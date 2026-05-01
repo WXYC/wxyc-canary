@@ -15,6 +15,7 @@ function loadConfigFromEnv(): CanaryConfig {
     backendUrl: required('CANARY_BACKEND_URL'),
     authUrl: required('CANARY_AUTH_URL'),
     semanticIndexUrl: required('CANARY_SEMANTIC_INDEX_URL'),
+    originUrl: process.env.CANARY_ORIGIN_URL ?? 'https://dj.wxyc.org',
     djEmail: process.env.CANARY_DJ_EMAIL,
     djPassword: process.env.CANARY_DJ_PASSWORD,
     timeoutMs: process.env.CANARY_TIMEOUT_MS ? Number(process.env.CANARY_TIMEOUT_MS) : 8000,
@@ -68,7 +69,12 @@ export async function runCanary(config: CanaryConfig): Promise<CheckOutcome[]> {
   let djBearerToken: string | undefined;
   if (djCreds) {
     try {
-      djBearerToken = await signInDj(config.authUrl, djCreds.email, djCreds.password);
+      djBearerToken = await signInDj(
+        config.authUrl,
+        djCreds.email,
+        djCreds.password,
+        config.originUrl ?? 'https://dj.wxyc.org'
+      );
     } catch (err) {
       djAuthError = (err as Error).message;
       // Don't throw — let the DJ-auth checks individually fail with the auth

@@ -21,22 +21,26 @@ const healthcheck: Check = {
 };
 
 /**
- * Anonymous: exercises the iOS proxy path through Backend-Service into LML.
- * Catches LML being down/timing out and any regression in the BS proxy
- * controller. Bypasses DJ auth so it works without provisioned credentials.
+ * Exercises the iOS proxy path through Backend-Service into LML. Catches
+ * LML being down/timing out and any regression in the BS proxy controller.
+ * Uses the DJ bearer because the proxy route is `requirePermissions({})` —
+ * any authed JWT works; we don't need a true anonymous-device session to
+ * cover the BS→LML hop.
  */
 const proxyLibrarySearch: Check = {
   name: 'proxy-library-search',
-  description: 'GET /proxy/library/search via anonymous device session — exercises BS → LML',
-  requiresAuth: false,
+  description: 'GET /proxy/library/search — exercises BS → LML',
+  requiresAuth: true,
   run: async (ctx) => {
+    if (!ctx.djBearerToken) throw new Error('DJ bearer token missing');
     const r = await canaryFetch(
-      `${ctx.backendUrl}/proxy/library/search?artist=${encodeURIComponent(PROBE_ARTIST)}&limit=5`
+      `${ctx.backendUrl}/proxy/library/search?artist=${encodeURIComponent(PROBE_ARTIST)}&limit=5`,
+      { headers: { Authorization: `Bearer ${ctx.djBearerToken}` } }
     );
     if (!r.ok) throw new Error(`expected 2xx, got ${r.status}: ${r.rawText.slice(0, 200)}`);
-    // /proxy/library/search returns an array (LML's bare LibrarySearchResponse passed through).
-    if (!Array.isArray(r.body)) {
-      throw new Error(`expected array body, got ${typeof r.body}: ${r.rawText.slice(0, 200)}`);
+    const body = r.body as { results?: unknown };
+    if (!body || typeof body !== 'object' || !Array.isArray(body.results)) {
+      throw new Error(`expected {results: [...]}, got: ${r.rawText.slice(0, 200)}`);
     }
   },
 };
@@ -90,17 +94,18 @@ const djLibrarySearch: Check = {
 };
 
 /**
- * DJ-authenticated: the v2 flowsheet read endpoint dj-site polls every 60s.
+ * DJ-authenticated: the flowsheet read endpoint dj-site polls every 60s.
  * Doesn't catch the play_order index incident (that's on POST), but does
- * catch read-side regressions on the V2 path that uses the @wxyc/shared DTOs.
+ * catch read-side regressions. Targets v1 because v2 (PR #182) isn't
+ * deployed yet — flip to `/v2/flowsheet?n=5` once it ships.
  */
 const djFlowsheetRead: Check = {
   name: 'dj-flowsheet-read',
-  description: 'GET /v2/flowsheet?n=5 as DJ',
+  description: 'GET /flowsheet?n=5 as DJ',
   requiresAuth: true,
   run: async (ctx) => {
     if (!ctx.djBearerToken) throw new Error('DJ bearer token missing');
-    const r = await canaryFetch(`${ctx.backendUrl}/v2/flowsheet?n=5`, {
+    const r = await canaryFetch(`${ctx.backendUrl}/flowsheet?n=5`, {
       headers: { Authorization: `Bearer ${ctx.djBearerToken}` },
     });
     if (!r.ok) throw new Error(`expected 2xx, got ${r.status}: ${r.rawText.slice(0, 200)}`);
@@ -140,22 +145,52 @@ export const checks: readonly Check[] = [
 ];
 
 /**
- * Sign in to better-auth as a DJ and return the Bearer token. Throws on
+ * Sign in to better-auth as a DJ and return a JWT suitable for the
+ * `Authorization: Bearer ...` header on Backend-Service routes. Throws on
  * any failure — caller is responsible for downgrading DJ-auth checks to
  * skipped when this throws and credentials weren't supplied.
+ *
+ * Two-step: `/sign-in/email` returns a session token (cookie-equivalent),
+ * then `/token` exchanges the session for a JWT. Backend-Service's
+ * `requirePermissions` middleware verifies JWTs against the JWKS endpoint,
+ * so the session token alone gets a 401 — the exchange is mandatory.
+ *
+ * `originUrl` is sent as the `Origin` header on both calls. better-auth's
+ * CSRF guard rejects sign-in with `MISSING_OR_NULL_ORIGIN` when the header
+ * is absent (curl, Lambda, anything non-browser). The value must be one of
+ * the auth server's `BETTER_AUTH_TRUSTED_ORIGINS`.
  */
-export async function signInDj(authUrl: string, email: string, password: string): Promise<string> {
-  const r = await canaryFetch(`${authUrl}/sign-in/email`, {
+export async function signInDj(
+  authUrl: string,
+  email: string,
+  password: string,
+  originUrl: string
+): Promise<string> {
+  const signIn = await canaryFetch(`${authUrl}/sign-in/email`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', Origin: originUrl },
     body: JSON.stringify({ email, password }),
   });
-  if (!r.ok) {
-    throw new Error(`auth sign-in failed with ${r.status}: ${r.rawText.slice(0, 200)}`);
+  if (!signIn.ok) {
+    throw new Error(`auth sign-in failed with ${signIn.status}: ${signIn.rawText.slice(0, 200)}`);
   }
-  const body = r.body as { token?: string };
-  if (!body || typeof body.token !== 'string' || body.token.length === 0) {
-    throw new Error(`auth sign-in returned no bearer token: ${r.rawText.slice(0, 200)}`);
+  const signInBody = signIn.body as { token?: string };
+  if (!signInBody || typeof signInBody.token !== 'string' || signInBody.token.length === 0) {
+    throw new Error(`auth sign-in returned no session token: ${signIn.rawText.slice(0, 200)}`);
   }
-  return body.token;
+  const sessionToken = signInBody.token;
+
+  const tokenExchange = await canaryFetch(`${authUrl}/token`, {
+    headers: { Authorization: `Bearer ${sessionToken}`, Origin: originUrl },
+  });
+  if (!tokenExchange.ok) {
+    throw new Error(
+      `auth token exchange failed with ${tokenExchange.status}: ${tokenExchange.rawText.slice(0, 200)}`
+    );
+  }
+  const tokenBody = tokenExchange.body as { token?: string };
+  if (!tokenBody || typeof tokenBody.token !== 'string' || tokenBody.token.length === 0) {
+    throw new Error(`auth token exchange returned no JWT: ${tokenExchange.rawText.slice(0, 200)}`);
+  }
+  return tokenBody.token;
 }

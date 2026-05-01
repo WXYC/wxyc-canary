@@ -35,6 +35,12 @@ export type CanaryConfig = {
   backendUrl: string;
   authUrl: string;
   semanticIndexUrl: string;
+  /**
+   * Sent as `Origin:` on auth calls (sign-in, token exchange). Must match one
+   * of the auth server's `BETTER_AUTH_TRUSTED_ORIGINS` or sign-in returns
+   * `MISSING_OR_NULL_ORIGIN`. Defaults to `https://dj.wxyc.org` (prod).
+   */
+  originUrl?: string;
   /** Optional DJ login. If unset, DJ-auth checks are skipped (not failed). */
   djEmail?: string;
   djPassword?: string;
