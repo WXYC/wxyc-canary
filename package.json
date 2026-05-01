@@ -1,0 +1,36 @@
+{
+  "name": "wxyc-canary",
+  "version": "0.1.0",
+  "description": "Synthetic-DJ canary that exercises the WXYC user-facing API surface every 5 minutes from AWS Lambda and emits CloudWatch metrics + alarms when anything fails.",
+  "private": true,
+  "type": "module",
+  "main": "dist/handler.js",
+  "scripts": {
+    "build": "esbuild src/handler.ts --bundle --platform=node --target=node20 --format=cjs --outfile=dist/handler.js --external:aws-sdk",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "local": "tsx src/handler.ts"
+  },
+  "keywords": [
+    "wxyc",
+    "canary",
+    "monitoring",
+    "lambda"
+  ],
+  "license": "ISC",
+  "dependencies": {},
+  "devDependencies": {
+    "@aws-sdk/client-cloudwatch": "^3.700.0",
+    "@aws-sdk/client-secrets-manager": "^3.700.0",
+    "@types/aws-lambda": "^8.10.146",
+    "@types/node": "^22.10.0",
+    "esbuild": "^0.24.0",
+    "prettier": "^3.4.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.0"
+  }
+}

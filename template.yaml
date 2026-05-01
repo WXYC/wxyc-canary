@@ -1,0 +1,158 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  WXYC synthetic-DJ canary. Lambda function on a 5-minute schedule that
+  exercises the WXYC user-facing API surface and emits CloudWatch metrics
+  + alarms when anything fails.
+
+Parameters:
+  BackendUrl:
+    Type: String
+    Default: https://api.wxyc.org
+    Description: Backend-Service base URL.
+  AuthUrl:
+    Type: String
+    Default: https://api.wxyc.org/auth
+    Description: better-auth base URL.
+  SemanticIndexUrl:
+    Type: String
+    Default: https://explore.wxyc.org
+    Description: semantic-index base URL.
+  DjCredentialsSecretArn:
+    Type: String
+    Default: ''
+    Description: >
+      Optional ARN of a Secrets Manager secret holding the canary DJ login.
+      JSON shape: {"email": "...", "password": "..."}. When empty, DJ-auth
+      checks downgrade to skipped (not failed).
+  AlertEmail:
+    Type: String
+    Default: ''
+    Description: >
+      Optional email address subscribed to the alarm SNS topic. Leave
+      empty to manage subscriptions outside this stack (e.g., wire to a
+      Slack webhook via a separate subscription).
+  ScheduleExpression:
+    Type: String
+    Default: rate(5 minutes)
+    Description: EventBridge schedule for the canary. rate() or cron().
+
+Conditions:
+  HasDjCredentials: !Not [!Equals [!Ref DjCredentialsSecretArn, '']]
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, '']]
+
+Resources:
+  CanaryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: wxyc-canary
+      Description: Synthetic-DJ canary; runs every 5 minutes against prod.
+      CodeUri: dist/
+      Handler: handler.handler
+      Runtime: nodejs20.x
+      Architectures:
+        - arm64
+      MemorySize: 256
+      Timeout: 60
+      Environment:
+        Variables:
+          CANARY_BACKEND_URL: !Ref BackendUrl
+          CANARY_AUTH_URL: !Ref AuthUrl
+          CANARY_SEMANTIC_INDEX_URL: !Ref SemanticIndexUrl
+          CANARY_DJ_SECRET_ARN: !If [HasDjCredentials, !Ref DjCredentialsSecretArn, '']
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: cloudwatch:PutMetricData
+              Resource: '*'
+              Condition:
+                StringEquals:
+                  cloudwatch:namespace: WXYC/Canary
+        - !If
+          - HasDjCredentials
+          - Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref DjCredentialsSecretArn
+          - !Ref AWS::NoValue
+      Events:
+        Schedule:
+          Type: Schedule
+          Properties:
+            Schedule: !Ref ScheduleExpression
+            Description: Run the WXYC canary on a fixed cadence.
+
+  CanaryLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${CanaryFunction}
+      RetentionInDays: 30
+
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: wxyc-canary-alerts
+      DisplayName: WXYC Canary Alerts
+
+  AlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # Per-check failure alarm. Fires when any individual check has reported a
+  # failure 2 of the last 3 evaluations (~10 minutes at the 5-minute schedule),
+  # which avoids alerting on a single transient blip while still catching
+  # sustained outages quickly.
+  CheckFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: wxyc-canary-check-failure
+      AlarmDescription: One or more WXYC canary checks have been failing.
+      Namespace: WXYC/Canary
+      MetricName: CheckFailure
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+      OKActions:
+        - !Ref AlertTopic
+
+  # Catches the case where the Lambda itself fails to run (timeout, crash
+  # before reaching the metric publish, etc). Without this, a Lambda that
+  # never publishes metrics would let the CheckFailure alarm sit at OK.
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: wxyc-canary-lambda-errors
+      AlarmDescription: WXYC canary Lambda has been throwing or timing out.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref CanaryFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+      OKActions:
+        - !Ref AlertTopic
+
+Outputs:
+  FunctionArn:
+    Value: !GetAtt CanaryFunction.Arn
+  AlertTopicArn:
+    Value: !Ref AlertTopic
+    Description: Subscribe additional endpoints (Slack webhook, PagerDuty, etc.) to this topic.
