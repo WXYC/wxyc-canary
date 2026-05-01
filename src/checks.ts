@@ -160,12 +160,7 @@ export const checks: readonly Check[] = [
  * is absent (curl, Lambda, anything non-browser). The value must be one of
  * the auth server's `BETTER_AUTH_TRUSTED_ORIGINS`.
  */
-export async function signInDj(
-  authUrl: string,
-  email: string,
-  password: string,
-  originUrl: string
-): Promise<string> {
+export async function signInDj(authUrl: string, email: string, password: string, originUrl: string): Promise<string> {
   const signIn = await canaryFetch(`${authUrl}/sign-in/email`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Origin: originUrl },
@@ -184,9 +179,7 @@ export async function signInDj(
     headers: { Authorization: `Bearer ${sessionToken}`, Origin: originUrl },
   });
   if (!tokenExchange.ok) {
-    throw new Error(
-      `auth token exchange failed with ${tokenExchange.status}: ${tokenExchange.rawText.slice(0, 200)}`
-    );
+    throw new Error(`auth token exchange failed with ${tokenExchange.status}: ${tokenExchange.rawText.slice(0, 200)}`);
   }
   const tokenBody = tokenExchange.body as { token?: string };
   if (!tokenBody || typeof tokenBody.token !== 'string' || tokenBody.token.length === 0) {
