@@ -33,7 +33,7 @@ EventBridge Scheduler (rate(5 minutes))
 
 - One Lambda invocation per schedule. All checks run in parallel; one failure does not short-circuit the others.
 - Per-check metrics: `CheckFailure`, `CheckSkipped`, `CheckLatency`, all dimensioned on `Check=<name>`.
-- Two alarms: `wxyc-canary-check-failure` (any check failed in 2 of last 3 evaluations) and `wxyc-canary-lambda-errors` (Lambda crashed before publishing metrics).
+- Three alarms: `wxyc-canary-check-failure` (any check failed in 2 of last 3 evaluations), `wxyc-canary-lambda-errors` (Lambda crashed before publishing metrics), and `wxyc-canary-mutation-4xx-surge` (sustained surge of Backend-Service mutation 4xx responses on `/flowsheet/*`, threshold SUM > 20 per 5-min window for 2 windows; reads the `MutationClientError` metric in the `WXYC/BackendService` namespace emitted by BS#704).
 
 ## Local development
 
@@ -118,6 +118,15 @@ Required GitHub variables (override defaults if needed):
 ### Alarm fires: `wxyc-canary-lambda-errors`
 
 The Lambda crashed before it could publish per-check metrics. Usually means a config error (missing env, bad secret), an AWS SDK retry storm, or an unhandled exception. Check the most recent log stream for the stack trace.
+
+### Alarm fires: `wxyc-canary-mutation-4xx-surge`
+
+A sustained surge of 4xx responses on Backend-Service mutation routes (`POST/PATCH/DELETE` on `/flowsheet/*`). The alarm reads the `MutationClientError` CloudWatch metric in the `WXYC/BackendService` namespace, emitted by Backend-Service per WXYC/Backend-Service#704. Sentry no longer captures these (handled-error filter from BS#691), so the trace explorer is the right place to triage:
+
+1. Open Sentry → trace explorer → filter `transaction:[POST /flowsheet/, PATCH /flowsheet/, DELETE /flowsheet/]` over the last 30 min. The span tags carry route + status code; group by `http.status_code` to see which class of 4xx is surging.
+2. Common cases: `showMemberMiddleware` 403 (DJ session lost show membership — check the recent flowsheet/rotation incident notes), validation 422 (request shape regression — usually a recent dj-site or iOS deploy), rate-limit 429 (a client retry storm).
+3. If the surge correlates with a recent Backend-Service or dj-site deploy, that's the first suspect. If it's isolated to one DJ session, the on-air DJ may be hitting a stale/expired session token and need to re-sign-in.
+4. The alarm threshold is SUM > 20 per 5-min window for 2 windows (sustained > 4/min for 10 min). One-off transient bursts won't trip it; if you're seeing churn at the threshold edge, raise the threshold rather than re-triggering manually.
 
 ### A check is too noisy
 
