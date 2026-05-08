@@ -12,6 +12,8 @@ export type FetchResult = {
   latencyMs: number;
   /** Raw text body. Useful for failure messages when JSON parse fails. */
   rawText: string;
+  /** Lowercased response headers. Used for things like `Retry-After`. */
+  headers: Record<string, string>;
 };
 
 export class CanaryFetchError extends Error {
@@ -52,12 +54,18 @@ export async function canaryFetch(
       }
     }
 
+    const headers: Record<string, string> = {};
+    response.headers.forEach((value, key) => {
+      headers[key.toLowerCase()] = value;
+    });
+
     return {
       status: response.status,
       ok: response.ok,
       body,
       latencyMs,
       rawText,
+      headers,
     };
   } catch (err) {
     const latencyMs = Math.round(performance.now() - startedAt);

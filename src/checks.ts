@@ -1,4 +1,4 @@
-import { canaryFetch } from './client.js';
+import { canaryFetch, type FetchResult } from './client.js';
 import type { Check } from './types.js';
 
 /**
@@ -145,6 +145,20 @@ export const checks: readonly Check[] = [
 ];
 
 /**
+ * Parse a `Retry-After` header in seconds form (the date form is rare on
+ * better-auth and not handled). Returns milliseconds, or undefined when
+ * the header is missing/unparseable. Negative or non-finite values are
+ * treated as missing.
+ */
+function parseRetryAfterMs(result: FetchResult): number | undefined {
+  const raw = result.headers?.['retry-after'];
+  if (!raw) return undefined;
+  const seconds = Number(raw);
+  if (!Number.isFinite(seconds) || seconds < 0) return undefined;
+  return Math.round(seconds * 1000);
+}
+
+/**
  * Sign in to better-auth as a DJ and return a JWT suitable for the
  * `Authorization: Bearer ...` header on Backend-Service routes. Throws on
  * any failure — caller is responsible for downgrading DJ-auth checks to
@@ -159,13 +173,30 @@ export const checks: readonly Check[] = [
  * CSRF guard rejects sign-in with `MISSING_OR_NULL_ORIGIN` when the header
  * is absent (curl, Lambda, anything non-browser). The value must be one of
  * the auth server's `BETTER_AUTH_TRUSTED_ORIGINS`.
+ *
+ * Retry carve-out: the canary deliberately does not retry the surfaces it
+ * measures (see `client.ts`). Sign-in is the exception, and only on 429.
+ * Auth is a precondition shared by 4 of 6 checks, so a single 429 here
+ * cascades into 4 simultaneous fail outcomes plus a Lambda Errors alarm —
+ * even when the surfaces being measured are healthy. One retry, only on
+ * 429, only on the sign-in step (token exchange does not retry). Honors
+ * `Retry-After` (seconds form) when present, capped to 5s so the Lambda
+ * still finishes inside its budget.
  */
 export async function signInDj(authUrl: string, email: string, password: string, originUrl: string): Promise<string> {
-  const signIn = await canaryFetch(`${authUrl}/sign-in/email`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Origin: originUrl },
-    body: JSON.stringify({ email, password }),
-  });
+  const postSignIn = (): Promise<FetchResult> =>
+    canaryFetch(`${authUrl}/sign-in/email`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Origin: originUrl },
+      body: JSON.stringify({ email, password }),
+    });
+
+  let signIn = await postSignIn();
+  if (signIn.status === 429) {
+    const delayMs = Math.min(parseRetryAfterMs(signIn) ?? 2000, 5000);
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+    signIn = await postSignIn();
+  }
   if (!signIn.ok) {
     throw new Error(`auth sign-in failed with ${signIn.status}: ${signIn.rawText.slice(0, 200)}`);
   }

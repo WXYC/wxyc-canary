@@ -198,3 +198,162 @@ describe('runCanary — failure surfaces (regression coverage for the 2026-04-30
     expect(dj.message).toMatch(/token exchange/);
   });
 });
+
+/**
+ * Auth sign-in is the one place the canary retries (see signInDj). The
+ * carve-out exists because a single 429 on sign-in cascades into 4 fail
+ * outcomes plus a Lambda Errors alarm, even when the surfaces being
+ * measured are healthy. These tests pin the contract: retry on 429 only,
+ * once only, sign-in step only.
+ */
+describe('runCanary — sign-in 429 retry carve-out', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  /**
+   * Build a fetch mock where each URL pattern returns a queue of responses
+   * in order. After the queue is exhausted, the last response repeats —
+   * lets a test specify "fail once, then succeed" without enumerating
+   * every subsequent call.
+   */
+  function setUpSequentialFetchMock(
+    sequences: Record<string, { status: number; body: unknown; headers?: Record<string, string> }[]>
+  ) {
+    const calls: Record<string, number> = {};
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const urlString = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      for (const [pattern, queue] of Object.entries(sequences)) {
+        if (urlString.includes(pattern)) {
+          const idx = calls[pattern] ?? 0;
+          calls[pattern] = idx + 1;
+          const resp = queue[Math.min(idx, queue.length - 1)];
+          return new Response(typeof resp.body === 'string' ? resp.body : JSON.stringify(resp.body), {
+            status: resp.status,
+            headers: { 'Content-Type': 'application/json', ...(resp.headers ?? {}) },
+          });
+        }
+      }
+      return new Response(`unmatched mock for ${urlString}`, { status: 599 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    return { fetchMock, calls };
+  }
+
+  it('retries sign-in once on 429 and proceeds when the second attempt succeeds', async () => {
+    vi.useFakeTimers();
+    const { fetchMock } = setUpSequentialFetchMock({
+      '/healthcheck': [{ status: 200, body: { ok: true } }],
+      '/proxy/library/search': [{ status: 200, body: proxyLibrarySearchResponse }],
+      '/graph/artists/search': [{ status: 200, body: { results: [{ id: 1 }] } }],
+      '/sign-in/email': [
+        { status: 429, body: { error: 'Too many requests, please try again later.' } },
+        { status: 200, body: { token: 'fake-session-token', user: { id: 'u1' } } },
+      ],
+      '/token': [{ status: 200, body: { token: 'fake-jwt' } }],
+      '/library/?artist_name=': [{ status: 200, body: stereolabSearchResults }],
+      '/flowsheet': [{ status: 200, body: [] }],
+      '/library/rotation': [{ status: 200, body: [] }],
+    });
+
+    const promise = runCanary({ ...baseConfig, djEmail: 'canary@wxyc.org', djPassword: 'pw' });
+    await vi.runAllTimersAsync();
+    const outcomes = await promise;
+
+    const byName = Object.fromEntries(outcomes.map((o) => [o.name, o]));
+    expect(byName['proxy-library-search'].status).toBe('pass');
+    expect(byName['dj-library-search'].status).toBe('pass');
+    expect(byName['dj-flowsheet-read'].status).toBe('pass');
+    expect(byName['dj-rotation'].status).toBe('pass');
+
+    const signInCalls = fetchMock.mock.calls.filter(([url]) => String(url).includes('/sign-in/email'));
+    expect(signInCalls).toHaveLength(2);
+  });
+
+  it('honors Retry-After (seconds) on 429, capped at 5s', async () => {
+    vi.useFakeTimers();
+    setUpSequentialFetchMock({
+      '/healthcheck': [{ status: 200, body: { ok: true } }],
+      '/proxy/library/search': [{ status: 200, body: proxyLibrarySearchResponse }],
+      '/graph/artists/search': [{ status: 200, body: { results: [{ id: 1 }] } }],
+      '/sign-in/email': [
+        // Server asks for 60s — far longer than the canary's budget. We cap at 5s.
+        { status: 429, body: { error: 'rate limited' }, headers: { 'Retry-After': '60' } },
+        { status: 200, body: { token: 'fake-session-token', user: { id: 'u1' } } },
+      ],
+      '/token': [{ status: 200, body: { token: 'fake-jwt' } }],
+      '/library/?artist_name=': [{ status: 200, body: stereolabSearchResults }],
+      '/flowsheet': [{ status: 200, body: [] }],
+      '/library/rotation': [{ status: 200, body: [] }],
+    });
+
+    const promise = runCanary({ ...baseConfig, djEmail: 'canary@wxyc.org', djPassword: 'pw' });
+    // Advance exactly 5s (the cap). If the cap weren't applied, the retry timer
+    // would still be pending and the sign-in promise wouldn't resolve.
+    await vi.advanceTimersByTimeAsync(5000);
+    const outcomes = await promise;
+
+    const dj = outcomes.find((o) => o.name === 'dj-library-search')!;
+    expect(dj.status).toBe('pass');
+  });
+
+  it('fails the precondition when both sign-in attempts return 429', async () => {
+    vi.useFakeTimers();
+    setUpSequentialFetchMock({
+      '/healthcheck': [{ status: 200, body: { ok: true } }],
+      '/proxy/library/search': [{ status: 200, body: proxyLibrarySearchResponse }],
+      '/graph/artists/search': [{ status: 200, body: { results: [{ id: 1 }] } }],
+      '/sign-in/email': [
+        { status: 429, body: { error: 'rate limited' } },
+        { status: 429, body: { error: 'rate limited' } },
+      ],
+    });
+
+    const promise = runCanary({ ...baseConfig, djEmail: 'canary@wxyc.org', djPassword: 'pw' });
+    await vi.runAllTimersAsync();
+    const outcomes = await promise;
+
+    const dj = outcomes.find((o) => o.name === 'dj-library-search')!;
+    expect(dj.status).toBe('fail');
+    expect(dj.message).toMatch(/auth precondition failed/);
+    expect(dj.message).toMatch(/429/);
+  });
+
+  it('does not retry on non-429 sign-in failures (e.g. 401)', async () => {
+    const { fetchMock } = setUpSequentialFetchMock({
+      '/healthcheck': [{ status: 200, body: { ok: true } }],
+      '/proxy/library/search': [{ status: 200, body: proxyLibrarySearchResponse }],
+      '/graph/artists/search': [{ status: 200, body: { results: [{ id: 1 }] } }],
+      '/sign-in/email': [{ status: 401, body: { error: 'invalid credentials' } }],
+    });
+
+    const outcomes = await runCanary({ ...baseConfig, djEmail: 'canary@wxyc.org', djPassword: 'wrong' });
+
+    const dj = outcomes.find((o) => o.name === 'dj-library-search')!;
+    expect(dj.status).toBe('fail');
+    expect(dj.message).toMatch(/401/);
+
+    const signInCalls = fetchMock.mock.calls.filter(([url]) => String(url).includes('/sign-in/email'));
+    expect(signInCalls).toHaveLength(1);
+  });
+
+  it('does not retry the token-exchange step on 429', async () => {
+    const { fetchMock } = setUpSequentialFetchMock({
+      '/healthcheck': [{ status: 200, body: { ok: true } }],
+      '/proxy/library/search': [{ status: 200, body: proxyLibrarySearchResponse }],
+      '/graph/artists/search': [{ status: 200, body: { results: [{ id: 1 }] } }],
+      '/sign-in/email': [{ status: 200, body: { token: 'fake-session-token', user: { id: 'u1' } } }],
+      '/token': [{ status: 429, body: { error: 'rate limited' } }],
+    });
+
+    const outcomes = await runCanary({ ...baseConfig, djEmail: 'canary@wxyc.org', djPassword: 'pw' });
+
+    const dj = outcomes.find((o) => o.name === 'dj-library-search')!;
+    expect(dj.status).toBe('fail');
+    expect(dj.message).toMatch(/token exchange/);
+
+    const tokenCalls = fetchMock.mock.calls.filter(([url]) => String(url).endsWith('/token'));
+    expect(tokenCalls).toHaveLength(1);
+  });
+});
