@@ -16,7 +16,6 @@ Synthetic-DJ canary on AWS Lambda. Probes the WXYC user-facing API every five mi
 ## Conventions
 
 - Each check has a stable kebab-case `name` that lands in CloudWatch as a `Check` dimension. Renaming breaks pinned dashboards — pick well first time.
-- The `wxyc-canary-check-failure` alarm uses the metrics-expression form (`SUM(SEARCH(...))`) so it aggregates `CheckFailure` across every value of the `Check` dimension; a plain `MetricName` alarm queries the empty undimensioned series and sits at "no data" forever (issue #2).
 - Checks fail by **throwing**. The runner converts the throw into a `CheckOutcome` with `status: 'fail'` and the message. One throw never short-circuits the others (parallel `Promise.all` of independent try-catches).
 - `requiresAuth: true` checks downgrade to `skipped` (separate metric from `fail`) when no DJ credentials are configured. The alarm only fires on `fail`, so an operator who hasn't provisioned the DJ test account gets a noisy console but not a phone call.
 - Two credential paths: `CANARY_DJ_EMAIL` + `CANARY_DJ_PASSWORD` env vars (local + tests) or `CANARY_DJ_SECRET_ARN` pointing at a Secrets Manager secret with `{"email":"...","password":"..."}` (prod).
