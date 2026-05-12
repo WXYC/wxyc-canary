@@ -49,7 +49,7 @@ Resources:
       Description: Synthetic-DJ canary; runs every 5 minutes against prod.
       CodeUri: dist/
       Handler: handler.handler
-      Runtime: nodejs20.x
+      Runtime: nodejs24.x
       Architectures:
         - arm64
       MemorySize: 256
