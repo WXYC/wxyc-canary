@@ -105,15 +105,9 @@ Resources:
   # Aggregated check-failure alarm. Fires when any check has reported a
   # failure 2 of the last 3 evaluations (~10 minutes at the 5-minute schedule),
   # which avoids alerting on a single transient blip while still catching
-  # sustained outages quickly.
-  #
-  # Targets the dimensionless CheckFailure series. The Lambda emits each
-  # CheckFailure datapoint twice — once with the Check dimension (for
-  # dashboards and per-surface drill-down) and once without dimensions
-  # (the series this alarm queries). CloudWatch alarms reject the
-  # SUM(SEARCH(...)) expression that would otherwise let one alarm watch
-  # every dimension value, so emit-twice is the supported equivalent.
-  # See issue #13 and the post-mortem on commits b7312c3 / 299deb5.
+  # sustained outages quickly. Targets the dimensionless CheckFailure series
+  # the Lambda publishes alongside the per-check one — see CLAUDE.md
+  # "Conventions" for why this isn't a SUM(SEARCH(...)) alarm.
   CheckFailureAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:

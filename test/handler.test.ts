@@ -372,14 +372,30 @@ describe('runCanary — sign-in 429 retry carve-out', () => {
   });
 });
 
+type MetricDatum = {
+  MetricName: string;
+  Value: number;
+  Dimensions?: Array<{ Name: string; Value: string }>;
+};
+
+function getPublishedMetrics(): MetricDatum[] {
+  expect(cloudWatchSendMock).toHaveBeenCalledTimes(1);
+  const [firstCall] = cloudWatchSendMock.mock.calls as unknown as Array<
+    [{ input: { Namespace: string; MetricData: MetricDatum[] } }]
+  >;
+  expect(firstCall[0].input.Namespace).toBe('WXYC/Canary');
+  return firstCall[0].input.MetricData;
+}
+
 /**
  * The `wxyc-canary-check-failure` alarm targets a plain
  * `Namespace=WXYC/Canary, MetricName=CheckFailure` series with no Dimensions
  * filter. CloudWatch alarms cannot use `SUM(SEARCH(...))` (issue #13), so
  * the canary publishes each `CheckFailure` datapoint twice: once with the
  * `Check` dimension (for dashboards / slicing) and once dimensionless (so a
- * plain alarm aggregates across every check). This regression pins both
- * emissions; dropping the dimensionless one silently breaks the alarm.
+ * plain alarm aggregates across every check). These regressions pin both
+ * emissions, the failure-case value flow, and the dimensioned-only contract
+ * for `CheckSkipped` / `CheckLatency` (alarming on those would be noise).
  */
 describe('publishMetrics — dimensioned + dimensionless emit-twice', () => {
   beforeEach(() => {
@@ -391,11 +407,6 @@ describe('publishMetrics — dimensioned + dimensionless emit-twice', () => {
     delete process.env.CANARY_DJ_EMAIL;
     delete process.env.CANARY_DJ_PASSWORD;
     delete process.env.CANARY_DJ_SECRET_ARN;
-    setUpFetchMock({
-      '/healthcheck': { status: 200, body: { ok: true } },
-      '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
-      '/graph/artists/search': { status: 200, body: { results: [{ id: 97426, canonical_name: 'stereolab' }] } },
-    });
   });
 
   afterEach(() => {
@@ -404,38 +415,74 @@ describe('publishMetrics — dimensioned + dimensionless emit-twice', () => {
   });
 
   it('emits each CheckFailure datapoint twice — once with the Check dimension and once dimensionless', async () => {
+    setUpFetchMock({
+      '/healthcheck': { status: 200, body: { ok: true } },
+      '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+      '/graph/artists/search': { status: 200, body: { results: [{ id: 97426, canonical_name: 'stereolab' }] } },
+    });
+
     await handler();
 
-    expect(cloudWatchSendMock).toHaveBeenCalledTimes(1);
-    const [firstCall] = cloudWatchSendMock.mock.calls as unknown as Array<
-      [
-        {
-          input: {
-            Namespace: string;
-            MetricData: Array<{
-              MetricName: string;
-              Value: number;
-              Dimensions?: Array<{ Name: string; Value: string }>;
-            }>;
-          };
-        },
-      ]
-    >;
-    const command = firstCall[0];
-    expect(command.input.Namespace).toBe('WXYC/Canary');
-
-    const checkFailureData = command.input.MetricData.filter((d) => d.MetricName === 'CheckFailure');
+    const checkFailureData = getPublishedMetrics().filter((d) => d.MetricName === 'CheckFailure');
     const dimensioned = checkFailureData.filter((d) => d.Dimensions && d.Dimensions.length > 0);
     const dimensionless = checkFailureData.filter((d) => !d.Dimensions || d.Dimensions.length === 0);
 
     // Six checks, each contributes one dimensioned and one dimensionless datapoint.
     expect(dimensioned).toHaveLength(6);
     expect(dimensionless).toHaveLength(6);
+    // Without an inducer, every value is 0 (passes + skips).
+    expect(dimensioned.every((d) => d.Value === 0)).toBe(true);
+    expect(dimensionless.every((d) => d.Value === 0)).toBe(true);
+  });
 
-    // Per-check the two emissions carry the same value (0 here — all checks pass or skip).
-    for (const d of dimensioned) {
-      const partner = dimensionless.find((x) => x.Value === d.Value);
-      expect(partner, `missing dimensionless partner for Check=${d.Dimensions![0].Value}`).toBeDefined();
-    }
+  // The alarm reads the dimensionless series. If a regression flowed
+  // `failureValue` into only the dimensioned branch, the dashboard would
+  // light up but the pager wouldn't — exactly the failure mode this pins.
+  it('flows the failure value (1) into both the dimensioned and dimensionless emission for the failing check', async () => {
+    setUpFetchMock({
+      // backend-healthcheck fails; everything else passes (DJ-auth checks
+      // skip with no creds — skipped is not a failure).
+      '/healthcheck': { status: 500, body: { error: 'oops' } },
+      '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+      '/graph/artists/search': { status: 200, body: { results: [{ id: 1, canonical_name: 'stereolab' }] } },
+    });
+
+    await expect(handler()).rejects.toThrow(/canary failed/);
+
+    const checkFailureData = getPublishedMetrics().filter((d) => d.MetricName === 'CheckFailure');
+    const dimensioned = checkFailureData.filter((d) => d.Dimensions && d.Dimensions.length > 0);
+    const dimensionless = checkFailureData.filter((d) => !d.Dimensions || d.Dimensions.length === 0);
+
+    const failingDimensioned = dimensioned.find((d) => d.Dimensions![0].Value === 'backend-healthcheck')!;
+    expect(failingDimensioned.Value).toBe(1);
+
+    // Exactly one dimensionless datapoint carries the failure value (the
+    // one paired with backend-healthcheck); the rest are 0. Value-matching
+    // isn't enough — `Statistic: Maximum` on the alarm needs at least one
+    // `1` in the window, so this asserts the count of 1s explicitly.
+    expect(dimensionless.filter((d) => d.Value === 1)).toHaveLength(1);
+    expect(dimensionless.filter((d) => d.Value === 0)).toHaveLength(5);
+  });
+
+  // `CheckSkipped` and `CheckLatency` are dashboard data, not alarm inputs.
+  // A future "let's mirror everything" refactor that also published their
+  // dimensionless companions would pollute the namespace and risk a
+  // misconfigured alarm being added against them — pin the contract.
+  it('emits CheckSkipped and CheckLatency dimensioned-only (no dimensionless companion)', async () => {
+    setUpFetchMock({
+      '/healthcheck': { status: 200, body: { ok: true } },
+      '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+      '/graph/artists/search': { status: 200, body: { results: [{ id: 97426, canonical_name: 'stereolab' }] } },
+    });
+
+    await handler();
+
+    const metricData = getPublishedMetrics();
+    const isDimensionless = (d: MetricDatum) => !d.Dimensions || d.Dimensions.length === 0;
+    expect(metricData.filter((d) => d.MetricName === 'CheckSkipped' && isDimensionless(d))).toHaveLength(0);
+    expect(metricData.filter((d) => d.MetricName === 'CheckLatency' && isDimensionless(d))).toHaveLength(0);
+    // Sanity: the dimensioned series for each is present (one per check).
+    expect(metricData.filter((d) => d.MetricName === 'CheckSkipped')).toHaveLength(6);
+    expect(metricData.filter((d) => d.MetricName === 'CheckLatency')).toHaveLength(6);
   });
 });
