@@ -106,22 +106,15 @@ Resources:
   # failure 2 of the last 3 evaluations (~10 minutes at the 5-minute schedule),
   # which avoids alerting on a single transient blip while still catching
   # sustained outages quickly.
-  #
-  # Uses the metrics-expression form (SEARCH + SUM) so the alarm aggregates
-  # CheckFailure across every value of the Check dimension. A plain
-  # Namespace/MetricName alarm without Dimensions queries the undimensioned
-  # series — which is empty, since the canary only emits CheckFailure with a
-  # Check dimension — and sits at "no data" forever (see issue #2).
   CheckFailureAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
       AlarmName: wxyc-canary-check-failure
       AlarmDescription: One or more WXYC canary checks have been failing.
-      Metrics:
-        - Id: e1
-          Expression: SUM(SEARCH('{WXYC/Canary,Check} MetricName="CheckFailure"', 'Sum', 300))
-          Label: TotalCheckFailures
-          ReturnData: true
+      Namespace: WXYC/Canary
+      MetricName: CheckFailure
+      Statistic: Maximum
+      Period: 300
       EvaluationPeriods: 3
       DatapointsToAlarm: 2
       Threshold: 1
