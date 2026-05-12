@@ -117,15 +117,14 @@ Resources:
     Properties:
       AlarmName: wxyc-canary-check-failure
       AlarmDescription: One or more WXYC canary checks have been failing.
-      # MetricDataQuery.Period is required when the entry uses Expression
-      # only (no MetricStat). PutMetricAlarm rejects the call with
-      # "Period must not be null" otherwise. The SEARCH function's third
-      # argument is the metric data resolution, not the alarm period.
+      # Period is required at the alarm level when every entry in Metrics
+      # uses Expression only (no MetricStat). PutMetricAlarm validation
+      # rejects the call with "Period must not be null" otherwise.
+      Period: 300
       Metrics:
         - Id: e1
           Expression: SUM(SEARCH('{WXYC/Canary,Check} MetricName="CheckFailure"', 'Sum', 300))
           Label: TotalCheckFailures
-          Period: 300
           ReturnData: true
       EvaluationPeriods: 3
       DatapointsToAlarm: 2
@@ -160,11 +159,11 @@ Resources:
         — Sentry-issues no longer carry 4xx after BS#691. Common causes:
         showMemberMiddleware 403 (DJ session lost show membership),
         validation 422, rate-limit 429.
+      Period: 300
       Metrics:
         - Id: e1
           Expression: SUM(SEARCH('{WXYC/BackendService} MetricName="MutationClientError"', 'Sum', 300))
           Label: TotalMutationClientErrors
-          Period: 300
           ReturnData: true
       EvaluationPeriods: 2
       DatapointsToAlarm: 2
