@@ -132,44 +132,6 @@ Resources:
       OKActions:
         - !Ref AlertTopic
 
-  # Mutation 4xx surge alarm. Backend-Service emits the MutationClientError
-  # metric (namespace WXYC/BackendService, dimensions Route + StatusCode) on
-  # every 4xx response from POST/PATCH/DELETE on /flowsheet/* — see
-  # WXYC/Backend-Service#704. This alarm fires when the SUM across every
-  # Route x StatusCode combination exceeds 20 in 2 of the last 2 5-minute
-  # windows (sustained >4/min for 10 min). The threshold is intentionally
-  # non-trivial so deploy windows and one-off transient errors don't page.
-  #
-  # Same metrics-expression form as CheckFailureAlarm: SEARCH aggregates
-  # across every dimension value. A plain Namespace/MetricName alarm with
-  # no Dimensions queries the empty undimensioned series and never fires
-  # (the lesson from issue #2 / PR #3).
-  MutationClientErrorSurgeAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: wxyc-canary-mutation-4xx-surge
-      AlarmDescription: >
-        Sustained surge of 4xx responses on Backend-Service mutation routes
-        (POST/PATCH/DELETE /flowsheet/*). Investigate via Sentry trace
-        explorer with transaction filtered to the flowsheet mutation routes
-        — Sentry-issues no longer carry 4xx after BS#691. Common causes:
-        showMemberMiddleware 403 (DJ session lost show membership),
-        validation 422, rate-limit 429.
-      Metrics:
-        - Id: e1
-          Expression: SUM(SEARCH('{WXYC/BackendService} MetricName="MutationClientError"', 'Sum', 300))
-          Label: TotalMutationClientErrors
-          ReturnData: true
-      EvaluationPeriods: 2
-      DatapointsToAlarm: 2
-      Threshold: 20
-      ComparisonOperator: GreaterThanOrEqualToThreshold
-      TreatMissingData: notBreaching
-      AlarmActions:
-        - !Ref AlertTopic
-      OKActions:
-        - !Ref AlertTopic
-
   # Catches the case where the Lambda itself fails to run (timeout, crash
   # before reaching the metric publish, etc). Without this, a Lambda that
   # never publishes metrics would let the CheckFailure alarm sit at OK.
