@@ -123,33 +123,50 @@ export async function runCanary(config: CanaryConfig): Promise<CheckOutcome[]> {
  * One PutMetricData call carries all checks; CloudWatch dedupes by
  * (namespace, metric, dimensions). Failures stay non-fatal here so the
  * Lambda still exits with the right code based on the outcome list.
+ *
+ * Each `CheckFailure` datapoint is emitted twice: once with the `Check`
+ * dimension (for per-surface dashboards and slicing) and once dimensionless
+ * (so the `wxyc-canary-check-failure` alarm can aggregate across every
+ * check via a plain `Namespace/MetricName` query). CloudWatch alarms do
+ * not accept `SUM(SEARCH(...))` expressions, so the SEARCH-form alarm
+ * that would otherwise let one alarm watch every dimension value is not
+ * an option — emit-twice is the supported equivalent. See issue #13.
  */
 async function publishMetrics(outcomes: CheckOutcome[], region: string): Promise<void> {
   const client = new CloudWatchClient({ region });
   const timestamp = new Date();
-  const metricData = outcomes.flatMap((o) => [
-    {
-      MetricName: 'CheckFailure',
-      Value: o.status === 'fail' ? 1 : 0,
-      Unit: StandardUnit.Count,
-      Timestamp: timestamp,
-      Dimensions: [{ Name: 'Check', Value: o.name }],
-    },
-    {
-      MetricName: 'CheckSkipped',
-      Value: o.status === 'skipped' ? 1 : 0,
-      Unit: StandardUnit.Count,
-      Timestamp: timestamp,
-      Dimensions: [{ Name: 'Check', Value: o.name }],
-    },
-    {
-      MetricName: 'CheckLatency',
-      Value: o.latencyMs,
-      Unit: StandardUnit.Milliseconds,
-      Timestamp: timestamp,
-      Dimensions: [{ Name: 'Check', Value: o.name }],
-    },
-  ]);
+  const metricData = outcomes.flatMap((o) => {
+    const failureValue = o.status === 'fail' ? 1 : 0;
+    return [
+      {
+        MetricName: 'CheckFailure',
+        Value: failureValue,
+        Unit: StandardUnit.Count,
+        Timestamp: timestamp,
+        Dimensions: [{ Name: 'Check', Value: o.name }],
+      },
+      {
+        MetricName: 'CheckFailure',
+        Value: failureValue,
+        Unit: StandardUnit.Count,
+        Timestamp: timestamp,
+      },
+      {
+        MetricName: 'CheckSkipped',
+        Value: o.status === 'skipped' ? 1 : 0,
+        Unit: StandardUnit.Count,
+        Timestamp: timestamp,
+        Dimensions: [{ Name: 'Check', Value: o.name }],
+      },
+      {
+        MetricName: 'CheckLatency',
+        Value: o.latencyMs,
+        Unit: StandardUnit.Milliseconds,
+        Timestamp: timestamp,
+        Dimensions: [{ Name: 'Check', Value: o.name }],
+      },
+    ];
+  });
   await client.send(new PutMetricDataCommand({ Namespace: METRIC_NAMESPACE, MetricData: metricData }));
 }
 

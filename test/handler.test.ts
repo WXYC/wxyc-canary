@@ -1,6 +1,20 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { runCanary } from '../src/handler.js';
+import { handler, runCanary } from '../src/handler.js';
 import type { CanaryConfig } from '../src/types.js';
+
+// Module-mock hoisting: vi.mock is hoisted above imports, so the mock factory
+// must use vi.hoisted() to share the spy with test assertions. Placing the
+// spy in vi.hoisted ensures it exists when the mocked module is constructed.
+const { cloudWatchSendMock } = vi.hoisted(() => ({
+  cloudWatchSendMock: vi.fn(async () => ({})),
+}));
+vi.mock('@aws-sdk/client-cloudwatch', async () => {
+  const actual = await vi.importActual<typeof import('@aws-sdk/client-cloudwatch')>('@aws-sdk/client-cloudwatch');
+  return {
+    ...actual,
+    CloudWatchClient: vi.fn().mockImplementation(() => ({ send: cloudWatchSendMock })),
+  };
+});
 
 const baseConfig: CanaryConfig = {
   backendUrl: 'https://api.example.test',
@@ -355,5 +369,73 @@ describe('runCanary — sign-in 429 retry carve-out', () => {
 
     const tokenCalls = fetchMock.mock.calls.filter(([url]) => String(url).endsWith('/token'));
     expect(tokenCalls).toHaveLength(1);
+  });
+});
+
+/**
+ * The `wxyc-canary-check-failure` alarm targets a plain
+ * `Namespace=WXYC/Canary, MetricName=CheckFailure` series with no Dimensions
+ * filter. CloudWatch alarms cannot use `SUM(SEARCH(...))` (issue #13), so
+ * the canary publishes each `CheckFailure` datapoint twice: once with the
+ * `Check` dimension (for dashboards / slicing) and once dimensionless (so a
+ * plain alarm aggregates across every check). This regression pins both
+ * emissions; dropping the dimensionless one silently breaks the alarm.
+ */
+describe('publishMetrics — dimensioned + dimensionless emit-twice', () => {
+  beforeEach(() => {
+    cloudWatchSendMock.mockClear();
+    process.env.CANARY_BACKEND_URL = 'https://api.example.test';
+    process.env.CANARY_AUTH_URL = 'https://auth.example.test';
+    process.env.CANARY_SEMANTIC_INDEX_URL = 'https://explore.example.test';
+    process.env.CANARY_PUBLISH_METRICS = 'true';
+    delete process.env.CANARY_DJ_EMAIL;
+    delete process.env.CANARY_DJ_PASSWORD;
+    delete process.env.CANARY_DJ_SECRET_ARN;
+    setUpFetchMock({
+      '/healthcheck': { status: 200, body: { ok: true } },
+      '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+      '/graph/artists/search': { status: 200, body: { results: [{ id: 97426, canonical_name: 'stereolab' }] } },
+    });
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    delete process.env.CANARY_PUBLISH_METRICS;
+  });
+
+  it('emits each CheckFailure datapoint twice — once with the Check dimension and once dimensionless', async () => {
+    await handler();
+
+    expect(cloudWatchSendMock).toHaveBeenCalledTimes(1);
+    const [firstCall] = cloudWatchSendMock.mock.calls as unknown as Array<
+      [
+        {
+          input: {
+            Namespace: string;
+            MetricData: Array<{
+              MetricName: string;
+              Value: number;
+              Dimensions?: Array<{ Name: string; Value: string }>;
+            }>;
+          };
+        },
+      ]
+    >;
+    const command = firstCall[0];
+    expect(command.input.Namespace).toBe('WXYC/Canary');
+
+    const checkFailureData = command.input.MetricData.filter((d) => d.MetricName === 'CheckFailure');
+    const dimensioned = checkFailureData.filter((d) => d.Dimensions && d.Dimensions.length > 0);
+    const dimensionless = checkFailureData.filter((d) => !d.Dimensions || d.Dimensions.length === 0);
+
+    // Six checks, each contributes one dimensioned and one dimensionless datapoint.
+    expect(dimensioned).toHaveLength(6);
+    expect(dimensionless).toHaveLength(6);
+
+    // Per-check the two emissions carry the same value (0 here — all checks pass or skip).
+    for (const d of dimensioned) {
+      const partner = dimensionless.find((x) => x.Value === d.Value);
+      expect(partner, `missing dimensionless partner for Check=${d.Dimensions![0].Value}`).toBeDefined();
+    }
   });
 });
