@@ -119,18 +119,11 @@ export async function runCanary(config: CanaryConfig): Promise<CheckOutcome[]> {
 }
 
 /**
- * Publish per-check failure (0 or 1) and latency metrics to CloudWatch.
- * One PutMetricData call carries all checks; CloudWatch dedupes by
- * (namespace, metric, dimensions). Failures stay non-fatal here so the
- * Lambda still exits with the right code based on the outcome list.
- *
- * Each `CheckFailure` datapoint is emitted twice: once with the `Check`
- * dimension (for per-surface dashboards and slicing) and once dimensionless
- * (so the `wxyc-canary-check-failure` alarm can aggregate across every
- * check via a plain `Namespace/MetricName` query). CloudWatch alarms do
- * not accept `SUM(SEARCH(...))` expressions, so the SEARCH-form alarm
- * that would otherwise let one alarm watch every dimension value is not
- * an option — emit-twice is the supported equivalent. See issue #13.
+ * Publish per-check failure, skip, and latency metrics in one PutMetricData
+ * call. `CheckFailure` is emitted twice (dimensioned + dimensionless) — see
+ * CLAUDE.md "Conventions" for the alarm-aggregation rationale. Failures
+ * stay non-fatal so the Lambda still exits on the outcome list, not on a
+ * CloudWatch hiccup.
  */
 async function publishMetrics(outcomes: CheckOutcome[], region: string): Promise<void> {
   const client = new CloudWatchClient({ region });
@@ -150,6 +143,7 @@ async function publishMetrics(outcomes: CheckOutcome[], region: string): Promise
         Value: failureValue,
         Unit: StandardUnit.Count,
         Timestamp: timestamp,
+        Dimensions: [],
       },
       {
         MetricName: 'CheckSkipped',
