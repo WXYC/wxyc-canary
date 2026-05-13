@@ -1,4 +1,8 @@
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, resolve } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import YAML from 'yaml';
 import { handler, runCanary } from '../src/handler.js';
 import type { CanaryConfig } from '../src/types.js';
 
@@ -484,5 +488,149 @@ describe('publishMetrics — dimensioned + dimensionless emit-twice', () => {
     // Sanity: the dimensioned series for each is present (one per check).
     expect(metricData.filter((d) => d.MetricName === 'CheckSkipped')).toHaveLength(6);
     expect(metricData.filter((d) => d.MetricName === 'CheckLatency')).toHaveLength(6);
+  });
+});
+
+/**
+ * Catches the wxyc-canary#13 drift class: an alarm in `template.yaml` that
+ * targets a (Namespace, MetricName, Dimensions) tuple the Lambda never
+ * actually publishes. The alarm definition (YAML) and metric emission (TS)
+ * live in separate files, so without a runtime contract test they can drift
+ * silently and a real outage parks the alarm at "no data" instead of paging.
+ *
+ * Scope is intentionally one-directional: alarms must point at metrics the
+ * code emits, but the code is free to emit dashboard-only metrics that no
+ * alarm references. And only `Namespace: WXYC/Canary` is checked — alarms on
+ * `AWS/Lambda` or other namespaces target metrics outside this repo.
+ */
+describe('template.yaml ↔ publishMetrics contract', () => {
+  type AlarmSpec = {
+    resourceName: string;
+    alarmName: string;
+    namespace: string;
+    metricName: string;
+    dimensionNames: string[];
+  };
+
+  /**
+   * Both alarm shapes CloudFormation accepts: the simple form (top-level
+   * Namespace/MetricName/Dimensions) and the expression form, where the
+   * underlying metric lives on a `Metrics: [{MetricStat: {Metric: {...}}}]`
+   * entry. We extract every metric-source the alarm references, so adding
+   * an expression-form alarm later doesn't silently bypass this test.
+   */
+  function extractMetricSources(properties: Record<string, unknown>): {
+    namespace: string;
+    metricName: string;
+    dimensionNames: string[];
+  }[] {
+    const sources: { namespace: string; metricName: string; dimensionNames: string[] }[] = [];
+    const dimensionNames = (dims: unknown): string[] => {
+      if (!Array.isArray(dims)) return [];
+      return dims
+        .map((d) => (d && typeof d === 'object' && 'Name' in d ? String((d as { Name: unknown }).Name) : null))
+        .filter((n): n is string => n !== null);
+    };
+
+    if (typeof properties.Namespace === 'string' && typeof properties.MetricName === 'string') {
+      sources.push({
+        namespace: properties.Namespace,
+        metricName: properties.MetricName,
+        dimensionNames: dimensionNames(properties.Dimensions),
+      });
+    }
+
+    const metrics = properties.Metrics;
+    if (Array.isArray(metrics)) {
+      for (const entry of metrics) {
+        const stat = (entry as { MetricStat?: { Metric?: Record<string, unknown> } })?.MetricStat;
+        const metric = stat?.Metric;
+        if (metric && typeof metric.Namespace === 'string' && typeof metric.MetricName === 'string') {
+          sources.push({
+            namespace: metric.Namespace,
+            metricName: metric.MetricName,
+            dimensionNames: dimensionNames(metric.Dimensions),
+          });
+        }
+      }
+    }
+    return sources;
+  }
+
+  function loadCanaryAlarms(): AlarmSpec[] {
+    const templatePath = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'template.yaml');
+    const text = readFileSync(templatePath, 'utf-8');
+    // logLevel: silent suppresses CFN tag warnings (`!Ref`, `!Sub`, etc.) —
+    // the parser still produces a usable tree; we just don't resolve those
+    // tags because none of them appear in alarm metric-selector fields.
+    const doc = YAML.parse(text, { logLevel: 'silent' }) as {
+      Resources?: Record<string, { Type?: string; Properties?: Record<string, unknown> }>;
+    };
+    const resources = doc.Resources ?? {};
+    const alarms: AlarmSpec[] = [];
+    for (const [resourceName, resource] of Object.entries(resources)) {
+      if (resource?.Type !== 'AWS::CloudWatch::Alarm') continue;
+      const props = resource.Properties ?? {};
+      const alarmName = typeof props.AlarmName === 'string' ? props.AlarmName : resourceName;
+      for (const source of extractMetricSources(props)) {
+        if (source.namespace !== 'WXYC/Canary') continue;
+        alarms.push({
+          resourceName,
+          alarmName,
+          namespace: source.namespace,
+          metricName: source.metricName,
+          dimensionNames: source.dimensionNames,
+        });
+      }
+    }
+    return alarms;
+  }
+
+  async function harvestPublishedMetrics(): Promise<MetricDatum[]> {
+    cloudWatchSendMock.mockClear();
+    process.env.CANARY_BACKEND_URL = 'https://api.example.test';
+    process.env.CANARY_AUTH_URL = 'https://auth.example.test';
+    process.env.CANARY_SEMANTIC_INDEX_URL = 'https://explore.example.test';
+    process.env.CANARY_PUBLISH_METRICS = 'true';
+    delete process.env.CANARY_DJ_EMAIL;
+    delete process.env.CANARY_DJ_PASSWORD;
+    delete process.env.CANARY_DJ_SECRET_ARN;
+
+    setUpFetchMock({
+      '/healthcheck': { status: 200, body: { ok: true } },
+      '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+      '/graph/artists/search': { status: 200, body: { results: [{ id: 97426, canonical_name: 'stereolab' }] } },
+    });
+
+    try {
+      await handler();
+    } finally {
+      vi.unstubAllGlobals();
+      delete process.env.CANARY_PUBLISH_METRICS;
+    }
+
+    return getPublishedMetrics();
+  }
+
+  it('every WXYC/Canary alarm points at a (MetricName, Dimensions-shape) tuple the handler actually emits', async () => {
+    const alarms = loadCanaryAlarms();
+    // Sanity: if this drops to zero, the parser broke and the test is a no-op.
+    expect(alarms.length).toBeGreaterThan(0);
+
+    const published = await harvestPublishedMetrics();
+    const emittedShapes = new Set(
+      published.map((d) => {
+        const names = (d.Dimensions ?? []).map((dim) => dim.Name).sort();
+        return `${d.MetricName}|${names.join(',')}`;
+      })
+    );
+
+    for (const alarm of alarms) {
+      const shape = `${alarm.metricName}|${[...alarm.dimensionNames].sort().join(',')}`;
+      expect(
+        emittedShapes,
+        `alarm ${alarm.alarmName} (${alarm.resourceName}) targets ${alarm.namespace}/${alarm.metricName} with dimensions [${alarm.dimensionNames.join(', ')}], but publishMetrics never emits that shape. Emitted shapes: ${[...emittedShapes].sort().join('; ')}.`
+      ).toContain(shape);
+    }
   });
 });

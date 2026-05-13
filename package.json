@@ -24,7 +24,6 @@
     "lambda"
   ],
   "license": "ISC",
-  "dependencies": {},
   "devDependencies": {
     "@aws-sdk/client-cloudwatch": "^3.700.0",
     "@aws-sdk/client-secrets-manager": "^3.700.0",
@@ -34,6 +33,7 @@
     "prettier": "^3.4.0",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0",
-    "vitest": "^2.1.0"
+    "vitest": "^2.1.0",
+    "yaml": "^2.9.0"
   }
 }
