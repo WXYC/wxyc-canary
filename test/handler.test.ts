@@ -586,7 +586,7 @@ describe('template.yaml ↔ publishMetrics contract', () => {
     return alarms;
   }
 
-  async function harvestPublishedMetrics(): Promise<MetricDatum[]> {
+  beforeEach(() => {
     cloudWatchSendMock.mockClear();
     process.env.CANARY_BACKEND_URL = 'https://api.example.test';
     process.env.CANARY_AUTH_URL = 'https://auth.example.test';
@@ -595,29 +595,32 @@ describe('template.yaml ↔ publishMetrics contract', () => {
     delete process.env.CANARY_DJ_EMAIL;
     delete process.env.CANARY_DJ_PASSWORD;
     delete process.env.CANARY_DJ_SECRET_ARN;
-
     setUpFetchMock({
       '/healthcheck': { status: 200, body: { ok: true } },
       '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
       '/graph/artists/search': { status: 200, body: { results: [{ id: 97426, canonical_name: 'stereolab' }] } },
     });
+  });
 
-    try {
-      await handler();
-    } finally {
-      vi.unstubAllGlobals();
-      delete process.env.CANARY_PUBLISH_METRICS;
-    }
-
-    return getPublishedMetrics();
-  }
+  // Full env-var cleanup, not just the publish flag — leaving CANARY_BACKEND_URL
+  // etc. set bleeds into any later test that expects them unset (e.g., a test
+  // asserting "throws when CANARY_BACKEND_URL is missing"). Strict cleanup
+  // keeps the describe block self-contained.
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    delete process.env.CANARY_BACKEND_URL;
+    delete process.env.CANARY_AUTH_URL;
+    delete process.env.CANARY_SEMANTIC_INDEX_URL;
+    delete process.env.CANARY_PUBLISH_METRICS;
+  });
 
   it('every WXYC/Canary alarm points at a (MetricName, Dimensions-shape) tuple the handler actually emits', async () => {
     const alarms = loadCanaryAlarms();
     // Sanity: if this drops to zero, the parser broke and the test is a no-op.
     expect(alarms.length).toBeGreaterThan(0);
 
-    const published = await harvestPublishedMetrics();
+    await handler();
+    const published = getPublishedMetrics();
     const emittedShapes = new Set(
       published.map((d) => {
         const names = (d.Dimensions ?? []).map((dim) => dim.Name).sort();
