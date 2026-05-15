@@ -6,16 +6,17 @@ The canary exists because three production incidents on 2026-04-30 (catalog-sear
 
 ## What it checks
 
-| Check                   | Endpoint                                                                | Auth             | What it would have caught                           |
-| ----------------------- | ----------------------------------------------------------------------- | ---------------- | --------------------------------------------------- |
-| `backend-healthcheck`   | `GET /healthcheck`                                                      | none             | Process-level outage on Backend-Service             |
-| `proxy-library-search`  | `GET /proxy/library/search?artist=Stereolab&limit=5`                    | anonymous device | LML degradation, BS proxy regressions               |
-| `semantic-index-search` | `GET https://explore.wxyc.org/graph/artists/search?q=Stereolab&limit=1` | none             | semantic-index 5xx; missing `results` envelope      |
-| `dj-library-search`     | `GET /library/?artist_name=Stereolab&n=5`                               | DJ JWT           | The 2026-04-30 catalog-search 503 incident, exactly |
-| `dj-flowsheet-read`     | `GET /v2/flowsheet?n=5`                                                 | DJ JWT           | V2 flowsheet read regressions                       |
-| `dj-rotation`           | `GET /library/rotation`                                                 | DJ JWT           | Rotation endpoint 5xx, fully empty rotation         |
+| Check                   | Endpoint                                                                | Auth             | What it would have caught                                        |
+| ----------------------- | ----------------------------------------------------------------------- | ---------------- | ---------------------------------------------------------------- |
+| `backend-healthcheck`   | `GET /healthcheck`                                                      | none             | Process-level outage on Backend-Service                          |
+| `proxy-library-search`  | `GET /proxy/library/search?artist=Stereolab&limit=5`                    | anonymous device | LML degradation, BS proxy regressions                            |
+| `semantic-index-search` | `GET https://explore.wxyc.org/graph/artists/search?q=Stereolab&limit=1` | none             | semantic-index 5xx; missing `results` envelope                   |
+| `dj-library-search`     | `GET /library/?artist_name=Stereolab&n=5`                               | DJ JWT           | The 2026-04-30 catalog-search 503 incident, exactly              |
+| `dj-flowsheet-read`     | `GET /v2/flowsheet?n=5`                                                 | DJ JWT           | V2 flowsheet read regressions                                    |
+| `dj-rotation`           | `GET /library/rotation`                                                 | DJ JWT           | Rotation endpoint 5xx, fully empty rotation                      |
+| `enrichment-quality`    | insert sentinel → poll for enrichment → delete                          | DJ JWT (write)   | The 2026-05-13 LML cascade regression (null-metadata on inserts) |
 
-DJ-auth checks downgrade to `skipped` (a distinct CloudWatch metric, not `failed`) when no DJ credentials are configured, so the alarm doesn't fire on operator-caused gaps.
+DJ-auth checks downgrade to `skipped` (a distinct CloudWatch metric, not `failed`) when no DJ credentials are configured, so the alarm doesn't fire on operator-caused gaps. The `enrichment-quality` write canary additionally requires `CANARY_ENABLE_WRITE_PROBE=true` and skips when another DJ is on-air — the canary deliberately doesn't inject sentinel rows into a real DJ's flowsheet.
 
 ## Architecture
 
@@ -32,8 +33,8 @@ EventBridge Scheduler (rate(5 minutes))
 ```
 
 - One Lambda invocation per schedule. All checks run in parallel; one failure does not short-circuit the others.
-- Per-check metrics: `CheckFailure`, `CheckSkipped`, `CheckLatency`, all dimensioned on `Check=<name>`.
-- Two alarms: `wxyc-canary-check-failure` (any check failed in 2 of last 3 evaluations) and `wxyc-canary-lambda-errors` (Lambda crashed before publishing metrics).
+- Per-check metrics: `CheckFailure`, `CheckSkipped`, `CheckLatency`, all dimensioned on `Check=<name>`. Plus `EnrichmentLagSeconds` from the v1 write canary (dimensioned + dimensionless).
+- Three alarms: `wxyc-canary-check-failure` (any check failed in 2 of last 3 evaluations), `wxyc-canary-enrichment-lag` (sentinel row took > 30 s to enrich for 3 consecutive evaluations), and `wxyc-canary-lambda-errors` (Lambda crashed before publishing metrics).
 
 ## Local development
 
@@ -80,8 +81,19 @@ sam build
 sam deploy --guided \
   --parameter-overrides \
     DjCredentialsSecretArn=arn:aws:secretsmanager:us-east-1:<account>:secret:wxyc-canary-dj-credentials-XXX \
-    AlertEmail=ops@wxyc.org
+    AlertEmail=ops@wxyc.org \
+    EnableWriteProbe=false
 ```
+
+Leave `EnableWriteProbe=false` for the first deploy. Once the DJ test account is provisioned, the `wxyc-canary-enrichment-lag` alarm is wired to the right SNS subscriber, and you've verified cleanup behaviour in a manual local run (`CANARY_ENABLE_WRITE_PROBE=true CANARY_LOCAL=true npm run local` against a non-prod environment), redeploy with `EnableWriteProbe=true` to turn the write canary on.
+
+### Verifying the write canary in staging
+
+The enrichment-quality check exists to catch the 2026-05-13 class of regression: silent latency-cliff in LML that leaves `youtube_music_url` null on inserts. To validate the alarm wiring before relying on it:
+
+1. In staging, set LML's `discogs_max_concurrent=0` (or otherwise force enrichment failure).
+2. Confirm `EnrichmentLagSeconds` climbs and the `wxyc-canary-enrichment-lag` alarm transitions to ALARM within 15 minutes (3 consecutive 5-minute breaches).
+3. Revert the LML change. The alarm should return to OK within the next two evaluation periods.
 
 The first invocation runs ~5 minutes after deploy. Confirm via:
 
@@ -133,9 +145,9 @@ The check set is deliberately small. Each one corresponds to a real production f
 
 Things this canary does **not** do, on purpose:
 
-- **No write probes in v0.** The catalog-search 503 and rotation regressions are read-side. The flowsheet POST 500 is write-side, but a write-probing canary needs a clean cleanup story so its writes don't pollute real flowsheet data — that's a v1 design problem with its own tradeoffs.
+- **No writes against another DJ's show.** The v1 write canary (`enrichment-quality`) is gated three ways: `CANARY_ENABLE_WRITE_PROBE=true` must be set, DJ credentials must be configured, and the check skips when another DJ is on-air. The last one is non-negotiable — even if the alarm is on the line, a sentinel row in a real DJ's flowsheet is worse than a missed metric.
 - **No iOS-side decoder testing.** The semantic-index check confirms the server returns the right shape, not that iOS decodes it correctly. iOS decoder tests live in `wxyc-ios-64`.
-- **No latency SLOs.** The latency metric is published for trend visibility, not alerting. Adding a SLO without a clear baseline mostly produces noise.
+- **No latency SLOs on the read-side checks.** The `CheckLatency` metric is published for trend visibility, not alerting — read-side latency targets are downstream of upstream API behaviour and would mostly produce noise. The `EnrichmentLagSeconds` SLO is the exception: it's measured against the canary's own controlled insert, so a 30 s threshold is meaningful.
 
 ## Costs
 

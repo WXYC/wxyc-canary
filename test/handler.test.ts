@@ -71,10 +71,10 @@ describe('runCanary — anonymous-only configuration', () => {
     vi.unstubAllGlobals();
   });
 
-  it('passes the 2 truly-anonymous checks and skips the 4 auth checks when no credentials are configured', async () => {
+  it('passes the 2 truly-anonymous checks and skips the 5 auth checks when no credentials are configured', async () => {
     const outcomes = await runCanary(baseConfig);
 
-    expect(outcomes).toHaveLength(6);
+    expect(outcomes).toHaveLength(7);
     const byName = Object.fromEntries(outcomes.map((o) => [o.name, o]));
     expect(byName['backend-healthcheck'].status).toBe('pass');
     expect(byName['semantic-index-search'].status).toBe('pass');
@@ -82,6 +82,7 @@ describe('runCanary — anonymous-only configuration', () => {
     expect(byName['dj-library-search'].status).toBe('skipped');
     expect(byName['dj-flowsheet-read'].status).toBe('skipped');
     expect(byName['dj-rotation'].status).toBe('skipped');
+    expect(byName['enrichment-quality'].status).toBe('skipped');
   });
 });
 
@@ -431,9 +432,9 @@ describe('publishMetrics — dimensioned + dimensionless emit-twice', () => {
     const dimensioned = checkFailureData.filter((d) => d.Dimensions && d.Dimensions.length > 0);
     const dimensionless = checkFailureData.filter((d) => !d.Dimensions || d.Dimensions.length === 0);
 
-    // Six checks, each contributes one dimensioned and one dimensionless datapoint.
-    expect(dimensioned).toHaveLength(6);
-    expect(dimensionless).toHaveLength(6);
+    // Seven checks, each contributes one dimensioned and one dimensionless datapoint.
+    expect(dimensioned).toHaveLength(7);
+    expect(dimensionless).toHaveLength(7);
     // Without an inducer, every value is 0 (passes + skips).
     expect(dimensioned.every((d) => d.Value === 0)).toBe(true);
     expect(dimensionless.every((d) => d.Value === 0)).toBe(true);
@@ -465,7 +466,7 @@ describe('publishMetrics — dimensioned + dimensionless emit-twice', () => {
     // isn't enough — `Statistic: Maximum` on the alarm needs at least one
     // `1` in the window, so this asserts the count of 1s explicitly.
     expect(dimensionless.filter((d) => d.Value === 1)).toHaveLength(1);
-    expect(dimensionless.filter((d) => d.Value === 0)).toHaveLength(5);
+    expect(dimensionless.filter((d) => d.Value === 0)).toHaveLength(6);
   });
 
   // `CheckSkipped` and `CheckLatency` are dashboard data, not alarm inputs.
@@ -486,8 +487,8 @@ describe('publishMetrics — dimensioned + dimensionless emit-twice', () => {
     expect(metricData.filter((d) => d.MetricName === 'CheckSkipped' && isDimensionless(d))).toHaveLength(0);
     expect(metricData.filter((d) => d.MetricName === 'CheckLatency' && isDimensionless(d))).toHaveLength(0);
     // Sanity: the dimensioned series for each is present (one per check).
-    expect(metricData.filter((d) => d.MetricName === 'CheckSkipped')).toHaveLength(6);
-    expect(metricData.filter((d) => d.MetricName === 'CheckLatency')).toHaveLength(6);
+    expect(metricData.filter((d) => d.MetricName === 'CheckSkipped')).toHaveLength(7);
+    expect(metricData.filter((d) => d.MetricName === 'CheckLatency')).toHaveLength(7);
   });
 });
 
@@ -586,20 +587,26 @@ describe('template.yaml ↔ publishMetrics contract', () => {
     return alarms;
   }
 
+  // Happy-path env + fetch mocks for every check, including the v1 write
+  // canary. The contract test needs all alarms to have at least one
+  // matching emission, so every metric the alarm set targets must be
+  // produced by this run — that includes `EnrichmentLagSeconds`, which
+  // only fires when the write canary is enabled AND the sentinel row
+  // enriches successfully. Tests below in the dedicated
+  // `enrichment-quality` block exercise failure / skip paths.
   beforeEach(() => {
     cloudWatchSendMock.mockClear();
     process.env.CANARY_BACKEND_URL = 'https://api.example.test';
     process.env.CANARY_AUTH_URL = 'https://auth.example.test';
     process.env.CANARY_SEMANTIC_INDEX_URL = 'https://explore.example.test';
     process.env.CANARY_PUBLISH_METRICS = 'true';
-    delete process.env.CANARY_DJ_EMAIL;
-    delete process.env.CANARY_DJ_PASSWORD;
+    process.env.CANARY_DJ_EMAIL = 'canary@wxyc.org';
+    process.env.CANARY_DJ_PASSWORD = 'pw';
+    process.env.CANARY_ENABLE_WRITE_PROBE = 'true';
+    process.env.CANARY_ENRICHMENT_POLL_INTERVAL_MS = '5';
+    process.env.CANARY_ENRICHMENT_POLL_TIMEOUT_MS = '500';
     delete process.env.CANARY_DJ_SECRET_ARN;
-    setUpFetchMock({
-      '/healthcheck': { status: 200, body: { ok: true } },
-      '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
-      '/graph/artists/search': { status: 200, body: { results: [{ id: 97426, canonical_name: 'stereolab' }] } },
-    });
+    setUpEnrichmentHappyPathMock();
   });
 
   // Full env-var cleanup, not just the publish flag — leaving CANARY_BACKEND_URL
@@ -612,6 +619,11 @@ describe('template.yaml ↔ publishMetrics contract', () => {
     delete process.env.CANARY_AUTH_URL;
     delete process.env.CANARY_SEMANTIC_INDEX_URL;
     delete process.env.CANARY_PUBLISH_METRICS;
+    delete process.env.CANARY_DJ_EMAIL;
+    delete process.env.CANARY_DJ_PASSWORD;
+    delete process.env.CANARY_ENABLE_WRITE_PROBE;
+    delete process.env.CANARY_ENRICHMENT_POLL_INTERVAL_MS;
+    delete process.env.CANARY_ENRICHMENT_POLL_TIMEOUT_MS;
   });
 
   it('every WXYC/Canary alarm points at a (MetricName, Dimensions-shape) tuple the handler actually emits', async () => {
@@ -634,6 +646,399 @@ describe('template.yaml ↔ publishMetrics contract', () => {
         emittedShapes,
         `alarm ${alarm.alarmName} (${alarm.resourceName}) targets ${alarm.namespace}/${alarm.metricName} with dimensions [${alarm.dimensionNames.join(', ')}], but publishMetrics never emits that shape. Emitted shapes: ${[...emittedShapes].sort().join('; ')}.`
       ).toContain(shape);
+    }
+  });
+});
+
+/**
+ * Method-aware sequential fetch mock for the v1 write canary. The existing
+ * `setUpFetchMock` matches by URL substring only, which collides on
+ * `/flowsheet` POST vs DELETE vs GET. Method matching is essential here:
+ * the enrichment check fires all four against the same path within seconds
+ * and a wrong-method dispatch would silently route a DELETE to the GET
+ * mock and the row would never be cleaned up.
+ *
+ * Each route's `responses` array is consumed in order; after the queue
+ * exhausts, the last response repeats — so `[notFound, enriched]` means
+ * "first poll returns 404, every subsequent poll returns the enriched
+ * row." Returns `{ fetchMock, calls }` so a test can verify e.g. that
+ * cleanup-DELETE was called even when polling timed out.
+ */
+type RouteResponse = { status: number; body: unknown };
+type Route = { method: string; pattern: string; responses: RouteResponse[] };
+
+function setUpMethodAwareMock(routes: Route[]): {
+  fetchMock: ReturnType<typeof vi.fn>;
+  calls: Record<string, number>;
+} {
+  const calls: Record<string, number> = {};
+  const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+    const method = String(init?.method ?? (input instanceof Request ? input.method : 'GET')).toUpperCase();
+    for (const route of routes) {
+      if (method === route.method.toUpperCase() && url.includes(route.pattern)) {
+        const key = `${route.method.toUpperCase()} ${route.pattern}`;
+        const idx = calls[key] ?? 0;
+        calls[key] = idx + 1;
+        const resp = route.responses[Math.min(idx, route.responses.length - 1)];
+        return new Response(typeof resp.body === 'string' ? resp.body : JSON.stringify(resp.body), {
+          status: resp.status,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+    }
+    return new Response(`unmatched ${method} ${url}`, { status: 599 });
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  return { fetchMock, calls };
+}
+
+const SENTINEL_ROW_ID = 42;
+const ENRICHED_SENTINEL_ROW = {
+  id: SENTINEL_ROW_ID,
+  entry_type: 'track',
+  artist_name: 'WXYCCanary-1234',
+  album_title: 'WXYCCanary',
+  track_title: 'Sentinel-1234',
+  youtube_music_url: 'https://music.youtube.com/search?q=WXYCCanary-1234',
+};
+
+/**
+ * Happy-path mock: every check passes, every metric the alarms care about
+ * is emitted. Used by the contract test and any test that wants the full
+ * outcome shape. The enrichment-quality flow returns one not-found poll
+ * (to exercise the 404 retry) followed by an enriched row.
+ */
+function setUpEnrichmentHappyPathMock(): ReturnType<typeof setUpMethodAwareMock> {
+  return setUpMethodAwareMock([
+    // Read-side checks (other 6 checks).
+    { method: 'GET', pattern: '/healthcheck', responses: [{ status: 200, body: { ok: true } }] },
+    { method: 'GET', pattern: '/proxy/library/search', responses: [{ status: 200, body: proxyLibrarySearchResponse }] },
+    {
+      method: 'GET',
+      pattern: '/graph/artists/search',
+      responses: [{ status: 200, body: { results: [{ id: 1, canonical_name: 'stereolab' }] } }],
+    },
+    { method: 'GET', pattern: '/library/?artist_name=', responses: [{ status: 200, body: stereolabSearchResults }] },
+    { method: 'GET', pattern: '/library/rotation', responses: [{ status: 200, body: [] }] },
+    // Sign-in (POST) + token exchange (GET).
+    {
+      method: 'POST',
+      pattern: '/sign-in/email',
+      responses: [{ status: 200, body: { token: 'fake-session-token', user: { id: 'canary-user-id' } } }],
+    },
+    { method: 'GET', pattern: '/token', responses: [{ status: 200, body: { token: 'fake-jwt' } }] },
+    // Write-canary path. Order matters when patterns overlap (`/flowsheet`
+    // is a prefix of `/flowsheet/join`), but method-aware matching disambiguates.
+    { method: 'GET', pattern: '/flowsheet/djs-on-air', responses: [{ status: 200, body: [] }] },
+    {
+      method: 'POST',
+      pattern: '/flowsheet/join',
+      responses: [{ status: 200, body: { id: 99, primary_dj_id: 'canary-user-id' } }],
+    },
+    { method: 'POST', pattern: '/flowsheet/end', responses: [{ status: 200, body: { id: 99, end_time: 12345 } }] },
+    {
+      method: 'POST',
+      pattern: '/flowsheet',
+      responses: [{ status: 201, body: { id: SENTINEL_ROW_ID, show_id: 99 } }],
+    },
+    // Range poll — what the enrichment check polls until the row's
+    // youtube_music_url populates. Distinct pattern (`?start_id=`) so it
+    // doesn't shadow `dj-flowsheet-read`'s `?n=5` call.
+    {
+      method: 'GET',
+      pattern: '/flowsheet?start_id=',
+      responses: [
+        // First range poll: row not yet visible (BS commits async).
+        { status: 404, body: { message: 'No Tracks found' } },
+        // Subsequent polls: enriched.
+        { status: 200, body: [ENRICHED_SENTINEL_ROW] },
+      ],
+    },
+    // dj-flowsheet-read.
+    { method: 'GET', pattern: '/flowsheet?n=', responses: [{ status: 200, body: [] }] },
+    // Fallback for any other bare-`/flowsheet` GET that might appear.
+    { method: 'GET', pattern: '/flowsheet', responses: [{ status: 200, body: [] }] },
+    { method: 'DELETE', pattern: '/flowsheet', responses: [{ status: 200, body: ENRICHED_SENTINEL_ROW }] },
+  ]);
+}
+
+/**
+ * Enrichment-quality (write canary v1) — the check the 2026-05-13 LML
+ * regression would have caught. Pins:
+ *   - Happy path passes and emits `EnrichmentLagSeconds`.
+ *   - Skip when another DJ is on-air (no inserts, no metric).
+ *   - Skip when `enableWriteProbe` is false.
+ *   - Polling timeout fails fast (within budget) AND cleans up the row.
+ *   - Insert 5xx propagates as fail without attempting delete.
+ */
+describe('enrichment-quality write canary', () => {
+  const writeProbeConfig: CanaryConfig = {
+    backendUrl: 'https://api.example.test',
+    authUrl: 'https://auth.example.test',
+    semanticIndexUrl: 'https://explore.example.test',
+    djEmail: 'canary@wxyc.org',
+    djPassword: 'pw',
+    enableWriteProbe: true,
+    enrichmentPollIntervalMs: 5,
+    enrichmentPollTimeoutMs: 500,
+    publishMetrics: false,
+  };
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('passes and emits EnrichmentLagSeconds on the happy path', async () => {
+    setUpEnrichmentHappyPathMock();
+
+    const outcomes = await runCanary(writeProbeConfig);
+    const enrichment = outcomes.find((o) => o.name === 'enrichment-quality')!;
+
+    expect(enrichment.status).toBe('pass');
+    expect(enrichment.metrics?.EnrichmentLagSeconds).toBeTypeOf('number');
+    expect(enrichment.metrics?.EnrichmentLagSeconds).toBeGreaterThanOrEqual(0);
+    // Sanity: the lag must be under the test poll budget; otherwise the
+    // check returned a value but ran the full timeout — that would mean
+    // the loop's "break on success" branch never fired.
+    expect(enrichment.metrics?.EnrichmentLagSeconds).toBeLessThan(1);
+  });
+
+  it('downgrades to skipped when CANARY_ENABLE_WRITE_PROBE is false (no fetch to write endpoints)', async () => {
+    const { fetchMock } = setUpEnrichmentHappyPathMock();
+
+    const outcomes = await runCanary({ ...writeProbeConfig, enableWriteProbe: false });
+    const enrichment = outcomes.find((o) => o.name === 'enrichment-quality')!;
+
+    expect(enrichment.status).toBe('skipped');
+    expect(enrichment.message).toMatch(/write probe disabled/);
+    expect(enrichment.metrics?.EnrichmentLagSeconds).toBeUndefined();
+
+    // No write endpoints called.
+    const calls = fetchMock.mock.calls.map(([url]) => String(url));
+    expect(calls.some((u) => u.includes('/flowsheet/join'))).toBe(false);
+    expect(calls.some((u) => u.includes('/flowsheet/end'))).toBe(false);
+  });
+
+  it('skips with a meaningful reason when another DJ is on-air', async () => {
+    const { fetchMock } = setUpMethodAwareMock([
+      { method: 'GET', pattern: '/healthcheck', responses: [{ status: 200, body: { ok: true } }] },
+      {
+        method: 'GET',
+        pattern: '/proxy/library/search',
+        responses: [{ status: 200, body: proxyLibrarySearchResponse }],
+      },
+      {
+        method: 'GET',
+        pattern: '/graph/artists/search',
+        responses: [{ status: 200, body: { results: [{ id: 1 }] } }],
+      },
+      { method: 'GET', pattern: '/library/?artist_name=', responses: [{ status: 200, body: stereolabSearchResults }] },
+      { method: 'GET', pattern: '/library/rotation', responses: [{ status: 200, body: [] }] },
+      {
+        method: 'POST',
+        pattern: '/sign-in/email',
+        responses: [{ status: 200, body: { token: 's', user: { id: 'canary-user-id' } } }],
+      },
+      { method: 'GET', pattern: '/token', responses: [{ status: 200, body: { token: 'jwt' } }] },
+      // Real DJ on-air, NOT the canary user.
+      {
+        method: 'GET',
+        pattern: '/flowsheet/djs-on-air',
+        responses: [{ status: 200, body: [{ id: 'real-dj-id', dj_name: 'Real DJ' }] }],
+      },
+      { method: 'GET', pattern: '/flowsheet', responses: [{ status: 200, body: [] }] },
+    ]);
+
+    const outcomes = await runCanary(writeProbeConfig);
+    const enrichment = outcomes.find((o) => o.name === 'enrichment-quality')!;
+
+    expect(enrichment.status).toBe('skipped');
+    expect(enrichment.message).toMatch(/other DJ on-air/);
+
+    // Critical: no insert was attempted into the real DJ's show.
+    const calls = fetchMock.mock.calls.map(([url, init]) => ({
+      url: String(url),
+      method: String((init as RequestInit | undefined)?.method ?? 'GET').toUpperCase(),
+    }));
+    expect(calls.some((c) => c.method === 'POST' && c.url.includes('/flowsheet/join'))).toBe(false);
+    const flowsheetPosts = calls.filter((c) => c.method === 'POST' && /\/flowsheet(\?|$)/.test(c.url));
+    expect(flowsheetPosts).toHaveLength(0);
+  });
+
+  it('fails on insert error WITHOUT attempting cleanup (no row was created)', async () => {
+    const { fetchMock } = setUpMethodAwareMock([
+      { method: 'GET', pattern: '/healthcheck', responses: [{ status: 200, body: { ok: true } }] },
+      {
+        method: 'GET',
+        pattern: '/proxy/library/search',
+        responses: [{ status: 200, body: proxyLibrarySearchResponse }],
+      },
+      {
+        method: 'GET',
+        pattern: '/graph/artists/search',
+        responses: [{ status: 200, body: { results: [{ id: 1 }] } }],
+      },
+      { method: 'GET', pattern: '/library/?artist_name=', responses: [{ status: 200, body: stereolabSearchResults }] },
+      { method: 'GET', pattern: '/library/rotation', responses: [{ status: 200, body: [] }] },
+      {
+        method: 'POST',
+        pattern: '/sign-in/email',
+        responses: [{ status: 200, body: { token: 's', user: { id: 'canary-user-id' } } }],
+      },
+      { method: 'GET', pattern: '/token', responses: [{ status: 200, body: { token: 'jwt' } }] },
+      { method: 'GET', pattern: '/flowsheet/djs-on-air', responses: [{ status: 200, body: [] }] },
+      { method: 'POST', pattern: '/flowsheet/join', responses: [{ status: 200, body: { id: 99 } }] },
+      { method: 'POST', pattern: '/flowsheet/end', responses: [{ status: 200, body: { id: 99 } }] },
+      {
+        method: 'POST',
+        pattern: '/flowsheet',
+        responses: [{ status: 500, body: { message: 'play_order index lookup failed' } }],
+      },
+      { method: 'GET', pattern: '/flowsheet', responses: [{ status: 200, body: [] }] },
+      { method: 'DELETE', pattern: '/flowsheet', responses: [{ status: 200, body: {} }] },
+    ]);
+
+    const outcomes = await runCanary(writeProbeConfig);
+    const enrichment = outcomes.find((o) => o.name === 'enrichment-quality')!;
+
+    expect(enrichment.status).toBe('fail');
+    expect(enrichment.message).toMatch(/insert failed with 500/);
+
+    // No DELETE — there's no row to clean up.
+    const calls = fetchMock.mock.calls.map(([url, init]) => ({
+      url: String(url),
+      method: String((init as RequestInit | undefined)?.method ?? 'GET').toUpperCase(),
+    }));
+    expect(calls.some((c) => c.method === 'DELETE')).toBe(false);
+  });
+
+  it('fails on polling timeout AND still cleans up the row and ends the show', async () => {
+    const { fetchMock } = setUpMethodAwareMock([
+      { method: 'GET', pattern: '/healthcheck', responses: [{ status: 200, body: { ok: true } }] },
+      {
+        method: 'GET',
+        pattern: '/proxy/library/search',
+        responses: [{ status: 200, body: proxyLibrarySearchResponse }],
+      },
+      {
+        method: 'GET',
+        pattern: '/graph/artists/search',
+        responses: [{ status: 200, body: { results: [{ id: 1 }] } }],
+      },
+      { method: 'GET', pattern: '/library/?artist_name=', responses: [{ status: 200, body: stereolabSearchResults }] },
+      { method: 'GET', pattern: '/library/rotation', responses: [{ status: 200, body: [] }] },
+      {
+        method: 'POST',
+        pattern: '/sign-in/email',
+        responses: [{ status: 200, body: { token: 's', user: { id: 'canary-user-id' } } }],
+      },
+      { method: 'GET', pattern: '/token', responses: [{ status: 200, body: { token: 'jwt' } }] },
+      { method: 'GET', pattern: '/flowsheet/djs-on-air', responses: [{ status: 200, body: [] }] },
+      { method: 'POST', pattern: '/flowsheet/join', responses: [{ status: 200, body: { id: 99 } }] },
+      { method: 'POST', pattern: '/flowsheet/end', responses: [{ status: 200, body: { id: 99 } }] },
+      {
+        method: 'POST',
+        pattern: '/flowsheet',
+        responses: [{ status: 201, body: { id: SENTINEL_ROW_ID } }],
+      },
+      {
+        method: 'GET',
+        pattern: '/flowsheet?start_id=',
+        // Poll forever returns the row but with null youtube_music_url —
+        // this is the 2026-05-13 regression shape exactly.
+        responses: [{ status: 200, body: [{ ...ENRICHED_SENTINEL_ROW, youtube_music_url: null }] }],
+      },
+      { method: 'GET', pattern: '/flowsheet?n=', responses: [{ status: 200, body: [] }] },
+      { method: 'GET', pattern: '/flowsheet', responses: [{ status: 200, body: [] }] },
+      { method: 'DELETE', pattern: '/flowsheet', responses: [{ status: 200, body: ENRICHED_SENTINEL_ROW }] },
+    ]);
+
+    // Tighter timeout so the test runs in well under 1s.
+    const outcomes = await runCanary({ ...writeProbeConfig, enrichmentPollTimeoutMs: 80, enrichmentPollIntervalMs: 5 });
+    const enrichment = outcomes.find((o) => o.name === 'enrichment-quality')!;
+
+    expect(enrichment.status).toBe('fail');
+    expect(enrichment.message).toMatch(/did not populate youtube_music_url/);
+
+    // Cleanup must have run despite the failure — DELETE + end-show called.
+    const calls = fetchMock.mock.calls.map(([url, init]) => ({
+      url: String(url),
+      method: String((init as RequestInit | undefined)?.method ?? 'GET').toUpperCase(),
+    }));
+    expect(calls.some((c) => c.method === 'DELETE' && c.url.includes('/flowsheet'))).toBe(true);
+    expect(calls.some((c) => c.method === 'POST' && c.url.includes('/flowsheet/end'))).toBe(true);
+  });
+
+  it('publishMetrics emits EnrichmentLagSeconds dimensioned + dimensionless on pass', async () => {
+    cloudWatchSendMock.mockClear();
+    process.env.CANARY_BACKEND_URL = 'https://api.example.test';
+    process.env.CANARY_AUTH_URL = 'https://auth.example.test';
+    process.env.CANARY_SEMANTIC_INDEX_URL = 'https://explore.example.test';
+    process.env.CANARY_PUBLISH_METRICS = 'true';
+    process.env.CANARY_DJ_EMAIL = 'canary@wxyc.org';
+    process.env.CANARY_DJ_PASSWORD = 'pw';
+    process.env.CANARY_ENABLE_WRITE_PROBE = 'true';
+    process.env.CANARY_ENRICHMENT_POLL_INTERVAL_MS = '5';
+    process.env.CANARY_ENRICHMENT_POLL_TIMEOUT_MS = '500';
+    try {
+      setUpEnrichmentHappyPathMock();
+      await handler();
+
+      const metricData = getPublishedMetrics();
+      const lagMetrics = metricData.filter((d) => d.MetricName === 'EnrichmentLagSeconds');
+      const dimensioned = lagMetrics.filter((d) => d.Dimensions && d.Dimensions.length > 0);
+      const dimensionless = lagMetrics.filter((d) => !d.Dimensions || d.Dimensions.length === 0);
+
+      // The dimensionless emit is what `wxyc-canary-enrichment-lag`
+      // targets. A regression that emitted only the dimensioned variant
+      // would leave the alarm at INSUFFICIENT_DATA forever (the
+      // wxyc-canary#13 lesson, generalized).
+      expect(dimensioned).toHaveLength(1);
+      expect(dimensionless).toHaveLength(1);
+      expect(dimensioned[0]!.Dimensions![0]!).toEqual({ Name: 'Check', Value: 'enrichment-quality' });
+      expect(dimensioned[0]!.Value).toBe(dimensionless[0]!.Value);
+      expect(dimensioned[0]!.Value).toBeGreaterThanOrEqual(0);
+    } finally {
+      delete process.env.CANARY_BACKEND_URL;
+      delete process.env.CANARY_AUTH_URL;
+      delete process.env.CANARY_SEMANTIC_INDEX_URL;
+      delete process.env.CANARY_PUBLISH_METRICS;
+      delete process.env.CANARY_DJ_EMAIL;
+      delete process.env.CANARY_DJ_PASSWORD;
+      delete process.env.CANARY_ENABLE_WRITE_PROBE;
+      delete process.env.CANARY_ENRICHMENT_POLL_INTERVAL_MS;
+      delete process.env.CANARY_ENRICHMENT_POLL_TIMEOUT_MS;
+    }
+  });
+
+  it('publishMetrics does NOT emit EnrichmentLagSeconds when the check is skipped or failed', async () => {
+    // Skipped path: no DJ credentials → enrichment-quality skips for two
+    // reasons (no creds AND write probe off by default). Either way, no
+    // value was measured — the alarm series should stay quiet.
+    cloudWatchSendMock.mockClear();
+    process.env.CANARY_BACKEND_URL = 'https://api.example.test';
+    process.env.CANARY_AUTH_URL = 'https://auth.example.test';
+    process.env.CANARY_SEMANTIC_INDEX_URL = 'https://explore.example.test';
+    process.env.CANARY_PUBLISH_METRICS = 'true';
+    delete process.env.CANARY_DJ_EMAIL;
+    delete process.env.CANARY_DJ_PASSWORD;
+    delete process.env.CANARY_DJ_SECRET_ARN;
+    delete process.env.CANARY_ENABLE_WRITE_PROBE;
+    try {
+      setUpFetchMock({
+        '/healthcheck': { status: 200, body: { ok: true } },
+        '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+        '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
+      });
+      await handler();
+      const metricData = getPublishedMetrics();
+      expect(metricData.filter((d) => d.MetricName === 'EnrichmentLagSeconds')).toHaveLength(0);
+    } finally {
+      delete process.env.CANARY_BACKEND_URL;
+      delete process.env.CANARY_AUTH_URL;
+      delete process.env.CANARY_SEMANTIC_INDEX_URL;
+      delete process.env.CANARY_PUBLISH_METRICS;
     }
   });
 });

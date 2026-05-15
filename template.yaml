@@ -36,6 +36,25 @@ Parameters:
     Type: String
     Default: rate(5 minutes)
     Description: EventBridge schedule for the canary. rate() or cron().
+  EnableWriteProbe:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >
+      Opt in to the enrichment-quality write canary. When 'true', every
+      invocation inserts a sentinel flowsheet row, polls for enrichment,
+      and deletes the row. Defaults 'false' so a fresh deploy does not
+      write to production until the DJ test account is provisioned and
+      the operator has reviewed the cleanup-on-failure behaviour.
+  EnrichmentLagThresholdSeconds:
+    Type: Number
+    Default: 30
+    Description: >
+      EnrichmentLag alarm threshold, in seconds. Fires when the canary's
+      sentinel row took longer than this to be populated with a
+      `youtube_music_url`. 30 s is the BS-side fire-and-forget timeout
+      after which a real iOS playcut would already have rendered with
+      null metadata.
 
 Conditions:
   HasDjCredentials: !Not [!Equals [!Ref DjCredentialsSecretArn, '']]
@@ -60,6 +79,7 @@ Resources:
           CANARY_AUTH_URL: !Ref AuthUrl
           CANARY_SEMANTIC_INDEX_URL: !Ref SemanticIndexUrl
           CANARY_DJ_SECRET_ARN: !If [HasDjCredentials, !Ref DjCredentialsSecretArn, '']
+          CANARY_ENABLE_WRITE_PROBE: !Ref EnableWriteProbe
       Policies:
         - Statement:
             - Effect: Allow
@@ -121,6 +141,43 @@ Resources:
       DatapointsToAlarm: 2
       Threshold: 1
       ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+      OKActions:
+        - !Ref AlertTopic
+
+  # Enrichment-quality SLO alarm. Targets the dimensionless EnrichmentLag
+  # series emitted by the `enrichment-quality` write canary. Threshold and
+  # treatment-of-missing-data:
+  #   - Threshold is operator-tunable via `EnrichmentLagThresholdSeconds`
+  #     (default 30 s — the BS-side fire-and-forget timeout after which an
+  #     iOS playcut would have rendered with null metadata).
+  #   - 3 evaluation periods at 5 min cadence = the alarm needs sustained
+  #     breach (15 min) before firing, which clears small Discogs-side
+  #     latency spikes without delaying the on-air paging window.
+  #   - `notBreaching` on missing data: when `EnableWriteProbe=false` the
+  #     metric is simply absent, and the alarm must sit at OK — wxyc-canary#13
+  #     pinned the "no data → no firing" failure mode the other way.
+  EnrichmentLagAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: wxyc-canary-enrichment-lag
+      AlarmDescription: WXYC canary sentinel row exceeded the enrichment lag SLO.
+      Namespace: WXYC/Canary
+      # The metric is suffixed with the unit because CloudWatch's dashboard
+      # views surface name and unit together — `EnrichmentLagSeconds` is
+      # immediately self-documenting in the metric picker. The `Seconds`
+      # suffix is also the unit hint `publishMetrics` reads when emitting
+      # this datum. Suffix convention: `*Seconds`, `*Milliseconds`, or
+      # default `Count` (see `unitForMetric` in src/handler.ts).
+      MetricName: EnrichmentLagSeconds
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      Threshold: !Ref EnrichmentLagThresholdSeconds
+      ComparisonOperator: GreaterThanThreshold
       TreatMissingData: notBreaching
       AlarmActions:
         - !Ref AlertTopic

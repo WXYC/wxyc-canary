@@ -1,9 +1,11 @@
-import { CloudWatchClient, PutMetricDataCommand, StandardUnit } from '@aws-sdk/client-cloudwatch';
+import { CloudWatchClient, PutMetricDataCommand, StandardUnit, type MetricDatum } from '@aws-sdk/client-cloudwatch';
 import { GetSecretValueCommand, SecretsManagerClient } from '@aws-sdk/client-secrets-manager';
 import { checks, signInDj } from './checks.js';
-import type { CanaryConfig, CheckContext, CheckOutcome } from './types.js';
+import type { CanaryConfig, CheckContext, CheckOutcome, CheckResult } from './types.js';
 
 const METRIC_NAMESPACE = 'WXYC/Canary';
+const DEFAULT_ENRICHMENT_POLL_TIMEOUT_MS = 45_000;
+const DEFAULT_ENRICHMENT_POLL_INTERVAL_MS = 2_000;
 
 function loadConfigFromEnv(): CanaryConfig {
   const required = (key: string): string => {
@@ -21,6 +23,13 @@ function loadConfigFromEnv(): CanaryConfig {
     timeoutMs: process.env.CANARY_TIMEOUT_MS ? Number(process.env.CANARY_TIMEOUT_MS) : 8000,
     awsRegion: process.env.AWS_REGION ?? 'us-east-1',
     publishMetrics: process.env.CANARY_PUBLISH_METRICS !== 'false',
+    enableWriteProbe: process.env.CANARY_ENABLE_WRITE_PROBE === 'true',
+    enrichmentPollTimeoutMs: process.env.CANARY_ENRICHMENT_POLL_TIMEOUT_MS
+      ? Number(process.env.CANARY_ENRICHMENT_POLL_TIMEOUT_MS)
+      : undefined,
+    enrichmentPollIntervalMs: process.env.CANARY_ENRICHMENT_POLL_INTERVAL_MS
+      ? Number(process.env.CANARY_ENRICHMENT_POLL_INTERVAL_MS)
+      : undefined,
   };
 }
 
@@ -55,7 +64,8 @@ async function resolveDjCredentials(config: CanaryConfig): Promise<{ email: stri
  * Run every check, regardless of individual failures. Returns one outcome
  * per check. DJ-auth checks downgrade to 'skipped' when no DJ credentials
  * are configured — distinct from 'fail' so the alarm only fires on real
- * regressions, not on operator-caused gaps.
+ * regressions, not on operator-caused gaps. Write-canary checks also
+ * downgrade to 'skipped' when `enableWriteProbe=false` (the default).
  */
 export async function runCanary(config: CanaryConfig): Promise<CheckOutcome[]> {
   let djCreds: { email: string; password: string } | undefined;
@@ -67,14 +77,17 @@ export async function runCanary(config: CanaryConfig): Promise<CheckOutcome[]> {
   }
 
   let djBearerToken: string | undefined;
+  let djUserId: string | undefined;
   if (djCreds) {
     try {
-      djBearerToken = await signInDj(
+      const signIn = await signInDj(
         config.authUrl,
         djCreds.email,
         djCreds.password,
         config.originUrl ?? 'https://dj.wxyc.org'
       );
+      djBearerToken = signIn.jwt;
+      djUserId = signIn.userId;
     } catch (err) {
       djAuthError = (err as Error).message;
       // Don't throw — let the DJ-auth checks individually fail with the auth
@@ -89,6 +102,9 @@ export async function runCanary(config: CanaryConfig): Promise<CheckOutcome[]> {
     authUrl: config.authUrl,
     semanticIndexUrl: config.semanticIndexUrl,
     djBearerToken,
+    djUserId,
+    enrichmentPollTimeoutMs: config.enrichmentPollTimeoutMs ?? DEFAULT_ENRICHMENT_POLL_TIMEOUT_MS,
+    enrichmentPollIntervalMs: config.enrichmentPollIntervalMs ?? DEFAULT_ENRICHMENT_POLL_INTERVAL_MS,
   };
 
   const outcomes = await Promise.all(
@@ -99,11 +115,33 @@ export async function runCanary(config: CanaryConfig): Promise<CheckOutcome[]> {
       if (check.requiresAuth && djAuthError) {
         return { name: check.name, status: 'fail', latencyMs: 0, message: `auth precondition failed: ${djAuthError}` };
       }
+      if (check.writes && !config.enableWriteProbe) {
+        return {
+          name: check.name,
+          status: 'skipped',
+          latencyMs: 0,
+          message: 'write probe disabled (CANARY_ENABLE_WRITE_PROBE)',
+        };
+      }
 
       const startedAt = performance.now();
       try {
-        await check.run(ctx);
-        return { name: check.name, status: 'pass', latencyMs: Math.round(performance.now() - startedAt) };
+        const result: void | CheckResult = await check.run(ctx);
+        const latencyMs = Math.round(performance.now() - startedAt);
+        if (result && result.skipped) {
+          return {
+            name: check.name,
+            status: 'skipped',
+            latencyMs,
+            message: result.skipReason ?? 'check skipped',
+          };
+        }
+        return {
+          name: check.name,
+          status: 'pass',
+          latencyMs,
+          metrics: result?.metrics,
+        };
       } catch (err) {
         return {
           name: check.name,
@@ -119,18 +157,33 @@ export async function runCanary(config: CanaryConfig): Promise<CheckOutcome[]> {
 }
 
 /**
- * Publish per-check failure, skip, and latency metrics in one PutMetricData
- * call. `CheckFailure` is emitted twice (dimensioned + dimensionless) — see
- * CLAUDE.md "Conventions" for the alarm-aggregation rationale. Failures
- * stay non-fatal so the Lambda still exits on the outcome list, not on a
- * CloudWatch hiccup.
+ * Infer a CloudWatch unit from the metric name suffix. Keep this in lock-step
+ * with the convention documented on `CheckResult.metrics` in `types.ts` —
+ * callers name metrics expecting a specific unit, and silently defaulting to
+ * Count would render dashboards meaningless.
+ */
+function unitForMetric(metricName: string): StandardUnit {
+  if (metricName.endsWith('Seconds')) return StandardUnit.Seconds;
+  if (metricName.endsWith('Milliseconds')) return StandardUnit.Milliseconds;
+  return StandardUnit.Count;
+}
+
+/**
+ * Publish per-check failure, skip, latency, and any custom metrics in one
+ * PutMetricData call. `CheckFailure` is emitted twice (dimensioned +
+ * dimensionless) per the wxyc-canary#13 convention. Custom check metrics
+ * (`outcome.metrics`) follow the same pattern: emitted once with the
+ * `Check` dimension and once dimensionless, so a plain-form alarm can
+ * target the dimensionless series without a SUM(SEARCH(...)) expression.
+ * Failures stay non-fatal so the Lambda still exits on the outcome list,
+ * not on a CloudWatch hiccup.
  */
 async function publishMetrics(outcomes: CheckOutcome[], region: string): Promise<void> {
   const client = new CloudWatchClient({ region });
   const timestamp = new Date();
   const metricData = outcomes.flatMap((o) => {
     const failureValue = o.status === 'fail' ? 1 : 0;
-    return [
+    const base: MetricDatum[] = [
       {
         MetricName: 'CheckFailure',
         Value: failureValue,
@@ -160,6 +213,28 @@ async function publishMetrics(outcomes: CheckOutcome[], region: string): Promise
         Dimensions: [{ Name: 'Check', Value: o.name }],
       },
     ];
+    if (o.metrics) {
+      for (const [name, value] of Object.entries(o.metrics)) {
+        const unit = unitForMetric(name);
+        base.push(
+          {
+            MetricName: name,
+            Value: value,
+            Unit: unit,
+            Timestamp: timestamp,
+            Dimensions: [{ Name: 'Check', Value: o.name }],
+          },
+          {
+            MetricName: name,
+            Value: value,
+            Unit: unit,
+            Timestamp: timestamp,
+            Dimensions: [],
+          }
+        );
+      }
+    }
+    return base;
   });
   await client.send(new PutMetricDataCommand({ Namespace: METRIC_NAMESPACE, MetricData: metricData }));
 }
