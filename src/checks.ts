@@ -209,7 +209,11 @@ function parseRetryAfterMs(result: FetchResult): number | undefined {
  * `Retry-After` (seconds form) when present, capped to 5s so the Lambda
  * still finishes inside its budget.
  */
-export type DjSignInResult = { jwt: string; userId: string };
+// `userId` is best-effort: a missing user.id only fails the write canary
+// (which throws its own preflight error when `ctx.djUserId` is undefined).
+// Read-only DJ-auth checks tolerate the absence so a better-auth response-
+// shape rev doesn't cascade into four false-positive failures.
+export type DjSignInResult = { jwt: string; userId: string | undefined };
 
 export async function signInDj(
   authUrl: string,
@@ -237,15 +241,11 @@ export async function signInDj(
   if (!signInBody || typeof signInBody.token !== 'string' || signInBody.token.length === 0) {
     throw new Error(`auth sign-in returned no session token: ${signIn.rawText.slice(0, 200)}`);
   }
-  if (!signInBody.user || typeof signInBody.user.id !== 'string' || signInBody.user.id.length === 0) {
-    // The write canary uses user.id as `dj_id` in /flowsheet/join + /end
-    // bodies. Better-auth's sign-in always returns user, so this absence
-    // is a real contract regression worth failing on rather than papering
-    // over with an Authorization-header round-trip back to /session.
-    throw new Error(`auth sign-in returned no user id: ${signIn.rawText.slice(0, 200)}`);
-  }
   const sessionToken = signInBody.token;
-  const userId = signInBody.user.id;
+  const userId =
+    signInBody.user && typeof signInBody.user.id === 'string' && signInBody.user.id.length > 0
+      ? signInBody.user.id
+      : undefined;
 
   const tokenExchange = await canaryFetch(`${authUrl}/token`, {
     headers: { Authorization: `Bearer ${sessionToken}`, Origin: originUrl },

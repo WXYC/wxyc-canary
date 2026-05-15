@@ -965,9 +965,80 @@ describe('enrichment-quality write canary', () => {
     const calls = fetchMock.mock.calls.map(([url, init]) => ({
       url: String(url),
       method: String((init as RequestInit | undefined)?.method ?? 'GET').toUpperCase(),
+      body: (init as RequestInit | undefined)?.body,
     }));
-    expect(calls.some((c) => c.method === 'DELETE' && c.url.includes('/flowsheet'))).toBe(true);
+    const deleteCall = calls.find((c) => c.method === 'DELETE' && c.url.includes('/flowsheet'));
+    expect(deleteCall).toBeDefined();
+    // The DELETE body must carry the actual inserted row's id so cleanup
+    // hits the right row. Body shape: { entry_id: <number> }.
+    expect(deleteCall!.body).toBeTypeOf('string');
+    expect(JSON.parse(deleteCall!.body as string)).toMatchObject({ entry_id: SENTINEL_ROW_ID });
     expect(calls.some((c) => c.method === 'POST' && c.url.includes('/flowsheet/end'))).toBe(true);
+  });
+
+  it('passes with EnrichmentLagSeconds above threshold when enrichment is slow but completes before timeout (SLO-violation but functional)', async () => {
+    // This is the primary failure-mode the alarm guards against: enrichment
+    // completes (so the check still passes) but takes long enough to
+    // breach the SLO threshold. The alarm trips on the metric value, not
+    // the check status — there's no test in the suite that pins this
+    // independently of the timeout path.
+    const nullPoll = { status: 200, body: [{ ...ENRICHED_SENTINEL_ROW, youtube_music_url: null }] };
+    setUpMethodAwareMock([
+      { method: 'GET', pattern: '/healthcheck', responses: [{ status: 200, body: { ok: true } }] },
+      {
+        method: 'GET',
+        pattern: '/proxy/library/search',
+        responses: [{ status: 200, body: proxyLibrarySearchResponse }],
+      },
+      {
+        method: 'GET',
+        pattern: '/graph/artists/search',
+        responses: [{ status: 200, body: { results: [{ id: 1 }] } }],
+      },
+      { method: 'GET', pattern: '/library/?artist_name=', responses: [{ status: 200, body: stereolabSearchResults }] },
+      { method: 'GET', pattern: '/library/rotation', responses: [{ status: 200, body: [] }] },
+      {
+        method: 'POST',
+        pattern: '/sign-in/email',
+        responses: [{ status: 200, body: { token: 's', user: { id: 'canary-user-id' } } }],
+      },
+      { method: 'GET', pattern: '/token', responses: [{ status: 200, body: { token: 'jwt' } }] },
+      { method: 'GET', pattern: '/flowsheet/djs-on-air', responses: [{ status: 200, body: [] }] },
+      { method: 'POST', pattern: '/flowsheet/join', responses: [{ status: 200, body: { id: 99 } }] },
+      { method: 'POST', pattern: '/flowsheet/end', responses: [{ status: 200, body: { id: 99 } }] },
+      {
+        method: 'POST',
+        pattern: '/flowsheet',
+        responses: [{ status: 201, body: { id: SENTINEL_ROW_ID } }],
+      },
+      {
+        method: 'GET',
+        pattern: '/flowsheet?start_id=',
+        // First 4 polls report a null youtube_music_url, then the 5th
+        // returns the enriched row. The mock dispenses responses
+        // sequentially and the last entry sticks for any extras.
+        responses: [nullPoll, nullPoll, nullPoll, nullPoll, { status: 200, body: [ENRICHED_SENTINEL_ROW] }],
+      },
+      { method: 'GET', pattern: '/flowsheet?n=', responses: [{ status: 200, body: [] }] },
+      { method: 'GET', pattern: '/flowsheet', responses: [{ status: 200, body: [] }] },
+      { method: 'DELETE', pattern: '/flowsheet', responses: [{ status: 200, body: ENRICHED_SENTINEL_ROW }] },
+    ]);
+
+    // Poll interval 20ms × 5 polls ≈ 100ms of lag. Threshold is enforced
+    // by the CloudWatch alarm, not the check; the check passes because
+    // enrichment did populate before the 500ms timeout.
+    const outcomes = await runCanary({
+      ...writeProbeConfig,
+      enrichmentPollTimeoutMs: 500,
+      enrichmentPollIntervalMs: 20,
+    });
+    const enrichment = outcomes.find((o) => o.name === 'enrichment-quality')!;
+
+    expect(enrichment.status).toBe('pass');
+    // ≥80ms of poll delay (4 sleeps of 20ms before the 5th poll wins);
+    // the metric should reflect the multi-poll lag rather than the
+    // single-poll happy-path number.
+    expect(enrichment.metrics?.EnrichmentLagSeconds).toBeGreaterThanOrEqual(0.07);
   });
 
   it('publishMetrics emits EnrichmentLagSeconds dimensioned + dimensionless on pass', async () => {
