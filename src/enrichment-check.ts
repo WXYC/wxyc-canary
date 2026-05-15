@@ -71,7 +71,6 @@ export async function runEnrichmentCheck(ctx: CheckContext): Promise<CheckResult
   // 2. Join the show. The /flowsheet/join controller starts a new show if
   //    there's no active one, or adds the DJ to the existing one. Either
   //    way, addEntry will pass showMemberMiddleware afterwards.
-  const canaryAlreadyInShow = djs.some((d) => d.id === ctx.djUserId);
   const joinResp = await canaryFetch(`${ctx.backendUrl}/flowsheet/join`, {
     method: 'POST',
     headers: jsonAuth,
@@ -85,7 +84,6 @@ export async function runEnrichmentCheck(ctx: CheckContext): Promise<CheckResult
   //    branch that fires fireAndForgetMetadata + fireAndForgetLinkage,
   //    which is exactly the enrichment path the 2026-05-13 regression
   //    broke.
-  const insertStartedAt = performance.now();
   const insertResp = await canaryFetch(`${ctx.backendUrl}/flowsheet`, {
     method: 'POST',
     headers: jsonAuth,
@@ -99,7 +97,6 @@ export async function runEnrichmentCheck(ctx: CheckContext): Promise<CheckResult
 
   let insertedId: number | undefined;
   let lagSeconds: number | undefined;
-  let primaryError: Error | undefined;
 
   try {
     if (!insertResp.ok) {
@@ -110,6 +107,11 @@ export async function runEnrichmentCheck(ctx: CheckContext): Promise<CheckResult
       throw new Error(`flowsheet insert returned no id: ${insertResp.rawText.slice(0, 200)}`);
     }
     insertedId = insertBody.id;
+    // Start the enrichment-lag clock *after* the row is committed in BS.
+    // The metric is the time-from-insert-visible to enrichment-fields-
+    // populated, not the canary's own POST round-trip. Threshold in
+    // template.yaml is calibrated against the BS fire-and-forget budget.
+    const insertConfirmedAt = performance.now();
 
     // 4. Poll the row range until the row's youtube_music_url is populated.
     //    `?start_id=N-1&end_id=N+1` matches the row exactly (range endpoint
@@ -130,7 +132,7 @@ export async function runEnrichmentCheck(ctx: CheckContext): Promise<CheckResult
       const entries = Array.isArray(pollResp.body) ? (pollResp.body as V2FlowsheetTrackEntry[]) : [];
       const row = entries.find((e) => e.id === insertedId);
       if (row?.youtube_music_url) {
-        lagSeconds = (performance.now() - insertStartedAt) / 1000;
+        lagSeconds = (performance.now() - insertConfirmedAt) / 1000;
         break;
       }
     }
@@ -140,13 +142,10 @@ export async function runEnrichmentCheck(ctx: CheckContext): Promise<CheckResult
         `enrichment did not populate youtube_music_url within ${ctx.enrichmentPollTimeoutMs}ms (sentinel id=${insertedId})`
       );
     }
-  } catch (err) {
-    primaryError = err as Error;
-    throw err;
   } finally {
     // 5. Best-effort cleanup. Delete the row first (so even if endShow
     //    fails we don't leak sentinel rows), then end the show. Failures
-    //    here are logged but never override the primary error.
+    //    here are logged but never override the primary throw.
     if (insertedId !== undefined) {
       try {
         const delResp = await canaryFetch(`${ctx.backendUrl}/flowsheet`, {
@@ -165,29 +164,24 @@ export async function runEnrichmentCheck(ctx: CheckContext): Promise<CheckResult
         );
       }
     }
-    // Only end the show if we started it ourselves. If the canary DJ was
-    // already in the show coming in, the show belongs to a previous run
-    // (or some other workflow) — leave it alone.
-    if (!canaryAlreadyInShow) {
-      try {
-        const endResp = await canaryFetch(`${ctx.backendUrl}/flowsheet/end`, {
-          method: 'POST',
-          headers: jsonAuth,
-          body: JSON.stringify({ dj_id: ctx.djUserId }),
-        });
-        if (!endResp.ok) {
-          console.warn(
-            `[enrichment-check] cleanup end-show failed: ${endResp.status} ${endResp.rawText.slice(0, 200)}`
-          );
-        }
-      } catch (err) {
-        console.warn(`[enrichment-check] cleanup end-show threw: ${(err as Error).message}`);
+    // End the show unconditionally. The djs-on-air precondition at step 1
+    // guarantees that if anyone is on-air now, it's the canary DJ — either
+    // because we joined a fresh show or because a previous canary run
+    // crashed mid-cleanup and left its show open. In both cases the
+    // canary owns the show; the previous "only end if we started it"
+    // gating leaked the show indefinitely across runs.
+    try {
+      const endResp = await canaryFetch(`${ctx.backendUrl}/flowsheet/end`, {
+        method: 'POST',
+        headers: jsonAuth,
+        body: JSON.stringify({ dj_id: ctx.djUserId }),
+      });
+      if (!endResp.ok) {
+        console.warn(`[enrichment-check] cleanup end-show failed: ${endResp.status} ${endResp.rawText.slice(0, 200)}`);
       }
+    } catch (err) {
+      console.warn(`[enrichment-check] cleanup end-show threw: ${(err as Error).message}`);
     }
-    // Re-throwing isn't necessary; the original try-catch already
-    // propagated `primaryError`. Reading it here is solely to satisfy
-    // tools that might complain about unused locals.
-    void primaryError;
   }
 
   return { metrics: { EnrichmentLagSeconds: lagSeconds } };
