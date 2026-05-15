@@ -1,4 +1,5 @@
 import { canaryFetch, type FetchResult } from './client.js';
+import { runEnrichmentCheck } from './enrichment-check.js';
 import type { Check } from './types.js';
 
 /**
@@ -135,6 +136,30 @@ const djRotation: Check = {
   },
 };
 
+/**
+ * Write canary (v1). Inserts a sentinel flowsheet row, polls until LML
+ * enrichment populates `youtube_music_url`, deletes the row, ends the
+ * canary's show. Returns an `EnrichmentLagSeconds` metric the runner
+ * publishes as the `EnrichmentLag` CloudWatch series the
+ * `wxyc-canary-enrichment-lag` alarm targets.
+ *
+ * Opt-in via `CANARY_ENABLE_WRITE_PROBE=true` (default off). With the flag
+ * off, the runner downgrades this check to skipped — keeps existing
+ * deployments unchanged and lets the rollout proceed environment-by-env.
+ *
+ * Built for the 2026-05-13 LML cascade regression that left 70% of new
+ * playcut entries with null metadata for 2+ days while the read-only
+ * checks (`proxy-library-search`, `dj-flowsheet-read`) all stayed green
+ * — same shapes, just no enrichment behind them.
+ */
+const enrichmentQuality: Check = {
+  name: 'enrichment-quality',
+  description: 'Insert sentinel track + poll until LML enrichment populates youtube_music_url',
+  requiresAuth: true,
+  writes: true,
+  run: async (ctx) => runEnrichmentCheck(ctx),
+};
+
 export const checks: readonly Check[] = [
   healthcheck,
   proxyLibrarySearch,
@@ -142,6 +167,7 @@ export const checks: readonly Check[] = [
   djLibrarySearch,
   djFlowsheetRead,
   djRotation,
+  enrichmentQuality,
 ];
 
 /**
@@ -183,7 +209,14 @@ function parseRetryAfterMs(result: FetchResult): number | undefined {
  * `Retry-After` (seconds form) when present, capped to 5s so the Lambda
  * still finishes inside its budget.
  */
-export async function signInDj(authUrl: string, email: string, password: string, originUrl: string): Promise<string> {
+export type DjSignInResult = { jwt: string; userId: string };
+
+export async function signInDj(
+  authUrl: string,
+  email: string,
+  password: string,
+  originUrl: string
+): Promise<DjSignInResult> {
   const postSignIn = (): Promise<FetchResult> =>
     canaryFetch(`${authUrl}/sign-in/email`, {
       method: 'POST',
@@ -200,11 +233,19 @@ export async function signInDj(authUrl: string, email: string, password: string,
   if (!signIn.ok) {
     throw new Error(`auth sign-in failed with ${signIn.status}: ${signIn.rawText.slice(0, 200)}`);
   }
-  const signInBody = signIn.body as { token?: string };
+  const signInBody = signIn.body as { token?: string; user?: { id?: string } };
   if (!signInBody || typeof signInBody.token !== 'string' || signInBody.token.length === 0) {
     throw new Error(`auth sign-in returned no session token: ${signIn.rawText.slice(0, 200)}`);
   }
+  if (!signInBody.user || typeof signInBody.user.id !== 'string' || signInBody.user.id.length === 0) {
+    // The write canary uses user.id as `dj_id` in /flowsheet/join + /end
+    // bodies. Better-auth's sign-in always returns user, so this absence
+    // is a real contract regression worth failing on rather than papering
+    // over with an Authorization-header round-trip back to /session.
+    throw new Error(`auth sign-in returned no user id: ${signIn.rawText.slice(0, 200)}`);
+  }
   const sessionToken = signInBody.token;
+  const userId = signInBody.user.id;
 
   const tokenExchange = await canaryFetch(`${authUrl}/token`, {
     headers: { Authorization: `Bearer ${sessionToken}`, Origin: originUrl },
@@ -216,5 +257,5 @@ export async function signInDj(authUrl: string, email: string, password: string,
   if (!tokenBody || typeof tokenBody.token !== 'string' || tokenBody.token.length === 0) {
     throw new Error(`auth token exchange returned no JWT: ${tokenExchange.rawText.slice(0, 200)}`);
   }
-  return tokenBody.token;
+  return { jwt: tokenBody.token, userId };
 }
