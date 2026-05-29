@@ -83,10 +83,10 @@ describe('runCanary — anonymous-only configuration', () => {
     vi.unstubAllGlobals();
   });
 
-  it('passes the 2 truly-anonymous checks and skips the 5 auth checks when no credentials are configured', async () => {
+  it('passes the 2 truly-anonymous checks and skips the 6 auth checks when no credentials are configured', async () => {
     const outcomes = await runCanary(baseConfig);
 
-    expect(outcomes).toHaveLength(7);
+    expect(outcomes).toHaveLength(8);
     const byName = Object.fromEntries(outcomes.map((o) => [o.name, o]));
     expect(byName['backend-healthcheck'].status).toBe('pass');
     expect(byName['semantic-index-search'].status).toBe('pass');
@@ -94,6 +94,7 @@ describe('runCanary — anonymous-only configuration', () => {
     expect(byName['dj-library-search'].status).toBe('skipped');
     expect(byName['dj-flowsheet-read'].status).toBe('skipped');
     expect(byName['dj-rotation'].status).toBe('skipped');
+    expect(byName['dj-rotation-picker'].status).toBe('skipped');
     expect(byName['enrichment-quality'].status).toBe('skipped');
   });
 });
@@ -176,6 +177,72 @@ describe('runCanary — failure surfaces (regression coverage for the 2026-04-30
 
     expect(dj.status).toBe('fail');
     expect(dj.message).toMatch(/at least 1 hit/);
+  });
+
+  // Regression coverage for the BS#994 / BS#1029 / BS#1030 cluster. Without
+  // this check, the rotation-picker endpoint was only exercised when an
+  // on-air DJ tried to log a rotation track — outages surfaced as a
+  // "Loading tracks..." spinner that a DJ Slacked in, not as a metric.
+  // BS#1029 made 21% of active rotation rows JOIN-resolvable; the picker
+  // probe pins that the endpoint stays 2xx + array-shaped, so a future
+  // regression of either the JOIN path or the runtime cascade pages within
+  // ~5 min instead of waiting for someone to spot the spinner.
+  it('catches the rotation picker returning 502 (BS#1030 cascade-to-502 regression class)', async () => {
+    setUpFetchMock({
+      '/healthcheck': { status: 200, body: { ok: true } },
+      '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+      '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
+      '/sign-in/email': { status: 200, body: { token: 'fake-session-token', user: { id: 'u1' } } },
+      '/token': { status: 200, body: { token: 'fake-jwt' } },
+      '/library/?artist_name=': { status: 200, body: stereolabSearchResults },
+      '/flowsheet': { status: 200, body: [] },
+      '/library/rotation/21522/tracks': { status: 502, body: { message: 'lookupReleaseId: LML cascade timed out' } },
+      '/library/rotation': { status: 200, body: [{ id: 21522 }] },
+    });
+
+    const outcomes = await runCanary({ ...baseConfig, djEmail: 'canary@wxyc.org', djPassword: 'pw' });
+    const picker = outcomes.find((o) => o.name === 'dj-rotation-picker')!;
+
+    expect(picker.status).toBe('fail');
+    expect(picker.message).toMatch(/502/);
+  });
+
+  it('passes the picker probe when the rotation list yields an id and /tracks returns an array', async () => {
+    setUpFetchMock({
+      '/healthcheck': { status: 200, body: { ok: true } },
+      '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+      '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
+      '/sign-in/email': { status: 200, body: { token: 'fake-session-token', user: { id: 'u1' } } },
+      '/token': { status: 200, body: { token: 'fake-jwt' } },
+      '/library/?artist_name=': { status: 200, body: stereolabSearchResults },
+      '/flowsheet': { status: 200, body: [] },
+      '/library/rotation/4242/tracks': { status: 200, body: [{ id: 1, title: 'la paradoja' }] },
+      '/library/rotation': { status: 200, body: [{ id: 4242 }] },
+    });
+
+    const outcomes = await runCanary({ ...baseConfig, djEmail: 'canary@wxyc.org', djPassword: 'pw' });
+    const picker = outcomes.find((o) => o.name === 'dj-rotation-picker')!;
+
+    expect(picker.status).toBe('pass');
+  });
+
+  it('skips the picker probe when the rotation list is empty (cannot synthesize a probe target)', async () => {
+    setUpFetchMock({
+      '/healthcheck': { status: 200, body: { ok: true } },
+      '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+      '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
+      '/sign-in/email': { status: 200, body: { token: 'fake-session-token', user: { id: 'u1' } } },
+      '/token': { status: 200, body: { token: 'fake-jwt' } },
+      '/library/?artist_name=': { status: 200, body: stereolabSearchResults },
+      '/flowsheet': { status: 200, body: [] },
+      '/library/rotation': { status: 200, body: [] },
+    });
+
+    const outcomes = await runCanary({ ...baseConfig, djEmail: 'canary@wxyc.org', djPassword: 'pw' });
+    const picker = outcomes.find((o) => o.name === 'dj-rotation-picker')!;
+
+    expect(picker.status).toBe('skipped');
+    expect(picker.message).toMatch(/rotation/i);
   });
 
   it('does not short-circuit other checks when one fails', async () => {
@@ -444,9 +511,9 @@ describe('publishMetrics — dimensioned + dimensionless emit-twice', () => {
     const dimensioned = checkFailureData.filter((d) => d.Dimensions && d.Dimensions.length > 0);
     const dimensionless = checkFailureData.filter((d) => !d.Dimensions || d.Dimensions.length === 0);
 
-    // Seven checks, each contributes one dimensioned and one dimensionless datapoint.
-    expect(dimensioned).toHaveLength(7);
-    expect(dimensionless).toHaveLength(7);
+    // Eight checks, each contributes one dimensioned and one dimensionless datapoint.
+    expect(dimensioned).toHaveLength(8);
+    expect(dimensionless).toHaveLength(8);
     // Without an inducer, every value is 0 (passes + skips).
     expect(dimensioned.every((d) => d.Value === 0)).toBe(true);
     expect(dimensionless.every((d) => d.Value === 0)).toBe(true);
@@ -478,7 +545,7 @@ describe('publishMetrics — dimensioned + dimensionless emit-twice', () => {
     // isn't enough — `Statistic: Maximum` on the alarm needs at least one
     // `1` in the window, so this asserts the count of 1s explicitly.
     expect(dimensionless.filter((d) => d.Value === 1)).toHaveLength(1);
-    expect(dimensionless.filter((d) => d.Value === 0)).toHaveLength(6);
+    expect(dimensionless.filter((d) => d.Value === 0)).toHaveLength(7);
   });
 
   // `CheckSkipped` and `CheckLatency` are dashboard data, not alarm inputs.
@@ -499,8 +566,8 @@ describe('publishMetrics — dimensioned + dimensionless emit-twice', () => {
     expect(metricData.filter((d) => d.MetricName === 'CheckSkipped' && isDimensionless(d))).toHaveLength(0);
     expect(metricData.filter((d) => d.MetricName === 'CheckLatency' && isDimensionless(d))).toHaveLength(0);
     // Sanity: the dimensioned series for each is present (one per check).
-    expect(metricData.filter((d) => d.MetricName === 'CheckSkipped')).toHaveLength(7);
-    expect(metricData.filter((d) => d.MetricName === 'CheckLatency')).toHaveLength(7);
+    expect(metricData.filter((d) => d.MetricName === 'CheckSkipped')).toHaveLength(8);
+    expect(metricData.filter((d) => d.MetricName === 'CheckLatency')).toHaveLength(8);
   });
 });
 
