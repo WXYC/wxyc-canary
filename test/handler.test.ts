@@ -9,8 +9,10 @@ import type { CanaryConfig } from '../src/types.js';
 // Module-mock hoisting: vi.mock is hoisted above imports, so the mock factory
 // must use vi.hoisted() to share the spy with test assertions. Placing the
 // spy in vi.hoisted ensures it exists when the mocked module is constructed.
-const { cloudWatchSendMock } = vi.hoisted(() => ({
+const { cloudWatchSendMock, ssmSendMock, reportOutcomesToGitHubMock } = vi.hoisted(() => ({
   cloudWatchSendMock: vi.fn(async () => ({})),
+  ssmSendMock: vi.fn(async () => ({ Parameter: { Value: 'fake-pat' } })),
+  reportOutcomesToGitHubMock: vi.fn(async () => undefined),
 }));
 vi.mock('@aws-sdk/client-cloudwatch', async () => {
   const actual = await vi.importActual<typeof import('@aws-sdk/client-cloudwatch')>('@aws-sdk/client-cloudwatch');
@@ -19,6 +21,16 @@ vi.mock('@aws-sdk/client-cloudwatch', async () => {
     CloudWatchClient: vi.fn().mockImplementation(() => ({ send: cloudWatchSendMock })),
   };
 });
+vi.mock('@aws-sdk/client-ssm', async () => {
+  const actual = await vi.importActual<typeof import('@aws-sdk/client-ssm')>('@aws-sdk/client-ssm');
+  return {
+    ...actual,
+    SSMClient: vi.fn().mockImplementation(() => ({ send: ssmSendMock })),
+  };
+});
+vi.mock('../src/github-issues.js', () => ({
+  reportOutcomesToGitHub: reportOutcomesToGitHubMock,
+}));
 
 const baseConfig: CanaryConfig = {
   backendUrl: 'https://api.example.test',
@@ -1111,5 +1123,90 @@ describe('enrichment-quality write canary', () => {
       delete process.env.CANARY_SEMANTIC_INDEX_URL;
       delete process.env.CANARY_PUBLISH_METRICS;
     }
+  });
+});
+
+/**
+ * Handler ↔ GitHub-issues reporter dispatch. The reporter itself is covered
+ * end-to-end in test/github-issues.test.ts; here we only assert that the
+ * handler resolves the PAT from SSM, calls the reporter with the right
+ * config, skips the reporter when env is unset, and survives reporter
+ * throws — same non-fatal contract publishMetrics has.
+ */
+describe('handler — GitHub issue reporting dispatch', () => {
+  beforeEach(() => {
+    ssmSendMock.mockClear();
+    reportOutcomesToGitHubMock.mockClear();
+    process.env.CANARY_BACKEND_URL = 'https://api.example.test';
+    process.env.CANARY_AUTH_URL = 'https://auth.example.test';
+    process.env.CANARY_SEMANTIC_INDEX_URL = 'https://explore.example.test';
+    process.env.CANARY_PUBLISH_METRICS = 'false';
+    delete process.env.CANARY_DJ_EMAIL;
+    delete process.env.CANARY_DJ_PASSWORD;
+    delete process.env.CANARY_DJ_SECRET_ARN;
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    delete process.env.CANARY_BACKEND_URL;
+    delete process.env.CANARY_AUTH_URL;
+    delete process.env.CANARY_SEMANTIC_INDEX_URL;
+    delete process.env.CANARY_PUBLISH_METRICS;
+    delete process.env.CANARY_GITHUB_TOKEN_SSM_PARAM;
+    delete process.env.CANARY_GITHUB_ISSUES_REPO;
+  });
+
+  it('fetches the SSM PAT and invokes the reporter when both env vars are set', async () => {
+    process.env.CANARY_GITHUB_TOKEN_SSM_PARAM = '/wxyc-canary/github-token';
+    process.env.CANARY_GITHUB_ISSUES_REPO = 'WXYC/wxyc-canary';
+    setUpFetchMock({
+      '/healthcheck': { status: 200, body: { ok: true } },
+      '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+      '/graph/artists/search': { status: 200, body: { results: [{ id: 1, canonical_name: 'stereolab' }] } },
+    });
+
+    await handler();
+
+    expect(ssmSendMock).toHaveBeenCalledTimes(1);
+    const ssmInput = (ssmSendMock.mock.calls[0] as unknown as [{ input: { Name: string; WithDecryption: boolean } }])[0]
+      .input;
+    expect(ssmInput.Name).toBe('/wxyc-canary/github-token');
+    expect(ssmInput.WithDecryption).toBe(true);
+
+    expect(reportOutcomesToGitHubMock).toHaveBeenCalledTimes(1);
+    const [reportedOutcomes, reportedConfig] = reportOutcomesToGitHubMock.mock.calls[0] as unknown as [
+      Array<{ name: string }>,
+      { token: string; repo: string },
+    ];
+    expect(reportedOutcomes.length).toBeGreaterThan(0);
+    expect(reportedConfig).toEqual({ token: 'fake-pat', repo: 'WXYC/wxyc-canary' });
+  });
+
+  it('does not fetch SSM or call the reporter when CANARY_GITHUB_TOKEN_SSM_PARAM is unset', async () => {
+    setUpFetchMock({
+      '/healthcheck': { status: 200, body: { ok: true } },
+      '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+      '/graph/artists/search': { status: 200, body: { results: [{ id: 1, canonical_name: 'stereolab' }] } },
+    });
+
+    await handler();
+
+    expect(ssmSendMock).not.toHaveBeenCalled();
+    expect(reportOutcomesToGitHubMock).not.toHaveBeenCalled();
+  });
+
+  it('survives a reporter throw — still surfaces canary-failed (not reporter-induced) when a check failed', async () => {
+    process.env.CANARY_GITHUB_TOKEN_SSM_PARAM = '/wxyc-canary/github-token';
+    process.env.CANARY_GITHUB_ISSUES_REPO = 'WXYC/wxyc-canary';
+    reportOutcomesToGitHubMock.mockRejectedValueOnce(new Error('github API rate limited'));
+    setUpFetchMock({
+      '/healthcheck': { status: 500, body: { error: 'oops' } },
+      '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+      '/graph/artists/search': { status: 200, body: { results: [{ id: 1, canonical_name: 'stereolab' }] } },
+    });
+
+    await expect(handler()).rejects.toThrow(/canary failed/);
+    // The reporter throw must not surface as the handler's error — pin that.
+    await expect(handler()).rejects.not.toThrow(/github API rate limited/);
   });
 });

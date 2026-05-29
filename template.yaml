@@ -55,10 +55,32 @@ Parameters:
       `youtube_music_url`. 30 s is the BS-side fire-and-forget timeout
       after which a real iOS playcut would already have rendered with
       null metadata.
+  GitHubTokenSsmParamName:
+    Type: String
+    Default: ''
+    AllowedPattern: '^(|/.+)$'
+    Description: >
+      Optional SSM Parameter Store name (SecureString) holding a fine-scoped
+      GitHub PAT with `issues:write` on the issue target repo. Must begin
+      with `/` (e.g. `/wxyc-canary/github-token`) so the IAM policy ARN
+      composes correctly. When set together with GitHubIssuesRepo, each
+      Lambda invocation mirrors check outcomes into GitHub issues: opens
+      an issue on first fail, comments on repeat fails (deduped by
+      `canary:check:{name}` label), and closes with a recovery comment
+      when the check passes. Leave empty to keep SNS-only alerting.
+  GitHubIssuesRepo:
+    Type: String
+    Default: ''
+    Description: >
+      Optional `owner/repo` target for canary-filed issues, e.g.
+      `WXYC/wxyc-canary`. Paired with GitHubTokenSsmParamName.
 
 Conditions:
   HasDjCredentials: !Not [!Equals [!Ref DjCredentialsSecretArn, '']]
   HasAlertEmail: !Not [!Equals [!Ref AlertEmail, '']]
+  HasGitHubReporter: !And
+    - !Not [!Equals [!Ref GitHubTokenSsmParamName, '']]
+    - !Not [!Equals [!Ref GitHubIssuesRepo, '']]
 
 Resources:
   CanaryFunction:
@@ -80,6 +102,8 @@ Resources:
           CANARY_SEMANTIC_INDEX_URL: !Ref SemanticIndexUrl
           CANARY_DJ_SECRET_ARN: !If [HasDjCredentials, !Ref DjCredentialsSecretArn, '']
           CANARY_ENABLE_WRITE_PROBE: !Ref EnableWriteProbe
+          CANARY_GITHUB_TOKEN_SSM_PARAM: !If [HasGitHubReporter, !Ref GitHubTokenSsmParamName, '']
+          CANARY_GITHUB_ISSUES_REPO: !If [HasGitHubReporter, !Ref GitHubIssuesRepo, '']
       Policies:
         - Statement:
             - Effect: Allow
@@ -94,6 +118,13 @@ Resources:
               - Effect: Allow
                 Action: secretsmanager:GetSecretValue
                 Resource: !Ref DjCredentialsSecretArn
+          - !Ref AWS::NoValue
+        - !If
+          - HasGitHubReporter
+          - Statement:
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${GitHubTokenSsmParamName}
           - !Ref AWS::NoValue
       Events:
         Schedule:

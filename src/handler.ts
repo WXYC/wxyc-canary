@@ -1,6 +1,8 @@
 import { CloudWatchClient, PutMetricDataCommand, StandardUnit, type MetricDatum } from '@aws-sdk/client-cloudwatch';
 import { GetSecretValueCommand, SecretsManagerClient } from '@aws-sdk/client-secrets-manager';
+import { GetParameterCommand, SSMClient } from '@aws-sdk/client-ssm';
 import { checks, signInDj } from './checks.js';
+import { reportOutcomesToGitHub } from './github-issues.js';
 import type { CanaryConfig, CheckContext, CheckOutcome, CheckResult } from './types.js';
 
 const METRIC_NAMESPACE = 'WXYC/Canary';
@@ -255,6 +257,23 @@ export const handler = async (): Promise<{ outcomes: CheckOutcome[]; failed: num
       await publishMetrics(outcomes, config.awsRegion ?? 'us-east-1');
     } catch (err) {
       console.error('failed to publish CloudWatch metrics', err);
+    }
+  }
+
+  // Mirror outcomes into GitHub issues for morning triage when configured.
+  // Same non-fatal contract as publishMetrics: a GitHub outage must not
+  // mask the canary's primary signal (the throw on failed checks).
+  const ghParamName = process.env.CANARY_GITHUB_TOKEN_SSM_PARAM;
+  const ghRepo = process.env.CANARY_GITHUB_ISSUES_REPO;
+  if (ghParamName && ghRepo) {
+    try {
+      const ssm = new SSMClient({ region: config.awsRegion ?? 'us-east-1' });
+      const param = await ssm.send(new GetParameterCommand({ Name: ghParamName, WithDecryption: true }));
+      const token = param.Parameter?.Value;
+      if (!token) throw new Error(`SSM parameter ${ghParamName} has no Value`);
+      await reportOutcomesToGitHub(outcomes, { token, repo: ghRepo });
+    } catch (err) {
+      console.error('failed to report outcomes to GitHub', err);
     }
   }
 
