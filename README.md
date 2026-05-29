@@ -107,6 +107,44 @@ aws cloudwatch get-metric-statistics \
   --end-time $(date -u '+%Y-%m-%dT%H:%M:%S')
 ```
 
+### GitHub-issue reporting (optional)
+
+When you want canary failures to land as GitHub issues for morning triage (instead of, or in addition to, SNS email), wire a fine-scoped PAT through SSM Parameter Store and pass two stack parameters. The reporter is best-effort and non-fatal: a GitHub outage never masks the canary's primary signal (the dimensionless `CheckFailure` series). SNS + the `wxyc-canary-lambda-errors` alarm stay armed as the fallback for when the Lambda itself dies before the reporter runs.
+
+1. Create a GitHub fine-scoped PAT:
+   - Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token.
+   - **Resource owner**: `WXYC`. **Repository access**: only the issue target repo (e.g. `WXYC/wxyc-canary`).
+   - **Permissions** → **Repository permissions** → **Issues**: Read and write.
+   - No other scopes. Set a reasonable expiry and a calendar reminder to rotate.
+2. Store it in SSM as a SecureString:
+   ```bash
+   aws ssm put-parameter \
+     --name /wxyc-canary/github-token \
+     --type SecureString \
+     --value "$PAT" \
+     --description "PAT for wxyc-canary to file/close issues. Rotate by overwriting with --overwrite."
+   ```
+3. Pass both stack parameters on deploy:
+   ```bash
+   sam deploy \
+     --parameter-overrides \
+       GitHubTokenSsmParamName=/wxyc-canary/github-token \
+       GitHubIssuesRepo=WXYC/wxyc-canary \
+       # ...other params
+   ```
+
+Behavior per outcome status:
+
+| Outcome   | Reporter action                                                                                                                     |
+| --------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `fail`    | Open a new issue if none labeled `canary:check:{name}` is open; otherwise comment on the existing issue with the new error message. |
+| `pass`    | If an open issue labeled `canary:check:{name}` exists, post a recovery comment and close it (`state_reason: completed`).            |
+| `skipped` | No-op. Skipped means an operator-configuration gap (no DJ credentials, write probe disabled), not a regression.                     |
+
+Dedup key is the `canary:check:{name}` label, not the title. Labels are durable across error-message changes; titles drift as the failure mode changes.
+
+To turn off GitHub-issue reporting, redeploy with empty `GitHubTokenSsmParamName` (the conditional in `template.yaml` then removes the SSM IAM grant and env vars).
+
 ### CI deploys
 
 `.github/workflows/deploy.yml` builds + deploys on push to `main`. Required GitHub secrets:
