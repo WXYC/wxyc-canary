@@ -1,6 +1,6 @@
 import { canaryFetch, type FetchResult } from './client.js';
 import { runEnrichmentCheck } from './enrichment-check.js';
-import type { Check } from './types.js';
+import type { Check, CheckResult } from './types.js';
 
 /**
  * The canonical artist used for read-side probes. Stereolab has been on
@@ -137,6 +137,62 @@ const djRotation: Check = {
 };
 
 /**
+ * DJ-authenticated: the dj-site rotation picker. On selecting a rotation
+ * row in the flowsheet entry UI, dj-site calls `GET /library/rotation/{id}/tracks`
+ * to populate a track dropdown. The endpoint was the user-visible failure
+ * surface of BS#994 / BS#1030: when LML was under cascade load, individual
+ * release-id lookups timed out, the controller short-circuited to 502, and
+ * on-air DJs saw "Loading tracks..." that never resolved. BS#1029 made 21%
+ * of active rotation rows JOIN-resolvable (no LML call needed), but the
+ * remaining ~79% still depend on the runtime cascade — so this probe both
+ * pins the JOIN path stays healthy and acts as a leading indicator for the
+ * cascade-class regression that surfaced today via on-air Slack messages
+ * rather than any monitor.
+ *
+ * Self-healing target: rather than hardcode a rotation id (which would
+ * break when that row gets killed), the probe discovers a candidate from
+ * the rotation list itself. Any 2xx + array response is a pass — the body
+ * is allowed to be empty because a real release may have zero indexed
+ * tracks (e.g., never cross-referenced with Discogs). The 8 s per-fetch
+ * timeout in `canaryFetch` is the regression signal: BS#994's cascade was
+ * a 30 s timeout chain → 502, so anything that gets within shouting
+ * distance of the budget produces a `fail`.
+ */
+const djRotationPicker: Check = {
+  name: 'dj-rotation-picker',
+  description: 'GET /library/rotation/{id}/tracks as DJ — catches BS#994 / BS#1030 cascade-to-502 class',
+  requiresAuth: true,
+  run: async (ctx): Promise<CheckResult | void> => {
+    if (!ctx.djBearerToken) throw new Error('DJ bearer token missing');
+    const list = await canaryFetch(`${ctx.backendUrl}/library/rotation`, {
+      headers: { Authorization: `Bearer ${ctx.djBearerToken}` },
+    });
+    if (!list.ok) {
+      throw new Error(`rotation list precondition: expected 2xx, got ${list.status}: ${list.rawText.slice(0, 200)}`);
+    }
+    if (!Array.isArray(list.body)) {
+      throw new Error(`rotation list precondition: expected array body, got ${typeof list.body}`);
+    }
+    const first = list.body[0] as { id?: number } | undefined;
+    if (!first || typeof first.id !== 'number') {
+      // The dj-rotation check already alerts on an empty rotation; this probe
+      // intentionally degrades to skipped so the picker signal doesn't
+      // duplicate that one. With rotation empty there's nothing to probe.
+      return { skipped: true, skipReason: 'rotation list is empty — no probe target available' };
+    }
+    const tracks = await canaryFetch(`${ctx.backendUrl}/library/rotation/${first.id}/tracks`, {
+      headers: { Authorization: `Bearer ${ctx.djBearerToken}` },
+    });
+    if (!tracks.ok) {
+      throw new Error(`expected 2xx, got ${tracks.status}: ${tracks.rawText.slice(0, 200)}`);
+    }
+    if (!Array.isArray(tracks.body)) {
+      throw new Error(`expected array body, got ${typeof tracks.body}: ${tracks.rawText.slice(0, 200)}`);
+    }
+  },
+};
+
+/**
  * Write canary (v1). Inserts a sentinel flowsheet row, polls until LML
  * enrichment populates `youtube_music_url`, deletes the row, ends the
  * canary's show. Returns an `EnrichmentLagSeconds` metric the runner
@@ -167,6 +223,7 @@ export const checks: readonly Check[] = [
   djLibrarySearch,
   djFlowsheetRead,
   djRotation,
+  djRotationPicker,
   enrichmentQuality,
 ];
 

@@ -6,15 +6,16 @@ The canary exists because three production incidents on 2026-04-30 (catalog-sear
 
 ## What it checks
 
-| Check                   | Endpoint                                                                | Auth             | What it would have caught                                        |
-| ----------------------- | ----------------------------------------------------------------------- | ---------------- | ---------------------------------------------------------------- |
-| `backend-healthcheck`   | `GET /healthcheck`                                                      | none             | Process-level outage on Backend-Service                          |
-| `proxy-library-search`  | `GET /proxy/library/search?artist=Stereolab&limit=5`                    | anonymous device | LML degradation, BS proxy regressions                            |
-| `semantic-index-search` | `GET https://explore.wxyc.org/graph/artists/search?q=Stereolab&limit=1` | none             | semantic-index 5xx; missing `results` envelope                   |
-| `dj-library-search`     | `GET /library/?artist_name=Stereolab&n=5`                               | DJ JWT           | The 2026-04-30 catalog-search 503 incident, exactly              |
-| `dj-flowsheet-read`     | `GET /v2/flowsheet?n=5`                                                 | DJ JWT           | V2 flowsheet read regressions                                    |
-| `dj-rotation`           | `GET /library/rotation`                                                 | DJ JWT           | Rotation endpoint 5xx, fully empty rotation                      |
-| `enrichment-quality`    | insert sentinel → poll for enrichment → delete                          | DJ JWT (write)   | The 2026-05-13 LML cascade regression (null-metadata on inserts) |
+| Check                   | Endpoint                                                                | Auth             | What it would have caught                                                                                               |
+| ----------------------- | ----------------------------------------------------------------------- | ---------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `backend-healthcheck`   | `GET /healthcheck`                                                      | none             | Process-level outage on Backend-Service                                                                                 |
+| `proxy-library-search`  | `GET /proxy/library/search?artist=Stereolab&limit=5`                    | anonymous device | LML degradation, BS proxy regressions                                                                                   |
+| `semantic-index-search` | `GET https://explore.wxyc.org/graph/artists/search?q=Stereolab&limit=1` | none             | semantic-index 5xx; missing `results` envelope                                                                          |
+| `dj-library-search`     | `GET /library/?artist_name=Stereolab&n=5`                               | DJ JWT           | The 2026-04-30 catalog-search 503 incident, exactly                                                                     |
+| `dj-flowsheet-read`     | `GET /v2/flowsheet?n=5`                                                 | DJ JWT           | V2 flowsheet read regressions                                                                                           |
+| `dj-rotation`           | `GET /library/rotation`                                                 | DJ JWT           | Rotation endpoint 5xx, fully empty rotation                                                                             |
+| `dj-rotation-picker`    | `GET /library/rotation/{id}/tracks` (id discovered from list)           | DJ JWT           | The BS#994 / BS#1030 cascade-to-502 class; LML-cascade timeouts on the picker that previously surfaced via on-air Slack |
+| `enrichment-quality`    | insert sentinel → poll for enrichment → delete                          | DJ JWT (write)   | The 2026-05-13 LML cascade regression (null-metadata on inserts)                                                        |
 
 DJ-auth checks downgrade to `skipped` (a distinct CloudWatch metric, not `failed`) when no DJ credentials are configured, so the alarm doesn't fire on operator-caused gaps. The `enrichment-quality` write canary additionally requires `CANARY_ENABLE_WRITE_PROBE=true` and skips when another DJ is on-air — the canary deliberately doesn't inject sentinel rows into a real DJ's flowsheet.
 
