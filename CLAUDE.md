@@ -2,19 +2,15 @@
 
 Synthetic-DJ canary on AWS Lambda. Probes the WXYC user-facing API every five minutes and emits CloudWatch metrics + alarms. Built after the 2026-04-30 triple-incident (catalog-search 503, flowsheet POST 500, iOS decoder drift) to close the gap where production failures were detected by users rather than monitors.
 
-## Code layout
+## Topic guides
 
-| File                         | Purpose                                                                                                                                                                                                                                                                                                |
-| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `src/handler.ts`             | Lambda entry. Loads config, resolves DJ credentials (env or Secrets Manager), runs all checks in parallel, publishes per-check metrics to CloudWatch, throws if any check failed (so the Lambda Errors metric also fires).                                                                             |
-| `src/checks.ts`              | The check definitions and the `signInDj` helper. One exported `checks` array. Adding a new check = one entry.                                                                                                                                                                                          |
-| `src/enrichment-check.ts`    | Write-canary orchestrator (v1, opt-in). Inserts a sentinel flowsheet row, polls until LML enrichment populates `youtube_music_url`, deletes the row, ends the show. Best-effort cleanup; skips when another DJ is on-air.                                                                              |
-| `src/client.ts`              | HTTP client wrapping `fetch` with a per-request `AbortController` timeout. Deliberately no retry on the surfaces being measured (a flaky retry hides brownouts).                                                                                                                                       |
-| `src/types.ts`               | Codable shapes for `Check`, `CheckResult`, `CheckOutcome`, `CanaryConfig`.                                                                                                                                                                                                                             |
-| `src/github-issues.ts`       | Optional reporter that mirrors outcomes into GitHub issues. Pure module, no AWS deps — the handler resolves the PAT from SSM, then hands it in. Opens on first fail (deduped by `canary:check:{name}` label), comments on repeat fail, closes with recovery comment on pass, no-ops on skipped.        |
-| `template.yaml`              | SAM (CloudFormation) — Lambda + EventBridge schedule + SNS alert topic + three CloudWatch alarms + a log group. `EnableWriteProbe` parameter gates the v1 write canary; `GitHubTokenSsmParamName` + `GitHubIssuesRepo` together gate the GitHub-issue reporter (and its `ssm:GetParameter` IAM grant). |
-| `test/handler.test.ts`       | Vitest. Mocks global `fetch` and exercises the runner end-to-end. Includes regression cases for each 2026-04-30 incident shape and the 2026-05-13 enrichment regression. Method-aware mock helper for the write canary's read+write interleave.                                                        |
-| `test/github-issues.test.ts` | Vitest. Mocks global `fetch` and pins the reporter's open / comment-on-repeat / close-with-recovery / skipped-noop contract per outcome status.                                                                                                                                                        |
+CLAUDE.md is a router for the always-loaded reference card. Topic depth lives in `docs/`:
+
+- **[`docs/code-layout.md`](docs/code-layout.md)** — File-by-file purpose table: handler, checks, enrichment write-canary, client, types, github-issues reporter, SAM template, vitest suites.
+- **[`docs/adding-a-check.md`](docs/adding-a-check.md)** — Procedure for adding a new check (define, test, typecheck, PR) plus the regression-test catalog the suite already pins.
+- **[`docs/scope.md`](docs/scope.md)** — What this canary is _not_ (not a load test, not an iOS test) and the v1 write-canary opt-in invariants.
+
+Read the relevant topic doc before doing work in that area.
 
 ## Conventions
 
@@ -27,27 +23,6 @@ Synthetic-DJ canary on AWS Lambda. Probes the WXYC user-facing API every five mi
 - Two credential paths: `CANARY_DJ_EMAIL` + `CANARY_DJ_PASSWORD` env vars (local + tests) or `CANARY_DJ_SECRET_ARN` pointing at a Secrets Manager secret with `{"email":"...","password":"..."}` (prod).
 - Retry policy: the canary does **not** retry the surfaces it measures. The lone carve-out is `signInDj` retrying once on 429 only — auth is a precondition shared by 4 of 6 checks, so a single 429 there cascades into 4 simultaneous fail outcomes plus a Lambda Errors alarm. The retry honors `Retry-After` (seconds form), capped at 5s to fit the Lambda budget. Token exchange is not retried.
 - The GitHub-issue reporter is **best-effort and non-fatal**. The handler wraps `reportOutcomesToGitHub` in a try/catch (parallel to `publishMetrics`) — a GitHub outage logs and continues so the canary's primary signal (the dimensionless `CheckFailure` series + the Lambda Errors alarm) is never masked by a reporter-induced exception. The SNS topic and `wxyc-canary-lambda-errors` alarm stay armed as the safety net for when the Lambda dies before the reporter runs. Dedup is by label (`canary:check:{name}`), not title — titles drift as error messages change; labels are durable. A `pass` after a `fail` closes the open issue with a recovery comment; a `pass` with no open issue is a no-op. `skipped` outcomes are always no-ops (operator gap, not regression).
-
-## Adding a check
-
-1. Define a new `Check` in `src/checks.ts`. Its `run` function should throw on failure with a message that's safe to alert on (no secrets, short enough to read in PagerDuty).
-2. Add a regression test in `test/handler.test.ts` that mocks the upstream response and asserts the new check is `pass` or `fail` accordingly.
-3. `npm run typecheck && npm test`.
-4. Open a PR. CI runs the same checks before deploy.
-
-## Tests cover
-
-- All anonymous checks pass when upstreams behave; DJ-auth checks skip without creds.
-- Each of the three 2026-04-30 incident shapes produces a `fail` outcome on the right check (catalog-search 503, semantic-index missing `results` envelope, LML proxy 504).
-- One failing check does not short-circuit the others.
-- Auth sign-in errors propagate as fail (not skip) on every DJ-auth check.
-- Sign-in 429 retries once (and only on 429) and recovers when the second attempt succeeds; both attempts failing or any non-429 fail the precondition without retrying.
-
-## What this is not
-
-- Not a load test. One synthetic call per check per five minutes.
-- Not an iOS test. The semantic-index check confirms the server's contract, not that iOS decodes it.
-- The v1 write canary (`enrichment-quality`) is opt-in via `CANARY_ENABLE_WRITE_PROBE=true`. When enabled, every invocation start-show / log-sentinel / poll / delete / end-show — see `src/enrichment-check.ts` for the cleanup invariants. When disabled, the check downgrades to `skipped` and the `wxyc-canary-enrichment-lag` alarm stays at OK (`TreatMissingData: notBreaching`).
 
 ## Related
 
