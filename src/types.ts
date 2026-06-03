@@ -54,6 +54,22 @@ export type CheckContext = {
   backendUrl: string;
   authUrl: string;
   semanticIndexUrl: string;
+  /**
+   * library-metadata-lookup base URL (no trailing slash). The `lml-auth`
+   * check POSTs directly here to detect LML_API_KEY rotation drift in
+   * isolation from the BS proxy path that `proxy-library-search` also
+   * exercises.
+   */
+  lmlUrl: string;
+  /**
+   * Production LML bearer (the shared service-to-service secret that BS,
+   * rom, and tubafrenzy also send). Undefined when neither the
+   * `CANARY_LML_API_KEY` env var nor a `CANARY_LML_API_KEY_SECRET_ARN`
+   * Secrets Manager secret is configured — the `lml-auth` check then
+   * downgrades to skipped (operator-configuration gap, not regression —
+   * same pattern as the DJ credentials).
+   */
+  lmlApiKey: string | undefined;
   /** Bearer token if the canary has logged in as a DJ; undefined for anonymous-only runs. */
   djBearerToken: string | undefined;
   /**
@@ -87,6 +103,18 @@ export type CanaryConfig = {
   backendUrl: string;
   authUrl: string;
   semanticIndexUrl: string;
+  /**
+   * library-metadata-lookup base URL (no trailing slash). Defaults to
+   * `https://library-metadata-lookup-production.up.railway.app` in the
+   * handler when unset.
+   */
+  lmlUrl?: string;
+  /**
+   * Production LML bearer (shared with BS, rom, tubafrenzy). When unset,
+   * the `lml-auth` check downgrades to skipped — same operator-gap
+   * semantics as the DJ-credentials path.
+   */
+  lmlApiKey?: string;
   /**
    * Sent as `Origin:` on auth calls (sign-in, token exchange). Must match one
    * of the auth server's `BETTER_AUTH_TRUSTED_ORIGINS` or sign-in returns

@@ -83,10 +83,10 @@ describe('runCanary — anonymous-only configuration', () => {
     vi.unstubAllGlobals();
   });
 
-  it('passes the 2 truly-anonymous checks and skips the 6 auth checks when no credentials are configured', async () => {
+  it('passes the 2 truly-anonymous checks and skips the 7 conditional checks when no credentials are configured', async () => {
     const outcomes = await runCanary(baseConfig);
 
-    expect(outcomes).toHaveLength(8);
+    expect(outcomes).toHaveLength(9);
     const byName = Object.fromEntries(outcomes.map((o) => [o.name, o]));
     expect(byName['backend-healthcheck'].status).toBe('pass');
     expect(byName['semantic-index-search'].status).toBe('pass');
@@ -96,6 +96,11 @@ describe('runCanary — anonymous-only configuration', () => {
     expect(byName['dj-rotation'].status).toBe('skipped');
     expect(byName['dj-rotation-picker'].status).toBe('skipped');
     expect(byName['enrichment-quality'].status).toBe('skipped');
+    // `lml-auth` skips on missing LML_API_KEY (operator gap) — same
+    // semantics as DJ credentials but a separate config switch. The
+    // `baseConfig` fixture leaves `lmlApiKey` undefined.
+    expect(byName['lml-auth'].status).toBe('skipped');
+    expect(byName['lml-auth'].message).toMatch(/no LML_API_KEY configured/);
   });
 });
 
@@ -294,6 +299,140 @@ describe('runCanary — failure surfaces (regression coverage for the 2026-04-30
     expect(dj.status).toBe('fail');
     expect(dj.message).toMatch(/auth precondition failed/);
     expect(dj.message).toMatch(/token exchange/);
+  });
+});
+
+/**
+ * `lml-auth` is the layer-1 mitigation for BS#1094 — silent
+ * `LML_API_KEY` rotation drift. It POSTs `/api/v1/lookup` directly to
+ * LML with the production bearer and asserts 200. 401/403 is the
+ * rotation-drift signal (distinct error message so the operator
+ * doesn't confuse it with LML being down); 5xx is the LML-down
+ * signal. Missing bearer is operator gap → skipped, not failed.
+ *
+ * URL match patterns here use the production LML host suffix because
+ * the `lml-auth` check hits LML directly, not via BS. `setUpFetchMock`
+ * matches on substring, so any unique part of the LML URL works; we
+ * use the full path `/api/v1/lookup` since the BS proxy uses the same
+ * substring fragment (`/library`), which would shadow this match
+ * otherwise.
+ */
+describe('runCanary — lml-auth check (BS#1094 layer 1)', () => {
+  const lmlAuthConfig: CanaryConfig = {
+    ...baseConfig,
+    // Distinct host so the check hits a substring no other mock matches.
+    lmlUrl: 'https://lml.example.test',
+    lmlApiKey: 'fake-lml-bearer',
+  };
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('passes when LML returns 200 to the authenticated lookup', async () => {
+    setUpFetchMock({
+      '/healthcheck': { status: 200, body: { ok: true } },
+      '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+      '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
+      'lml.example.test/api/v1/lookup': { status: 200, body: { results: [], cache_stats: {} } },
+    });
+
+    const outcomes = await runCanary(lmlAuthConfig);
+    const lml = outcomes.find((o) => o.name === 'lml-auth')!;
+    expect(lml.status).toBe('pass');
+  });
+
+  it('fails with a rotation-drift message when LML returns 401 (the BS#1094 incident shape)', async () => {
+    setUpFetchMock({
+      '/healthcheck': { status: 200, body: { ok: true } },
+      '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+      '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
+      'lml.example.test/api/v1/lookup': { status: 401, body: { detail: 'Missing or invalid API key' } },
+    });
+
+    const outcomes = await runCanary(lmlAuthConfig);
+    const lml = outcomes.find((o) => o.name === 'lml-auth')!;
+
+    expect(lml.status).toBe('fail');
+    // The operator-facing distinction: rotation drift vs LML down. A
+    // generic "expected 2xx" message would lose the BS#1094 signal.
+    expect(lml.message).toMatch(/rotation drift/);
+    expect(lml.message).toMatch(/401/);
+  });
+
+  it('fails with the same rotation-drift message on 403 (forbidden — bearer recognised but revoked)', async () => {
+    setUpFetchMock({
+      '/healthcheck': { status: 200, body: { ok: true } },
+      '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+      '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
+      'lml.example.test/api/v1/lookup': { status: 403, body: { detail: 'Forbidden' } },
+    });
+
+    const outcomes = await runCanary(lmlAuthConfig);
+    const lml = outcomes.find((o) => o.name === 'lml-auth')!;
+
+    expect(lml.status).toBe('fail');
+    expect(lml.message).toMatch(/rotation drift/);
+    expect(lml.message).toMatch(/403/);
+  });
+
+  it('fails with a generic 5xx message when LML itself is down (not a rotation-drift signal)', async () => {
+    setUpFetchMock({
+      '/healthcheck': { status: 200, body: { ok: true } },
+      '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+      '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
+      'lml.example.test/api/v1/lookup': { status: 503, body: { detail: 'Service Unavailable' } },
+    });
+
+    const outcomes = await runCanary(lmlAuthConfig);
+    const lml = outcomes.find((o) => o.name === 'lml-auth')!;
+
+    expect(lml.status).toBe('fail');
+    // No rotation-drift framing — the operator's diagnostic path
+    // (page rom, page LML on-call) is different from rotation drift.
+    expect(lml.message).not.toMatch(/rotation drift/);
+    expect(lml.message).toMatch(/503/);
+  });
+
+  it('sends the bearer as Authorization: Bearer and posts a structured artist/album/song body', async () => {
+    const fetchMock = setUpFetchMock({
+      '/healthcheck': { status: 200, body: { ok: true } },
+      '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+      '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
+      'lml.example.test/api/v1/lookup': { status: 200, body: { results: [], cache_stats: {} } },
+    });
+
+    await runCanary(lmlAuthConfig);
+
+    const lmlCall = fetchMock.mock.calls.find(([url]) => String(url).includes('lml.example.test/api/v1/lookup'));
+    expect(lmlCall).toBeDefined();
+    const [, init] = lmlCall as unknown as [unknown, RequestInit];
+    expect(init.method).toBe('POST');
+    const headers = init.headers as Record<string, string>;
+    expect(headers.Authorization).toBe('Bearer fake-lml-bearer');
+    expect(headers['Content-Type']).toBe('application/json');
+    // The payload must carry a real artist/album/song so it exercises
+    // LML's `perform_lookup` rather than short-circuiting on empty
+    // input. Use a canonical WXYC-representative fixture.
+    const body = JSON.parse(init.body as string);
+    expect(body.artist).toBeTypeOf('string');
+    expect(body.artist.length).toBeGreaterThan(0);
+    expect(body.album).toBeTypeOf('string');
+    expect(body.song).toBeTypeOf('string');
+  });
+
+  it('skips when no LML_API_KEY is configured (operator gap, not regression)', async () => {
+    setUpFetchMock({
+      '/healthcheck': { status: 200, body: { ok: true } },
+      '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+      '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
+    });
+
+    const outcomes = await runCanary({ ...baseConfig, lmlUrl: 'https://lml.example.test' });
+    const lml = outcomes.find((o) => o.name === 'lml-auth')!;
+
+    expect(lml.status).toBe('skipped');
+    expect(lml.message).toMatch(/no LML_API_KEY configured/);
   });
 });
 
@@ -511,9 +650,9 @@ describe('publishMetrics — dimensioned + dimensionless emit-twice', () => {
     const dimensioned = checkFailureData.filter((d) => d.Dimensions && d.Dimensions.length > 0);
     const dimensionless = checkFailureData.filter((d) => !d.Dimensions || d.Dimensions.length === 0);
 
-    // Eight checks, each contributes one dimensioned and one dimensionless datapoint.
-    expect(dimensioned).toHaveLength(8);
-    expect(dimensionless).toHaveLength(8);
+    // Nine checks, each contributes one dimensioned and one dimensionless datapoint.
+    expect(dimensioned).toHaveLength(9);
+    expect(dimensionless).toHaveLength(9);
     // Without an inducer, every value is 0 (passes + skips).
     expect(dimensioned.every((d) => d.Value === 0)).toBe(true);
     expect(dimensionless.every((d) => d.Value === 0)).toBe(true);
@@ -545,7 +684,7 @@ describe('publishMetrics — dimensioned + dimensionless emit-twice', () => {
     // isn't enough — `Statistic: Maximum` on the alarm needs at least one
     // `1` in the window, so this asserts the count of 1s explicitly.
     expect(dimensionless.filter((d) => d.Value === 1)).toHaveLength(1);
-    expect(dimensionless.filter((d) => d.Value === 0)).toHaveLength(7);
+    expect(dimensionless.filter((d) => d.Value === 0)).toHaveLength(8);
   });
 
   // `CheckSkipped` and `CheckLatency` are dashboard data, not alarm inputs.
@@ -566,8 +705,8 @@ describe('publishMetrics — dimensioned + dimensionless emit-twice', () => {
     expect(metricData.filter((d) => d.MetricName === 'CheckSkipped' && isDimensionless(d))).toHaveLength(0);
     expect(metricData.filter((d) => d.MetricName === 'CheckLatency' && isDimensionless(d))).toHaveLength(0);
     // Sanity: the dimensioned series for each is present (one per check).
-    expect(metricData.filter((d) => d.MetricName === 'CheckSkipped')).toHaveLength(8);
-    expect(metricData.filter((d) => d.MetricName === 'CheckLatency')).toHaveLength(8);
+    expect(metricData.filter((d) => d.MetricName === 'CheckSkipped')).toHaveLength(9);
+    expect(metricData.filter((d) => d.MetricName === 'CheckLatency')).toHaveLength(9);
   });
 });
 

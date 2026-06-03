@@ -18,6 +18,23 @@ Parameters:
     Type: String
     Default: https://explore.wxyc.org
     Description: semantic-index base URL.
+  LmlUrl:
+    Type: String
+    Default: https://library-metadata-lookup-production.up.railway.app
+    Description: >
+      library-metadata-lookup base URL. The `lml-auth` check POSTs
+      directly to `${LmlUrl}/api/v1/lookup` with `LML_API_KEY` to detect
+      bearer rotation drift in isolation from the BS proxy path.
+  LmlApiKeySecretArn:
+    Type: String
+    Default: ''
+    Description: >
+      Optional ARN of a Secrets Manager secret whose `SecretString` is
+      the production LML bearer (plain string, not JSON — matches
+      Railway's one-secret-one-value convention so the bearer rotates
+      in one place across BS + rom + tubafrenzy + canary). When empty,
+      the `lml-auth` check downgrades to skipped (operator gap, not
+      regression — same shape as the DJ-credentials path).
   DjCredentialsSecretArn:
     Type: String
     Default: ''
@@ -77,6 +94,7 @@ Parameters:
 
 Conditions:
   HasDjCredentials: !Not [!Equals [!Ref DjCredentialsSecretArn, '']]
+  HasLmlApiKey: !Not [!Equals [!Ref LmlApiKeySecretArn, '']]
   HasAlertEmail: !Not [!Equals [!Ref AlertEmail, '']]
   HasGitHubReporter: !And
     - !Not [!Equals [!Ref GitHubTokenSsmParamName, '']]
@@ -100,6 +118,8 @@ Resources:
           CANARY_BACKEND_URL: !Ref BackendUrl
           CANARY_AUTH_URL: !Ref AuthUrl
           CANARY_SEMANTIC_INDEX_URL: !Ref SemanticIndexUrl
+          CANARY_LML_URL: !Ref LmlUrl
+          CANARY_LML_API_KEY_SECRET_ARN: !If [HasLmlApiKey, !Ref LmlApiKeySecretArn, '']
           CANARY_DJ_SECRET_ARN: !If [HasDjCredentials, !Ref DjCredentialsSecretArn, '']
           CANARY_ENABLE_WRITE_PROBE: !Ref EnableWriteProbe
           CANARY_GITHUB_TOKEN_SSM_PARAM: !If [HasGitHubReporter, !Ref GitHubTokenSsmParamName, '']
@@ -118,6 +138,13 @@ Resources:
               - Effect: Allow
                 Action: secretsmanager:GetSecretValue
                 Resource: !Ref DjCredentialsSecretArn
+          - !Ref AWS::NoValue
+        - !If
+          - HasLmlApiKey
+          - Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref LmlApiKeySecretArn
           - !Ref AWS::NoValue
         - !If
           - HasGitHubReporter

@@ -193,6 +193,60 @@ const djRotationPicker: Check = {
 };
 
 /**
+ * Direct POST to LML's `/api/v1/lookup` with the production
+ * `LML_API_KEY` bearer. Catches `LML_API_KEY` rotation drift in
+ * isolation from the BS proxy path: `proxy-library-search` exercises
+ * BS→LML through a DJ JWT, so a missing bearer there fails as "BS lost
+ * the header" rather than "the LML bearer is stale". This check removes
+ * BS from the loop entirely. Layer-1 mitigation for BS#1094 — the
+ * silent backfill stall the org saw the last time the bearer was
+ * rotated without a coordinated rollout (Sentry per row, no aggregated
+ * alarm, predicate didn't know about auth).
+ *
+ * Skips when no LML bearer is configured (operator gap, mirrors the
+ * DJ-credentials pattern). A 401/403 is the rotation-drift signal; a
+ * 5xx points at LML itself, not the auth chain. The probe payload uses
+ * a canonical WXYC-representative fixture (Juana Molina / DOGA / la
+ * paradoja) from `wxyc-shared`'s example data so the request body is
+ * indistinguishable from a real DJ lookup. We don't assert on the
+ * `results` shape — that's `proxy-library-search`'s job; this check
+ * scopes to "the bearer is accepted and LML answered 2xx".
+ */
+const lmlAuth: Check = {
+  name: 'lml-auth',
+  description: 'POST /api/v1/lookup directly to LML with LML_API_KEY — catches BS#1094 bearer rotation drift',
+  requiresAuth: false,
+  run: async (ctx): Promise<CheckResult | void> => {
+    if (!ctx.lmlApiKey) {
+      return { skipped: true, skipReason: 'no LML_API_KEY configured' };
+    }
+    const body = JSON.stringify({
+      artist: 'Juana Molina',
+      album: 'DOGA',
+      song: 'la paradoja',
+      raw_message: 'Juana Molina - la paradoja (DOGA)',
+    });
+    const r = await canaryFetch(`${ctx.lmlUrl}/api/v1/lookup`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${ctx.lmlApiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body,
+    });
+    if (r.status === 401 || r.status === 403) {
+      // Distinct message so the operator sees "rotation drift" not "LML
+      // down". The bearer is rolled across BS + rom + tubafrenzy + canary;
+      // a 401/403 here means at least one of those is wedged the same way.
+      throw new Error(
+        `LML rejected bearer with ${r.status} (likely LML_API_KEY rotation drift): ${r.rawText.slice(0, 200)}`
+      );
+    }
+    if (!r.ok) throw new Error(`expected 2xx, got ${r.status}: ${r.rawText.slice(0, 200)}`);
+  },
+};
+
+/**
  * Write canary (v1). Inserts a sentinel flowsheet row, polls until LML
  * enrichment populates `youtube_music_url`, deletes the row, ends the
  * canary's show. Returns an `EnrichmentLagSeconds` metric the runner
@@ -224,6 +278,7 @@ export const checks: readonly Check[] = [
   djFlowsheetRead,
   djRotation,
   djRotationPicker,
+  lmlAuth,
   enrichmentQuality,
 ];
 

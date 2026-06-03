@@ -15,9 +15,10 @@ The canary exists because three production incidents on 2026-04-30 (catalog-sear
 | `dj-flowsheet-read`     | `GET /v2/flowsheet?n=5`                                                 | DJ JWT           | V2 flowsheet read regressions                                                                                           |
 | `dj-rotation`           | `GET /library/rotation`                                                 | DJ JWT           | Rotation endpoint 5xx, fully empty rotation                                                                             |
 | `dj-rotation-picker`    | `GET /library/rotation/{id}/tracks` (id discovered from list)           | DJ JWT           | The BS#994 / BS#1030 cascade-to-502 class; LML-cascade timeouts on the picker that previously surfaced via on-air Slack |
+| `lml-auth`              | `POST /api/v1/lookup` directly to LML with `LML_API_KEY`                | LML bearer       | BS#1094 `LML_API_KEY` rotation drift — silent BS backfill stall when the bearer is rolled without coordinated rollout   |
 | `enrichment-quality`    | insert sentinel → poll for enrichment → delete                          | DJ JWT (write)   | The 2026-05-13 LML cascade regression (null-metadata on inserts)                                                        |
 
-DJ-auth checks downgrade to `skipped` (a distinct CloudWatch metric, not `failed`) when no DJ credentials are configured, so the alarm doesn't fire on operator-caused gaps. The `enrichment-quality` write canary additionally requires `CANARY_ENABLE_WRITE_PROBE=true` and skips when another DJ is on-air — the canary deliberately doesn't inject sentinel rows into a real DJ's flowsheet.
+DJ-auth checks downgrade to `skipped` (a distinct CloudWatch metric, not `failed`) when no DJ credentials are configured, so the alarm doesn't fire on operator-caused gaps. The `lml-auth` check follows the same shape: it skips when no `LML_API_KEY` is configured. The `enrichment-quality` write canary additionally requires `CANARY_ENABLE_WRITE_PROBE=true` and skips when another DJ is on-air — the canary deliberately doesn't inject sentinel rows into a real DJ's flowsheet.
 
 ## Architecture
 

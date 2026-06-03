@@ -19,6 +19,8 @@ function loadConfigFromEnv(): CanaryConfig {
     backendUrl: required('CANARY_BACKEND_URL'),
     authUrl: required('CANARY_AUTH_URL'),
     semanticIndexUrl: required('CANARY_SEMANTIC_INDEX_URL'),
+    lmlUrl: process.env.CANARY_LML_URL ?? 'https://library-metadata-lookup-production.up.railway.app',
+    lmlApiKey: process.env.CANARY_LML_API_KEY,
     originUrl: process.env.CANARY_ORIGIN_URL ?? 'https://dj.wxyc.org',
     djEmail: process.env.CANARY_DJ_EMAIL,
     djPassword: process.env.CANARY_DJ_PASSWORD,
@@ -63,6 +65,29 @@ async function resolveDjCredentials(config: CanaryConfig): Promise<{ email: stri
 }
 
 /**
+ * Resolve the LML bearer from one of two sources, in order:
+ *   1. `CANARY_LML_API_KEY` env var (local + tests + simple prod).
+ *   2. `CANARY_LML_API_KEY_SECRET_ARN` pointing at a Secrets Manager
+ *      secret whose `SecretString` is the bearer itself (plain string,
+ *      not JSON — Railway-style secret-store convention so the bearer
+ *      rotates in one place across BS + rom + tubafrenzy + canary).
+ * Returns undefined when neither is configured — the `lml-auth` check
+ * then downgrades to skipped (operator gap, not regression).
+ */
+async function resolveLmlApiKey(config: CanaryConfig): Promise<string | undefined> {
+  if (config.lmlApiKey) return config.lmlApiKey;
+  const secretArn = process.env.CANARY_LML_API_KEY_SECRET_ARN;
+  if (!secretArn) return undefined;
+
+  const sm = new SecretsManagerClient({ region: config.awsRegion ?? 'us-east-1' });
+  const result = await sm.send(new GetSecretValueCommand({ SecretId: secretArn }));
+  if (!result.SecretString) {
+    throw new Error(`secret ${secretArn} has no SecretString`);
+  }
+  return result.SecretString;
+}
+
+/**
  * Run every check, regardless of individual failures. Returns one outcome
  * per check. DJ-auth checks downgrade to 'skipped' when no DJ credentials
  * are configured — distinct from 'fail' so the alarm only fires on real
@@ -76,6 +101,18 @@ export async function runCanary(config: CanaryConfig): Promise<CheckOutcome[]> {
     djCreds = await resolveDjCredentials(config);
   } catch (err) {
     djAuthError = `credential resolution failed: ${(err as Error).message}`;
+  }
+
+  // LML bearer resolution is independent of DJ auth: the lml-auth check
+  // skips on absence, fails on resolve errors (Secrets Manager outages
+  // are real, distinct signals — collapsing them into "skipped" would
+  // hide an IAM/SM regression).
+  let lmlApiKey: string | undefined;
+  let lmlAuthError: string | undefined;
+  try {
+    lmlApiKey = await resolveLmlApiKey(config);
+  } catch (err) {
+    lmlAuthError = `LML bearer resolution failed: ${(err as Error).message}`;
   }
 
   let djBearerToken: string | undefined;
@@ -103,6 +140,8 @@ export async function runCanary(config: CanaryConfig): Promise<CheckOutcome[]> {
     backendUrl: config.backendUrl,
     authUrl: config.authUrl,
     semanticIndexUrl: config.semanticIndexUrl,
+    lmlUrl: config.lmlUrl ?? 'https://library-metadata-lookup-production.up.railway.app',
+    lmlApiKey,
     djBearerToken,
     djUserId,
     enrichmentPollTimeoutMs: config.enrichmentPollTimeoutMs ?? DEFAULT_ENRICHMENT_POLL_TIMEOUT_MS,
@@ -116,6 +155,12 @@ export async function runCanary(config: CanaryConfig): Promise<CheckOutcome[]> {
       }
       if (check.requiresAuth && djAuthError) {
         return { name: check.name, status: 'fail', latencyMs: 0, message: `auth precondition failed: ${djAuthError}` };
+      }
+      // The lml-auth check fails (not skips) when bearer resolution
+      // errored — a Secrets Manager outage / IAM regression is a real
+      // signal that warrants paging, not a silent skip.
+      if (check.name === 'lml-auth' && lmlAuthError) {
+        return { name: check.name, status: 'fail', latencyMs: 0, message: lmlAuthError };
       }
       if (check.writes && !config.enableWriteProbe) {
         return {
