@@ -193,6 +193,15 @@ const djRotationPicker: Check = {
 };
 
 /**
+ * Synthetic bearer used by the lml-auth check's known-bad probe. Must NOT
+ * match a real bearer pattern — if the real `LML_API_KEY` ever drifted to
+ * this value the canary would silently lose the auth-disabled signal. The
+ * `wxyc-canary-probe-` prefix keeps any accidental leak grepable and the
+ * `not-a-real-key` suffix is the obvious "do not use" marker.
+ */
+const LML_KNOWN_BAD_BEARER = 'wxyc-canary-probe-not-a-real-key';
+
+/**
  * Direct POST to LML's `/api/v1/lookup` with the production
  * `LML_API_KEY` bearer. Catches `LML_API_KEY` rotation drift in
  * isolation from the BS proxy path: `proxy-library-search` exercises
@@ -203,18 +212,29 @@ const djRotationPicker: Check = {
  * rotated without a coordinated rollout (Sentry per row, no aggregated
  * alarm, predicate didn't know about auth).
  *
+ * Two probes per tick:
+ *   1. Known-good bearer (`ctx.lmlApiKey`) must return 2xx. 401/403 here
+ *      is the rotation-drift signal; 5xx points at LML itself.
+ *   2. Known-bad bearer (`wxyc-canary-probe-not-a-real-key`) must return
+ *      401/403. A 200 means LML's auth flag was disabled or rolled back
+ *      (LML_REQUIRE_AUTH=false) and the good-bearer probe alone can't
+ *      detect that — the broader regression the parent BS#1094 was filed
+ *      to catch. Distinct error message ("auth disabled") so operator
+ *      routing differs from rotation drift (which is "re-coordinate
+ *      consumer rotation", not "re-enable LML auth").
+ *
  * Skips when no LML bearer is configured (operator gap, mirrors the
- * DJ-credentials pattern). A 401/403 is the rotation-drift signal; a
- * 5xx points at LML itself, not the auth chain. The probe payload uses
- * a canonical WXYC-representative fixture (Juana Molina / DOGA / la
- * paradoja) from `wxyc-shared`'s example data so the request body is
- * indistinguishable from a real DJ lookup. We don't assert on the
- * `results` shape — that's `proxy-library-search`'s job; this check
- * scopes to "the bearer is accepted and LML answered 2xx".
+ * DJ-credentials pattern). The probe payload uses a canonical
+ * WXYC-representative fixture (Juana Molina / DOGA / la paradoja) from
+ * `wxyc-shared`'s example data so the request body is indistinguishable
+ * from a real DJ lookup. We don't assert on the `results` shape — that's
+ * `proxy-library-search`'s job; this check scopes to "the bearer is
+ * accepted and LML answered 2xx" plus "the known-bad bearer is rejected".
  */
 const lmlAuth: Check = {
   name: 'lml-auth',
-  description: 'POST /api/v1/lookup directly to LML with LML_API_KEY — catches BS#1094 bearer rotation drift',
+  description:
+    'POST /api/v1/lookup directly to LML with LML_API_KEY — catches BS#1094 bearer rotation drift + LML_REQUIRE_AUTH=false',
   requiresAuth: false,
   run: async (ctx): Promise<CheckResult | void> => {
     if (!ctx.lmlApiKey) {
@@ -226,7 +246,9 @@ const lmlAuth: Check = {
       song: 'la paradoja',
       raw_message: 'Juana Molina - la paradoja (DOGA)',
     });
-    const r = await canaryFetch(`${ctx.lmlUrl}/api/v1/lookup`, {
+
+    // Probe 1: known-good bearer must succeed.
+    const good = await canaryFetch(`${ctx.lmlUrl}/api/v1/lookup`, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${ctx.lmlApiKey}`,
@@ -234,15 +256,45 @@ const lmlAuth: Check = {
       },
       body,
     });
-    if (r.status === 401 || r.status === 403) {
+    if (good.status === 401 || good.status === 403) {
       // Distinct message so the operator sees "rotation drift" not "LML
       // down". The bearer is rolled across BS + rom + tubafrenzy + canary;
       // a 401/403 here means at least one of those is wedged the same way.
       throw new Error(
-        `LML rejected bearer with ${r.status} (likely LML_API_KEY rotation drift): ${r.rawText.slice(0, 200)}`
+        `LML rejected bearer with ${good.status} (likely LML_API_KEY rotation drift): ${good.rawText.slice(0, 200)}`
       );
     }
-    if (!r.ok) throw new Error(`expected 2xx, got ${r.status}: ${r.rawText.slice(0, 200)}`);
+    if (!good.ok) {
+      throw new Error(`expected 2xx, got ${good.status}: ${good.rawText.slice(0, 200)}`);
+    }
+
+    // Probe 2: known-bad bearer must be rejected. Catches LML_REQUIRE_AUTH
+    // being flipped off or rolled back — the silent regression the
+    // good-bearer probe alone can't see.
+    const bad = await canaryFetch(`${ctx.lmlUrl}/api/v1/lookup`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${LML_KNOWN_BAD_BEARER}`,
+        'Content-Type': 'application/json',
+      },
+      body,
+    });
+    if (bad.status === 200) {
+      // LML accepted a deliberately-bad bearer — auth is disabled upstream.
+      // Operator routing differs from rotation drift: this is "re-enable
+      // LML auth" (a regression), not "rotate the shared secret".
+      throw new Error(
+        `LML accepted known-bad bearer with 200 — auth disabled upstream (LML_REQUIRE_AUTH likely flipped to false): ${bad.rawText.slice(0, 200)}`
+      );
+    }
+    if (bad.status !== 401 && bad.status !== 403) {
+      // Ambiguous: not a clean "auth enabled" (401/403) and not a clean
+      // "auth disabled" (200). 5xx falls here. Surface as its own class so
+      // it doesn't get conflated with the good-bearer 5xx ("LML down") path.
+      throw new Error(
+        `LML returned ${bad.status} for known-bad bearer (expected 401/403): ${bad.rawText.slice(0, 200)}`
+      );
+    }
   },
 };
 

@@ -325,16 +325,62 @@ describe('runCanary — lml-auth check (BS#1094 layer 1)', () => {
     lmlApiKey: 'fake-lml-bearer',
   };
 
+  /**
+   * The lml-auth check fires two probes per tick: one with the configured
+   * bearer (known-good), one with a deliberately-bad bearer (the
+   * `wxyc-canary-probe-not-a-real-key` sentinel). Both probes hit the same
+   * URL so the existing URL-substring mock can't distinguish them. This
+   * helper inspects the `Authorization` header to route the response,
+   * letting each test pin the four-quadrant outcome matrix (good-200 +
+   * bad-401, good-200 + bad-200, good-401 + bad-anything, good-5xx +
+   * bad-anything).
+   */
+  function setUpLmlBearerAwareMock(opts: {
+    backendHealthcheck?: { status: number; body: unknown };
+    proxyLibrarySearch?: { status: number; body: unknown };
+    semanticIndexSearch?: { status: number; body: unknown };
+    lmlGoodBearer: { status: number; body: unknown };
+    lmlBadBearer: { status: number; body: unknown };
+  }) {
+    const defaults = {
+      backendHealthcheck: { status: 200, body: { ok: true } },
+      proxyLibrarySearch: { status: 200, body: proxyLibrarySearchResponse },
+      semanticIndexSearch: { status: 200, body: { results: [{ id: 1 }] } },
+    };
+    const merged = { ...defaults, ...opts };
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const urlString = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      const respond = (resp: { status: number; body: unknown }) =>
+        new Response(typeof resp.body === 'string' ? resp.body : JSON.stringify(resp.body), {
+          status: resp.status,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      if (urlString.includes('/healthcheck')) return respond(merged.backendHealthcheck);
+      if (urlString.includes('/proxy/library/search')) return respond(merged.proxyLibrarySearch);
+      if (urlString.includes('/graph/artists/search')) return respond(merged.semanticIndexSearch);
+      if (urlString.includes('lml.example.test/api/v1/lookup')) {
+        const headers = (init?.headers ?? {}) as Record<string, string>;
+        const auth = headers.Authorization ?? headers.authorization ?? '';
+        // The sentinel must be obviously synthetic — anything that doesn't
+        // match a real bearer pattern. The implementation chose
+        // `wxyc-canary-probe-not-a-real-key` (see src/checks.ts).
+        const isBadBearer = auth.includes('wxyc-canary-probe-not-a-real-key');
+        return respond(isBadBearer ? opts.lmlBadBearer : opts.lmlGoodBearer);
+      }
+      return new Response(`unmatched mock for ${urlString}`, { status: 599 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    return fetchMock;
+  }
+
   afterEach(() => {
     vi.unstubAllGlobals();
   });
 
-  it('passes when LML returns 200 to the authenticated lookup', async () => {
-    setUpFetchMock({
-      '/healthcheck': { status: 200, body: { ok: true } },
-      '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
-      '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
-      'lml.example.test/api/v1/lookup': { status: 200, body: { results: [], cache_stats: {} } },
+  it('passes when LML returns 200 to the good bearer and 401 to the known-bad bearer', async () => {
+    setUpLmlBearerAwareMock({
+      lmlGoodBearer: { status: 200, body: { results: [], cache_stats: {} } },
+      lmlBadBearer: { status: 401, body: { detail: 'Missing or invalid API key' } },
     });
 
     const outcomes = await runCanary(lmlAuthConfig);
@@ -342,12 +388,68 @@ describe('runCanary — lml-auth check (BS#1094 layer 1)', () => {
     expect(lml.status).toBe('pass');
   });
 
-  it('fails with a rotation-drift message when LML returns 401 (the BS#1094 incident shape)', async () => {
-    setUpFetchMock({
-      '/healthcheck': { status: 200, body: { ok: true } },
-      '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
-      '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
-      'lml.example.test/api/v1/lookup': { status: 401, body: { detail: 'Missing or invalid API key' } },
+  it('passes when LML returns 200 to the good bearer and 403 to the known-bad bearer', async () => {
+    // 403 is treated the same as 401 — both mean "auth is enforced and this
+    // bearer is not accepted", which is exactly what the known-bad probe is
+    // supposed to confirm.
+    setUpLmlBearerAwareMock({
+      lmlGoodBearer: { status: 200, body: { results: [], cache_stats: {} } },
+      lmlBadBearer: { status: 403, body: { detail: 'Forbidden' } },
+    });
+
+    const outcomes = await runCanary(lmlAuthConfig);
+    const lml = outcomes.find((o) => o.name === 'lml-auth')!;
+    expect(lml.status).toBe('pass');
+  });
+
+  it('fails with an "auth disabled" message when LML accepts the known-bad bearer (LML_REQUIRE_AUTH=false regression)', async () => {
+    // The exact failure mode the issue was filed to catch: LML's auth flag
+    // got flipped or rolled back, and any bearer now returns 200. The
+    // good-bearer probe is silent on this — only the known-bad probe
+    // surfaces it. Distinct error class from rotation drift so the operator
+    // routes to "re-enable LML auth", not "rotate the shared secret".
+    setUpLmlBearerAwareMock({
+      lmlGoodBearer: { status: 200, body: { results: [], cache_stats: {} } },
+      lmlBadBearer: { status: 200, body: { results: [], cache_stats: {} } },
+    });
+
+    const outcomes = await runCanary(lmlAuthConfig);
+    const lml = outcomes.find((o) => o.name === 'lml-auth')!;
+
+    expect(lml.status).toBe('fail');
+    expect(lml.message).toMatch(/auth disabled/);
+    // Must not be mistaken for the rotation-drift failure class — different
+    // remediation, different on-call routing.
+    expect(lml.message).not.toMatch(/rotation drift/);
+  });
+
+  it('fails with an "unexpected status" message when the known-bad bearer returns neither 200 nor 401/403 (e.g. 500)', async () => {
+    // A 5xx on the known-bad probe is ambiguous: not a clean "auth enabled"
+    // signal, not a clean "auth disabled" signal either. Surface it as its
+    // own class so the operator doesn't conflate it with the good-bearer
+    // 5xx path (which is the "LML down" message).
+    setUpLmlBearerAwareMock({
+      lmlGoodBearer: { status: 200, body: { results: [], cache_stats: {} } },
+      lmlBadBearer: { status: 500, body: { detail: 'Internal Server Error' } },
+    });
+
+    const outcomes = await runCanary(lmlAuthConfig);
+    const lml = outcomes.find((o) => o.name === 'lml-auth')!;
+
+    expect(lml.status).toBe('fail');
+    expect(lml.message).toMatch(/known-bad bearer/);
+    expect(lml.message).toMatch(/500/);
+    expect(lml.message).not.toMatch(/rotation drift/);
+    expect(lml.message).not.toMatch(/auth disabled/);
+  });
+
+  it('fails with a rotation-drift message when LML returns 401 to the good bearer (the BS#1094 incident shape)', async () => {
+    // Good-bearer 401 short-circuits — no need to consult the known-bad
+    // probe. Rotation drift is the dominant failure class; calling out the
+    // known-bad result here would muddy the operator's runbook.
+    setUpLmlBearerAwareMock({
+      lmlGoodBearer: { status: 401, body: { detail: 'Missing or invalid API key' } },
+      lmlBadBearer: { status: 401, body: { detail: 'Missing or invalid API key' } },
     });
 
     const outcomes = await runCanary(lmlAuthConfig);
@@ -360,12 +462,10 @@ describe('runCanary — lml-auth check (BS#1094 layer 1)', () => {
     expect(lml.message).toMatch(/401/);
   });
 
-  it('fails with the same rotation-drift message on 403 (forbidden — bearer recognised but revoked)', async () => {
-    setUpFetchMock({
-      '/healthcheck': { status: 200, body: { ok: true } },
-      '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
-      '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
-      'lml.example.test/api/v1/lookup': { status: 403, body: { detail: 'Forbidden' } },
+  it('fails with the same rotation-drift message on good-bearer 403 (forbidden — bearer recognised but revoked)', async () => {
+    setUpLmlBearerAwareMock({
+      lmlGoodBearer: { status: 403, body: { detail: 'Forbidden' } },
+      lmlBadBearer: { status: 401, body: { detail: 'Missing or invalid API key' } },
     });
 
     const outcomes = await runCanary(lmlAuthConfig);
@@ -377,11 +477,9 @@ describe('runCanary — lml-auth check (BS#1094 layer 1)', () => {
   });
 
   it('fails with a generic 5xx message when LML itself is down (not a rotation-drift signal)', async () => {
-    setUpFetchMock({
-      '/healthcheck': { status: 200, body: { ok: true } },
-      '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
-      '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
-      'lml.example.test/api/v1/lookup': { status: 503, body: { detail: 'Service Unavailable' } },
+    setUpLmlBearerAwareMock({
+      lmlGoodBearer: { status: 503, body: { detail: 'Service Unavailable' } },
+      lmlBadBearer: { status: 503, body: { detail: 'Service Unavailable' } },
     });
 
     const outcomes = await runCanary(lmlAuthConfig);
@@ -391,34 +489,43 @@ describe('runCanary — lml-auth check (BS#1094 layer 1)', () => {
     // No rotation-drift framing — the operator's diagnostic path
     // (page rom, page LML on-call) is different from rotation drift.
     expect(lml.message).not.toMatch(/rotation drift/);
+    expect(lml.message).not.toMatch(/auth disabled/);
     expect(lml.message).toMatch(/503/);
   });
 
   it('sends the bearer as Authorization: Bearer and posts a structured artist/album/song body', async () => {
-    const fetchMock = setUpFetchMock({
-      '/healthcheck': { status: 200, body: { ok: true } },
-      '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
-      '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
-      'lml.example.test/api/v1/lookup': { status: 200, body: { results: [], cache_stats: {} } },
+    const fetchMock = setUpLmlBearerAwareMock({
+      lmlGoodBearer: { status: 200, body: { results: [], cache_stats: {} } },
+      lmlBadBearer: { status: 401, body: { detail: 'Missing or invalid API key' } },
     });
 
     await runCanary(lmlAuthConfig);
 
-    const lmlCall = fetchMock.mock.calls.find(([url]) => String(url).includes('lml.example.test/api/v1/lookup'));
-    expect(lmlCall).toBeDefined();
-    const [, init] = lmlCall as unknown as [unknown, RequestInit];
-    expect(init.method).toBe('POST');
-    const headers = init.headers as Record<string, string>;
-    expect(headers.Authorization).toBe('Bearer fake-lml-bearer');
-    expect(headers['Content-Type']).toBe('application/json');
+    const lmlCalls = fetchMock.mock.calls.filter(([url]) => String(url).includes('lml.example.test/api/v1/lookup'));
+    // Two probes per tick: one with the configured bearer, one with the
+    // synthetic known-bad bearer.
+    expect(lmlCalls).toHaveLength(2);
+    const [, goodInit] = lmlCalls[0] as unknown as [unknown, RequestInit];
+    expect(goodInit.method).toBe('POST');
+    const goodHeaders = goodInit.headers as Record<string, string>;
+    expect(goodHeaders.Authorization).toBe('Bearer fake-lml-bearer');
+    expect(goodHeaders['Content-Type']).toBe('application/json');
     // The payload must carry a real artist/album/song so it exercises
     // LML's `perform_lookup` rather than short-circuiting on empty
     // input. Use a canonical WXYC-representative fixture.
-    const body = JSON.parse(init.body as string);
+    const body = JSON.parse(goodInit.body as string);
     expect(body.artist).toBeTypeOf('string');
     expect(body.artist.length).toBeGreaterThan(0);
     expect(body.album).toBeTypeOf('string');
     expect(body.song).toBeTypeOf('string');
+
+    const [, badInit] = lmlCalls[1] as unknown as [unknown, RequestInit];
+    const badHeaders = badInit.headers as Record<string, string>;
+    // The sentinel bearer must be obviously synthetic — never overlap with
+    // a real bearer pattern. If this ever changes, the bearer-aware mock
+    // in this file needs the matching string updated.
+    expect(badHeaders.Authorization).toBe('Bearer wxyc-canary-probe-not-a-real-key');
+    expect(badHeaders['Content-Type']).toBe('application/json');
   });
 
   it('skips when no LML_API_KEY is configured (operator gap, not regression)', async () => {
