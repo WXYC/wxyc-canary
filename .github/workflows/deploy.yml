@@ -57,5 +57,7 @@ jobs:
               BackendUrl=${{ vars.BACKEND_URL || 'https://api.wxyc.org' }} \
               AuthUrl=${{ vars.AUTH_URL || 'https://api.wxyc.org/auth' }} \
               SemanticIndexUrl=${{ vars.SEMANTIC_INDEX_URL || 'https://explore.wxyc.org' }} \
+              LmlUrl=${{ vars.LML_URL || 'https://library-metadata-lookup-production.up.railway.app' }} \
+              LmlApiKeySecretArn=${{ secrets.LML_API_KEY_SECRET_ARN }} \
               DjCredentialsSecretArn=${{ secrets.DJ_CREDENTIALS_SECRET_ARN }} \
               AlertEmail=${{ vars.ALERT_EMAIL }}
