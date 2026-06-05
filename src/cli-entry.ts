@@ -3,13 +3,17 @@
 // in `./cli.js`'s `runCli`; this entry is a thin IO wiring shell so the
 // test suite can import `runCli` directly without firing process.exit.
 import { runCli } from './cli.js';
+import { sanitizeForLog } from './cli.js';
 
 /**
  * Format a thrown value for the fatal-error stderr line. `err` is typed
  * `unknown` because library code may `throw 'string'` / `throw {code:'X'}`
  * / `throw undefined`. The early `err instanceof Error` branch keeps the
  * stack trace; the else branch coerces with care so we never print a bare
- * `undefined` or `[object Object]`.
+ * `undefined` or `[object Object]`. The caller passes the result through
+ * `sanitizeForLog` before writing to stderr — attacker text leaked via a
+ * thrown Error message would otherwise bypass the per-outcome sanitizer
+ * and forge a fake summary line in the GHA workflow log.
  */
 function formatFatal(err: unknown): string {
   if (err instanceof Error) {
@@ -27,12 +31,37 @@ function formatFatal(err: unknown): string {
   return String(err);
 }
 
+/**
+ * Wait for stdout/stderr to drain, then force exit with the given code.
+ *
+ * `process.exit(code)` discards pending I/O when stdout is a pipe (the
+ * documented `| jq` happy path), truncating the JSON line the gate
+ * workflow consumes. Setting `process.exitCode` and waiting for the
+ * loop to drain naturally is the textbook fix — except Node's global
+ * `fetch` (undici) keeps an HTTP connection pool alive after the last
+ * request (default ~4s idle keepalive; up to 60s on servers with
+ * aggressive Keep-Alive headers). Letting the loop drain there means
+ * the CLI hangs that long after writing its JSON, which compounds
+ * across BS+LML+dj-site gate legs.
+ *
+ * The compromise: wait for explicit stdout/stderr drain callbacks, then
+ * call `process.exit(code)` — by the time both drain callbacks fire,
+ * the pipe buffer has flushed, but the connection pool is still alive;
+ * the explicit exit closes everything without waiting for the pool to
+ * idle out.
+ */
+async function exitAfterDrain(code: number): Promise<never> {
+  // Trigger empty writes whose callbacks fire after the previously
+  // queued bytes have flushed to the underlying transport. If the
+  // streams are already drained, the callback fires on the next tick.
+  await Promise.all([
+    new Promise<void>((resolve) => process.stdout.write('', () => resolve())),
+    new Promise<void>((resolve) => process.stderr.write('', () => resolve())),
+  ]);
+  process.exit(code);
+}
+
 runCli(process.argv.slice(2), process.env, {
-  // Wrap stdout/stderr writes so the entry can await pipe drainage before
-  // exiting. `process.stdout.write` is async when stdout is a pipe (the
-  // documented `| jq` happy path); calling process.exit(code) immediately
-  // after a sync-style write truncates the pipe buffer. Setting
-  // process.exitCode and letting the loop drain naturally avoids the race.
   stdout: (s) => {
     process.stdout.write(s);
   },
@@ -41,19 +70,19 @@ runCli(process.argv.slice(2), process.env, {
   },
 }).then(
   (code) => {
-    // Drain stdout/stderr before letting the process exit. Without an
-    // explicit drain wait, `process.exit(code)` discards pending I/O when
-    // stdout is a pipe — truncating the JSON line the gate workflow
-    // consumes via `jq`. Setting exitCode and letting the event loop
-    // drain naturally is the Node-documented fix.
-    process.exitCode = code;
+    void exitAfterDrain(code);
   },
   (err) => {
-    process.stderr.write(`fatal: ${formatFatal(err)}\n`);
+    // Sanitize before write — formatFatal may interpolate err.message
+    // that originated from a server response body (`canaryFetch` errors
+    // include `r.rawText.slice(0, 200)` in their messages). Without
+    // sanitization the fatal-error path bypasses the log-injection
+    // defense the per-outcome sanitizer was added for.
+    process.stderr.write(`fatal: ${sanitizeForLog(formatFatal(err))}\n`);
     // Exit 2 (invocation/internal error), not 1 (any check failed). The
     // CLI's exit-code contract distinguishes "your service is broken" (1)
     // from "your CLI invocation / runtime is broken" (2); an uncaught
     // throw in runCli is the latter.
-    process.exitCode = 2;
+    void exitAfterDrain(2);
   }
 );

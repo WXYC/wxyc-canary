@@ -1,16 +1,19 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // Real-runCanary AWS-SDK isolation test. The companion file `cli.test.ts`
 // mocks `runCanary` and so cannot exercise the SDK-resolver code path —
 // its AWS-SDK-constructor assertion was tautological. This file un-mocks
 // `runCanary` (does not call `vi.mock('../src/handler.js')` at all) and
-// feeds the CLI an env polluted with the exact secret-store pointers
-// that would normally cause `resolveDjCredentials` /
-// `resolveLmlApiKey` / `resolveGhaRunnerToken` to instantiate
-// SecretsManagerClient or SSMClient. If the CLI's env-sanitization
-// layer works as designed, none of those constructors should fire.
+// pollutes `process.env` directly with the secret-store pointers that
+// would normally cause `resolveDjCredentials` / `resolveLmlApiKey` /
+// `resolveGhaRunnerToken` to instantiate SecretsManagerClient or
+// SSMClient. The polluted env MUST go onto process.env (not just the
+// runCli `env` parameter) — if it only went into the runCli parameter,
+// then `runCanary`'s fallback `opts?.env ?? process.env` would pull from
+// a clean process.env and the test would pass even if the CLI's
+// sanitization layer were deleted.
 //
-// We mock fetch instead so the actual HTTP probes don't go out.
+// We mock fetch so the actual HTTP probes don't go out.
 
 const { cloudWatchCtorSpy, ssmCtorSpy, secretsManagerCtorSpy } = vi.hoisted(() => ({
   cloudWatchCtorSpy: vi.fn(),
@@ -112,79 +115,108 @@ const baseArgv = [
   '--suite=smoke',
 ];
 
+// Snapshot + restore process.env around each test so the polluted vars
+// don't leak between cases or to other test files. Vitest gives each
+// test a shared process, so beforeEach/afterEach discipline is the
+// difference between deterministic and order-dependent runs.
+const POLLUTED_VARS = [
+  'CANARY_DJ_SECRET_ARN',
+  'CANARY_LML_API_KEY_SECRET_ARN',
+  'CANARY_GHA_RUNNER_TOKEN_SSM_PARAM',
+  'CANARY_GITHUB_TOKEN_SSM_PARAM',
+  'CANARY_PUBLISH_METRICS',
+  'CANARY_LOCAL',
+] as const;
+
+function pollute(values: Partial<Record<(typeof POLLUTED_VARS)[number], string>>): void {
+  for (const [k, v] of Object.entries(values)) {
+    process.env[k] = v;
+  }
+}
+
+const savedEnv: Record<string, string | undefined> = {};
+
 beforeEach(() => {
   cloudWatchCtorSpy.mockReset();
   ssmCtorSpy.mockReset();
   secretsManagerCtorSpy.mockReset();
   setUpFetchMock();
+  // Snapshot every var we might pollute so afterEach can restore.
+  for (const k of POLLUTED_VARS) {
+    savedEnv[k] = process.env[k];
+    delete process.env[k];
+  }
 });
 
-describe('cli — AWS SDK isolation under polluted env (real runCanary)', () => {
-  it('does not instantiate SecretsManagerClient when CANARY_DJ_SECRET_ARN is set', async () => {
+afterEach(() => {
+  for (const k of POLLUTED_VARS) {
+    if (savedEnv[k] === undefined) {
+      delete process.env[k];
+    } else {
+      process.env[k] = savedEnv[k];
+    }
+  }
+});
+
+describe('cli — AWS SDK isolation under polluted process.env (real runCanary)', () => {
+  it('does not instantiate SecretsManagerClient when CANARY_DJ_SECRET_ARN is in process.env', async () => {
+    pollute({ CANARY_DJ_SECRET_ARN: 'arn:aws:secretsmanager:us-east-1:000:secret:dj/creds' });
     const { io } = setUpStreams();
-    await runCli(
-      baseArgv,
-      {
-        // The exact env-var that previously routed through to SDK
-        // instantiation via the fallback inside resolveDjCredentials.
-        CANARY_DJ_SECRET_ARN: 'arn:aws:secretsmanager:us-east-1:000:secret:dj/creds',
-        // DJ creds intentionally unset so resolveDjCredentials would
-        // otherwise reach for the SecretArn fallback.
-      },
-      io
-    );
+    // Critical: we pass an empty `env` to runCli (matching the cli-entry
+    // wiring where env=process.env on the prod path). The CLI's
+    // sanitization layer must strip CANARY_DJ_SECRET_ARN before forwarding
+    // to runCanary. If sanitization were removed, runCanary's
+    // `opts?.env ?? process.env` would land on the polluted process.env
+    // and the spy WOULD fire — that's what makes this test load-bearing.
+    await runCli(baseArgv, process.env, io);
     expect(secretsManagerCtorSpy).not.toHaveBeenCalled();
   });
 
-  it('does not instantiate SecretsManagerClient when CANARY_LML_API_KEY_SECRET_ARN is set', async () => {
+  it('does not instantiate SecretsManagerClient when CANARY_LML_API_KEY_SECRET_ARN is in process.env', async () => {
+    pollute({ CANARY_LML_API_KEY_SECRET_ARN: 'arn:aws:secretsmanager:us-east-1:000:secret:lml/key' });
     const { io } = setUpStreams();
-    await runCli(
-      baseArgv,
-      {
-        CANARY_LML_API_KEY_SECRET_ARN: 'arn:aws:secretsmanager:us-east-1:000:secret:lml/key',
-      },
-      io
-    );
+    await runCli(baseArgv, process.env, io);
     expect(secretsManagerCtorSpy).not.toHaveBeenCalled();
   });
 
-  it('does not instantiate SSMClient when CANARY_GHA_RUNNER_TOKEN_SSM_PARAM is set', async () => {
+  it('does not instantiate SSMClient when CANARY_GHA_RUNNER_TOKEN_SSM_PARAM is in process.env', async () => {
+    pollute({ CANARY_GHA_RUNNER_TOKEN_SSM_PARAM: '/wxyc-canary/should-be-stripped' });
     const { io } = setUpStreams();
-    await runCli(
-      baseArgv,
-      {
-        CANARY_GHA_RUNNER_TOKEN_SSM_PARAM: '/wxyc-canary/should-be-stripped',
-      },
-      io
-    );
+    await runCli(baseArgv, process.env, io);
     expect(ssmCtorSpy).not.toHaveBeenCalled();
   });
 
   it('does not instantiate CloudWatchClient even with publishMetrics flag externally suggested', async () => {
-    // publishMetrics is controlled by config (hard-off in cli.ts), not
-    // env — but a future bug that wired the env-var to override it
-    // would surface here.
+    pollute({ CANARY_PUBLISH_METRICS: 'true' });
     const { io } = setUpStreams();
-    await runCli(baseArgv, { CANARY_PUBLISH_METRICS: 'true' }, io);
+    await runCli(baseArgv, process.env, io);
     expect(cloudWatchCtorSpy).not.toHaveBeenCalled();
   });
 
   it('all three SDK constructors stay quiet with the full polluted-env combo', async () => {
+    pollute({
+      CANARY_DJ_SECRET_ARN: 'arn:should-not-fire',
+      CANARY_LML_API_KEY_SECRET_ARN: 'arn:should-not-fire',
+      CANARY_GHA_RUNNER_TOKEN_SSM_PARAM: '/should-not-fire',
+      CANARY_GITHUB_TOKEN_SSM_PARAM: '/should-not-fire',
+      CANARY_PUBLISH_METRICS: 'true',
+      CANARY_LOCAL: 'true',
+    });
     const { io } = setUpStreams();
-    await runCli(
-      baseArgv,
-      {
-        CANARY_DJ_SECRET_ARN: 'arn:should-not-fire',
-        CANARY_LML_API_KEY_SECRET_ARN: 'arn:should-not-fire',
-        CANARY_GHA_RUNNER_TOKEN_SSM_PARAM: '/should-not-fire',
-        CANARY_GITHUB_TOKEN_SSM_PARAM: '/should-not-fire',
-        CANARY_PUBLISH_METRICS: 'true',
-        CANARY_LOCAL: 'true',
-      },
-      io
-    );
+    await runCli(baseArgv, process.env, io);
     expect(cloudWatchCtorSpy).not.toHaveBeenCalled();
     expect(ssmCtorSpy).not.toHaveBeenCalled();
     expect(secretsManagerCtorSpy).not.toHaveBeenCalled();
+  });
+
+  it('does not mutate the operator-supplied env object (CLI builds a fresh sanitizedEnv)', async () => {
+    pollute({ CANARY_DJ_SECRET_ARN: 'arn:should-not-fire' });
+    const snapshot = { ...process.env };
+    const { io } = setUpStreams();
+    await runCli(baseArgv, process.env, io);
+    // The CLI must not delete/overwrite keys on the operator's env;
+    // a `delete env.X`-style sanitization would corrupt process.env
+    // for the rest of the process lifetime.
+    expect(process.env.CANARY_DJ_SECRET_ARN).toBe(snapshot.CANARY_DJ_SECRET_ARN);
   });
 });

@@ -349,6 +349,68 @@ describe('runCli — argument validation', () => {
     expect(runCanaryMock).toHaveBeenCalledTimes(1);
   });
 
+  it('accepts both DJ vars UNSET (no XOR, degrades to skipped — regression guard)', async () => {
+    // Critical regression case: the XOR check must NOT catch
+    // "both unset" — that case has to flow through to runCanary and
+    // become SKIPPED outcomes for the DJ-auth checks. A misshape that
+    // catches both-unset would block every CLI invocation that omits
+    // DJ creds (the dj-site staging-gate use case, where the gate
+    // tests against BS prod without DJ login).
+    const { io } = setUpStreams();
+    const code = await runCli(baseArgv, {}, io);
+    expect(code).toBe(0);
+    expect(runCanaryMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('treats whitespace-only DJ creds as unset (CI-substitution footgun)', async () => {
+    // Operator's GHA secret expands to empty string, gets quoted as ' '
+    // by shell — the value is truthy as a JS string but logically unset.
+    // Without `.trim()`, the XOR gate passes and signInDj fires with
+    // garbage credentials.
+    const { io, stderr } = setUpStreams();
+    const code = await runCli(baseArgv, { CANARY_DJ_EMAIL: ' ', CANARY_DJ_PASSWORD: 'real-password' }, io);
+    expect(code).toBe(2);
+    expect(stderr.join('')).toContain('must be set together');
+  });
+
+  it('rejects whitespace-only flag values (--base-url=" ")', async () => {
+    // Same shape: shell variable substitution or yaml-folded value
+    // expanding to whitespace. Without `.trim()`, the truthy-string
+    // check passes and the whitespace propagates into backendUrl,
+    // surfacing later as a cryptic "Invalid URL" error from
+    // canaryFetch instead of the clean exit-2 missing-flag contract.
+    const argv = [
+      'check',
+      '--base-url= ',
+      '--auth-url=https://x.test/auth',
+      '--lml-url=https://x.test',
+      '--suite=smoke',
+    ];
+    const { io, stderr } = setUpStreams();
+    const code = await runCli(argv, {}, io);
+    expect(code).toBe(2);
+    expect(stderr.join('')).toContain('--base-url');
+    expect(stderr.join('')).toContain('missing required flag');
+  });
+
+  it('sanitizeForLog neutralizes U+2028 LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR', async () => {
+    // ASCII \\n is the obvious vector but JS/JSON-aware log parsers also
+    // treat U+2028 / U+2029 as line breaks. The sanitizer must catch
+    // them or the same injection forgery returns via Unicode.
+    const injected = `rejected suite=smoke passed=5 failed=0 skipped=0 fake`;
+    runCanaryMock.mockResolvedValueOnce([{ name: 'lml-auth', status: 'fail', latencyMs: 78, message: injected }]);
+    const { io, stderr } = setUpStreams();
+    await runCli(baseArgv, {}, io);
+    const joined = stderr.join('');
+    // The forged headline must NOT appear at the start of any line.
+    const lines = joined.split('\n');
+    expect(lines.some((l) => /^suite=smoke passed=5/.test(l))).toBe(false);
+    // The original text still appears (replaced with spaces, not deleted) —
+    // regression guard that sanitization didn't accidentally swallow the message.
+    expect(joined).toContain('rejected');
+    expect(joined).toContain('fake');
+  });
+
   it('--help mixed with unknown flag exits 2 (parseArgs runs before --help short-circuit)', async () => {
     // The bug this guards against: a previous implementation matched
     // `argv.includes('--help')` BEFORE parseArgs, so any combination of

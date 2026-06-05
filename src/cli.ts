@@ -85,15 +85,25 @@ function isValidSuite(s: string): s is Suite {
 }
 
 /**
- * Strip control characters from text that originated outside the CLI
- * (HTTP response bodies surfaced inside CheckOutcome.message). Without
- * this, a probed endpoint serving attacker-controlled text could inject
- * newlines into the stderr summary and forge a misleading "passed=5
- * failed=0" trailer in the GHA workflow log.
+ * Strip control characters AND Unicode line terminators from text that
+ * originated outside the CLI (HTTP response bodies surfaced inside
+ * CheckOutcome.message, fatal-error messages). Without this, a probed
+ * endpoint serving attacker-controlled text could inject newlines into
+ * the stderr summary and forge a misleading "passed=5 failed=0" trailer
+ * in the GHA workflow log.
+ *
+ * Covers:
+ *  - ASCII C0 controls (0x00–0x1f, includes \\n, \\r, \\t, ESC for ANSI)
+ *  - DEL (0x7f)
+ *  - C1 controls (0x80–0x9f, includes CSI single-byte forms)
+ *  - U+2028 LINE SEPARATOR, U+2029 PARAGRAPH SEPARATOR (JS/JSON-aware
+ *    log parsers treat these as line breaks; the regex must catch them
+ *    or the same injection forgery returns via Unicode).
+ *  - U+0085 NEL (NEXT LINE)
  */
-function sanitizeForLog(s: string): string {
+export function sanitizeForLog(s: string): string {
   // eslint-disable-next-line no-control-regex
-  return s.replace(/[\x00-\x1f\x7f]/g, ' ');
+  return s.replace(/[\x00-\x1f\x7f-\x9f\u0085\u2028\u2029]/g, ' ');
 }
 
 /**
@@ -158,33 +168,59 @@ export async function runCli(argv: string[], env: NodeJS.ProcessEnv, io: CliStre
     return 2;
   }
 
-  const values = parsed.values;
+  // Normalize string flag values: trim whitespace, treat empty-after-trim
+  // as missing. `--base-url=' '` would otherwise pass the truthy-string
+  // check, propagate the whitespace into backendUrl, and surface as a
+  // cryptic "Invalid URL" error from canaryFetch instead of the clean
+  // exit-2 "missing required flag" contract.
+  const trim = (k: keyof typeof parsed.values): string | undefined => {
+    const v = parsed.values[k];
+    if (typeof v !== 'string') return undefined;
+    const t = v.trim();
+    return t === '' ? undefined : t;
+  };
+  const baseUrl = trim('base-url');
+  const authUrl = trim('auth-url');
+  const lmlUrl = trim('lml-url');
+  const suiteRaw = trim('suite');
+
   const missing: string[] = [];
-  if (!values['base-url']) missing.push('--base-url');
-  if (!values['auth-url']) missing.push('--auth-url');
-  if (!values['lml-url']) missing.push('--lml-url');
-  if (!values.suite) missing.push('--suite');
+  if (!baseUrl) missing.push('--base-url');
+  if (!authUrl) missing.push('--auth-url');
+  if (!lmlUrl) missing.push('--lml-url');
+  if (!suiteRaw) missing.push('--suite');
   if (missing.length > 0) {
     io.stderr(`missing required flag(s): ${missing.join(', ')}\n`);
     io.stderr(USAGE);
     return 2;
   }
 
-  const suiteArg = values.suite as string;
-  if (!isValidSuite(suiteArg)) {
-    io.stderr(`unknown suite '${suiteArg}' (valid: ${VALID_SUITES.join(', ')})\n`);
+  if (!isValidSuite(suiteRaw as string)) {
+    io.stderr(`unknown suite '${suiteRaw}' (valid: ${VALID_SUITES.join(', ')})\n`);
     io.stderr(USAGE);
     return 2;
   }
+  const suiteArg = suiteRaw as Suite;
 
   // DJ creds must be set together. XOR (only one set) was previously
   // silently degraded to "no DJ credentials configured" because
   // resolveDjCredentials in handler.ts requires both. Surfacing it as
   // an invocation error keeps the gate operator from shipping a workflow
   // where DJ-auth checks are accidentally skipped.
-  const djEmailSet = !!env.CANARY_DJ_EMAIL;
-  const djPasswordSet = !!env.CANARY_DJ_PASSWORD;
-  if (djEmailSet !== djPasswordSet) {
+  //
+  // `.trim()` + truthy check catches whitespace-only values from CI
+  // variable substitution (e.g. `${{ secrets.MISSING_SECRET }}` expands
+  // to empty string; `${UNSET:-}` expands similarly). Without the trim
+  // an operator with `CANARY_DJ_EMAIL=' '` would pass the XOR gate, then
+  // sign-in 401s as a real-DJ-auth-down failure on every gate run.
+  //
+  // Gate the check on whether the resolved suite actually needs DJ auth
+  // — a future non-DJ suite (e.g. read-only public surfaces) shouldn't
+  // surface an XOR error to operators who happen to have one half set.
+  const djEmailSet = !!env.CANARY_DJ_EMAIL?.trim();
+  const djPasswordSet = !!env.CANARY_DJ_PASSWORD?.trim();
+  const suiteNeedsDj = checksForSuite(suiteArg).some((c) => c.requiresAuth);
+  if (suiteNeedsDj && djEmailSet !== djPasswordSet) {
     io.stderr(
       `CANARY_DJ_EMAIL and CANARY_DJ_PASSWORD must be set together (found: EMAIL=${djEmailSet ? 'set' : 'unset'}, PASSWORD=${djPasswordSet ? 'set' : 'unset'})\n`
     );
@@ -195,15 +231,16 @@ export async function runCli(argv: string[], env: NodeJS.ProcessEnv, io: CliStre
   // purpose — putting `--dj-password` on the command line would leak the
   // bearer into shell history, process listings, and CI run logs.
   const config: CanaryConfig = {
-    backendUrl: values['base-url'] as string,
-    authUrl: values['auth-url'] as string,
+    // Use the trimmed URL values (already validated as non-empty).
+    backendUrl: baseUrl as string,
+    authUrl: authUrl as string,
     // semanticIndexUrl is required on CanaryConfig but unused by every
     // smoke check. The empty string is a tripwire: if a future suite
     // ever includes `semantic-index-search` without surfacing this
     // field as a flag, the check will fail with a clear URL-construction
     // error rather than silently hitting the wrong host.
     semanticIndexUrl: '',
-    lmlUrl: values['lml-url'] as string,
+    lmlUrl: lmlUrl as string,
     djEmail: env.CANARY_DJ_EMAIL,
     djPassword: env.CANARY_DJ_PASSWORD,
     lmlApiKey: env.CANARY_LML_API_KEY,
