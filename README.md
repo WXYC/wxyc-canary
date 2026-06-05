@@ -195,6 +195,12 @@ Required GitHub variables (override defaults if needed):
 
 - `BACKEND_URL`, `AUTH_URL`, `SEMANTIC_INDEX_URL`, `ALERT_EMAIL`
 
+Optional GitHub variables for the runner-liveness probe (when all three are set the next deploy enables `gha-runner-online`; leave unset to keep it skipped):
+
+- `GHA_RUNNER_TOKEN_SSM_PARAM_NAME` — SSM SecureString path that the operator has populated, e.g. `/wxyc-canary/gha-runner-token`. Defaults empty → probe disabled.
+- `GHA_RUNNER_ORG` — defaults to `WXYC`.
+- `GHA_RUNNER_ID` — numeric runner id from `gh api /orgs/WXYC/actions/runners`. Defaults to `0` → probe disabled.
+
 ## Operating runbook
 
 ### Alarm fires: `wxyc-canary-check-failure`

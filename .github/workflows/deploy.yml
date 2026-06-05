@@ -46,6 +46,16 @@ jobs:
       - name: SAM build
         run: sam build
       - name: SAM deploy
+        # `GhaRunnerTokenSsmParamName` defaults empty and `GhaRunnerId` defaults
+        # '0' so the runner-liveness probe stays disabled until the SSM PAT
+        # exists in the canary's AWS account AND the corresponding GH Action
+        # variables (`GHA_RUNNER_TOKEN_SSM_PARAM_NAME`, `GHA_RUNNER_ID`) are
+        # set. See `scripts/e2e-runner/README.md` (in wxyc-shared) for the
+        # runner topology and the README in this repo's "Runner liveness probe"
+        # section for the SSM PAT setup. Sequencing intent: probe ships
+        # disabled, operator opts in by creating the SSM PAT then flipping
+        # the GH vars, then a workflow_dispatch run enables the probe
+        # atomically without an alarm window.
         run: |
           sam deploy \
             --no-confirm-changeset \
@@ -60,4 +70,7 @@ jobs:
               LmlUrl=${{ vars.LML_URL || 'https://library-metadata-lookup-production.up.railway.app' }} \
               LmlApiKeySecretArn=${{ secrets.LML_API_KEY_SECRET_ARN }} \
               DjCredentialsSecretArn=${{ secrets.DJ_CREDENTIALS_SECRET_ARN }} \
-              AlertEmail=${{ vars.ALERT_EMAIL }}
+              AlertEmail=${{ vars.ALERT_EMAIL }} \
+              GhaRunnerTokenSsmParamName=${{ vars.GHA_RUNNER_TOKEN_SSM_PARAM_NAME }} \
+              GhaRunnerOrg=${{ vars.GHA_RUNNER_ORG || 'WXYC' }} \
+              GhaRunnerId=${{ vars.GHA_RUNNER_ID || '0' }}
