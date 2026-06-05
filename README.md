@@ -57,7 +57,6 @@ export CANARY_PUBLISH_METRICS=false
 # Optional, exercises DJ-auth checks:
 export CANARY_DJ_EMAIL=canary@wxyc.org
 export CANARY_DJ_PASSWORD=...
-export CANARY_LOCAL=true
 npm run local
 ```
 
@@ -77,13 +76,14 @@ wxyc-canary check \
 
 Credentials come from environment variables only (flags would leak into shell history and CI logs):
 
-| Env var              | Purpose                                                                                                                      |
-| -------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| `CANARY_DJ_EMAIL`    | DJ login for auth-protected checks. Without it, those checks `skipped` (not fail).                                           |
-| `CANARY_DJ_PASSWORD` | Pairs with `CANARY_DJ_EMAIL`.                                                                                                |
-| `CANARY_LML_API_KEY` | LML bearer for the `lml-auth` check. Without it, the check `skipped`.                                                        |
-| `CANARY_ORIGIN_URL`  | Sent as `Origin:` on better-auth calls. Must match a `BETTER_AUTH_TRUSTED_ORIGINS` value. Defaults to `https://dj.wxyc.org`. |
-| `CANARY_TIMEOUT_MS`  | Per-check fetch timeout. Defaults to 8000.                                                                                   |
+| Env var              | Purpose                                                                                                                                                                     |
+| -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `CANARY_DJ_EMAIL`    | DJ login email. Pairs with `CANARY_DJ_PASSWORD`; both must be set together or both unset (XOR is rejected as exit 2). When both unset, DJ-auth checks `skipped` (not fail). |
+| `CANARY_DJ_PASSWORD` | DJ login password. See above.                                                                                                                                               |
+| `CANARY_LML_API_KEY` | LML bearer for the `lml-auth` check. Without it, the check `skipped`.                                                                                                       |
+| `CANARY_ORIGIN_URL`  | Sent as `Origin:` on better-auth calls. Must match a `BETTER_AUTH_TRUSTED_ORIGINS` value. Defaults to `https://dj.wxyc.org`.                                                |
+
+`*_SECRET_ARN` and `*_SSM_PARAM` env vars used by the Lambda are **not** read by the CLI. The CLI passes a sanitized env to `runCanary` so an operator with those vars exported in their shell cannot accidentally trigger AWS-SDK calls from a CLI invocation — verified by `test/cli-aws-isolation.test.ts`.
 
 ### Suites
 
@@ -95,7 +95,7 @@ Lambda-only checks (`gha-runner-online`, `enrichment-quality`, `semantic-index-s
 
 ### Output
 
-Stdout is one JSON line, parseable by `jq`:
+Stdout is exactly one JSON line, parseable by `jq`. The outcome shape is projected to the documented fields below — fields like `metrics` that the Lambda may attach internally are **not** emitted by the CLI, even when a future check returns them:
 
 ```json
 {
@@ -112,6 +112,8 @@ Stdout is one JSON line, parseable by `jq`:
   ]
 }
 ```
+
+`outcomes[i].message` is present only when `status !== 'pass'`. Control characters in messages are stripped before they reach stderr to neutralize log-injection attempts via probed-endpoint response bodies.
 
 Stderr is a human-readable summary headline plus a line for every non-pass outcome — readable from a GHA workflow log without piping stdout through `jq`.
 
@@ -176,7 +178,7 @@ sam deploy --guided \
     EnableWriteProbe=false
 ```
 
-Leave `EnableWriteProbe=false` for the first deploy. Once the DJ test account is provisioned, the `wxyc-canary-enrichment-lag` alarm is wired to the right SNS subscriber, and you've verified cleanup behaviour in a manual local run (`CANARY_ENABLE_WRITE_PROBE=true CANARY_LOCAL=true npm run local` against a non-prod environment), redeploy with `EnableWriteProbe=true` to turn the write canary on.
+Leave `EnableWriteProbe=false` for the first deploy. Once the DJ test account is provisioned, the `wxyc-canary-enrichment-lag` alarm is wired to the right SNS subscriber, and you've verified cleanup behaviour in a manual local run (`CANARY_ENABLE_WRITE_PROBE=true npm run local` against a non-prod environment), redeploy with `EnableWriteProbe=true` to turn the write canary on.
 
 ### Verifying the write canary in staging
 

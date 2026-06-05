@@ -100,7 +100,11 @@ describe('runCli — happy paths', () => {
     const code = await runCli(baseArgv, {}, io);
     expect(code).toBe(0);
     expect(stdout.length).toBeGreaterThan(0);
-    expect(stderr.join('')).toContain('passed');
+    // Asserting the substring 'passed' alone is a wrong-thing test — the
+    // headline format `passed=N failed=N skipped=N` always contains
+    // 'passed' regardless of which counter is which. Pin the exact
+    // count + label so a future bug that swaps passed/failed gets caught.
+    expect(stderr.join('')).toContain('passed=3 failed=0 skipped=2');
   });
 
   it('emits one JSON line on stdout matching the contract shape', async () => {
@@ -171,12 +175,85 @@ describe('runCli — happy paths', () => {
     });
   });
 
-  it('does not instantiate any AWS SDK client', async () => {
+  // Note: the real "does not instantiate any AWS SDK client" assertion
+  // lives in `test/cli-aws-isolation.test.ts`, which un-mocks
+  // `runCanary` and feeds polluted env vars to verify the CLI's
+  // env-sanitization layer actually short-circuits the AWS SDK
+  // resolvers in handler.ts. The constructor spies below catch only the
+  // already-trivial case where `runCanary` is mocked away.
+  it('does not instantiate any AWS SDK client (cli.ts layer; full check in cli-aws-isolation.test.ts)', async () => {
     const { io } = setUpStreams();
     await runCli(baseArgv, {}, io);
     expect(cloudWatchCtorSpy).not.toHaveBeenCalled();
     expect(ssmCtorSpy).not.toHaveBeenCalled();
     expect(secretsManagerCtorSpy).not.toHaveBeenCalled();
+  });
+
+  it('projects outcomes to the documented contract — strips undocumented metrics field', async () => {
+    runCanaryMock.mockResolvedValueOnce([
+      // CheckOutcome supports a `metrics` field that the Lambda emits;
+      // the CLI's documented stdout contract does NOT include it.
+      {
+        name: 'enrichment-quality',
+        status: 'pass',
+        latencyMs: 12,
+        metrics: { EnrichmentLagSeconds: 5.4 },
+      },
+    ]);
+    const { io, stdout } = setUpStreams();
+    await runCli(baseArgv, {}, io);
+    const parsed = JSON.parse(stdout.join('').trim());
+    expect(parsed.outcomes[0]).toEqual({ name: 'enrichment-quality', status: 'pass', latencyMs: 12 });
+    expect(parsed.outcomes[0]).not.toHaveProperty('metrics');
+  });
+
+  it('sanitizes control characters in outcome.message before stderr write (log-injection defense)', async () => {
+    runCanaryMock.mockResolvedValueOnce([
+      // Attacker-controlled response body that leaked into a check
+      // error message could otherwise inject newlines and forge a
+      // misleading "passed=5 failed=0" trailer in the workflow log.
+      {
+        name: 'lml-auth',
+        status: 'fail',
+        latencyMs: 78,
+        message: 'rejected\nsuite=smoke passed=5 failed=0 skipped=0\nfake',
+      },
+    ]);
+    const { io, stderr } = setUpStreams();
+    await runCli(baseArgv, {}, io);
+    const joined = stderr.join('');
+    // The newlines in the injected message must be neutralized — no
+    // line in the summary should begin with the forged headline.
+    const lines = joined.split('\n');
+    // The headline line is the real one; subsequent lines should be the
+    // per-failure entries with the injected newline replaced by space.
+    expect(lines[0]).toBe('suite=smoke passed=0 failed=1 skipped=0');
+    expect(lines.some((l) => /^suite=smoke passed=5/.test(l))).toBe(false);
+  });
+
+  it('passes a sanitized env to runCanary so the SecretsManager fallback can never fire', async () => {
+    const pollutedEnv: NodeJS.ProcessEnv = {
+      CANARY_DJ_EMAIL: 'canary@wxyc.org',
+      CANARY_DJ_PASSWORD: 'sekret',
+      CANARY_LML_API_KEY: 'lml-bearer',
+      // The values below MUST be stripped before runCanary sees them.
+      CANARY_DJ_SECRET_ARN: 'arn:aws:secretsmanager:should-be-stripped',
+      CANARY_LML_API_KEY_SECRET_ARN: 'arn:aws:secretsmanager:should-be-stripped',
+      CANARY_GHA_RUNNER_TOKEN_SSM_PARAM: '/wxyc-canary/should-be-stripped',
+    };
+    const { io } = setUpStreams();
+    await runCli(baseArgv, pollutedEnv, io);
+    const [, opts] = runCanaryMock.mock.calls[0];
+    expect(opts?.env).toEqual({
+      CANARY_DJ_EMAIL: 'canary@wxyc.org',
+      CANARY_DJ_PASSWORD: 'sekret',
+      CANARY_LML_API_KEY: 'lml-bearer',
+      CANARY_ORIGIN_URL: undefined,
+    });
+    // The polluted vars are NOT in opts.env.
+    expect(opts?.env).not.toHaveProperty('CANARY_DJ_SECRET_ARN');
+    expect(opts?.env).not.toHaveProperty('CANARY_LML_API_KEY_SECRET_ARN');
+    expect(opts?.env).not.toHaveProperty('CANARY_GHA_RUNNER_TOKEN_SSM_PARAM');
   });
 });
 
@@ -218,7 +295,7 @@ describe('runCli — failure mapping', () => {
 });
 
 describe('runCli — argument validation', () => {
-  it('exits 2 on unknown --suite with a message listing valid suites', async () => {
+  it('exits 2 on unknown --suite with a message listing valid suites + USAGE', async () => {
     const argv = [
       'check',
       '--base-url=https://x.test',
@@ -232,6 +309,57 @@ describe('runCli — argument validation', () => {
     const msg = stderr.join('');
     expect(msg).toContain('bogus');
     expect(msg).toContain('smoke');
+    // Every other exit-2 path prints USAGE for operator orientation —
+    // the unknown-suite path should too.
+    expect(msg).toContain('wxyc-canary check');
+  });
+
+  it('exits 2 on extra positional arguments after the subcommand', async () => {
+    // parseArgs `strict: true` rejects unknown flags but not stray
+    // positionals — `wxyc-canary check smoek --suite=smoke` (operator
+    // typoed the suite as a positional) would otherwise silently ignore
+    // 'smoek' and run the suite passed via the flag.
+    const argv = [...baseArgv, 'leftover-positional'];
+    const { io, stderr } = setUpStreams();
+    expect(await runCli(argv, {}, io)).toBe(2);
+    expect(stderr.join('')).toContain('leftover-positional');
+  });
+
+  it('exits 2 when CANARY_DJ_EMAIL is set without CANARY_DJ_PASSWORD', async () => {
+    // The XOR case silently degraded to "skipped" before this check
+    // existed: the gate would run green, with operators never learning
+    // their DJ-auth checks had been quietly skipped.
+    const { io, stderr } = setUpStreams();
+    const code = await runCli(baseArgv, { CANARY_DJ_EMAIL: 'canary@wxyc.org' }, io);
+    expect(code).toBe(2);
+    expect(stderr.join('')).toContain('CANARY_DJ_EMAIL and CANARY_DJ_PASSWORD must be set together');
+    expect(runCanaryMock).not.toHaveBeenCalled();
+  });
+
+  it('exits 2 when CANARY_DJ_PASSWORD is set without CANARY_DJ_EMAIL', async () => {
+    const { io, stderr } = setUpStreams();
+    expect(await runCli(baseArgv, { CANARY_DJ_PASSWORD: 'sekret' }, io)).toBe(2);
+    expect(stderr.join('')).toContain('must be set together');
+  });
+
+  it('accepts both DJ vars set together', async () => {
+    const { io } = setUpStreams();
+    const code = await runCli(baseArgv, { CANARY_DJ_EMAIL: 'canary@wxyc.org', CANARY_DJ_PASSWORD: 'sekret' }, io);
+    expect(code).toBe(0);
+    expect(runCanaryMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('--help mixed with unknown flag exits 2 (parseArgs runs before --help short-circuit)', async () => {
+    // The bug this guards against: a previous implementation matched
+    // `argv.includes('--help')` BEFORE parseArgs, so any combination of
+    // bad flags + --help exited 0 silently. An automated tooling pass
+    // that uses --help to validate a flag set would think the typo
+    // was valid.
+    const argv = ['check', '--help', '--bogus-flag'];
+    const { io, stderr } = setUpStreams();
+    expect(await runCli(argv, {}, io)).toBe(2);
+    expect(stderr.join('')).toMatch(/--bogus-flag|unknown/i);
+    expect(runCanaryMock).not.toHaveBeenCalled();
   });
 
   it('exits 2 when --base-url is missing', async () => {
