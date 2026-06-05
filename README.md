@@ -6,19 +6,20 @@ The canary exists because three production incidents on 2026-04-30 (catalog-sear
 
 ## What it checks
 
-| Check                   | Endpoint                                                                                                                                        | Auth             | What it would have caught                                                                                                                                                                                                                             |
-| ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- | ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `backend-healthcheck`   | `GET /healthcheck`                                                                                                                              | none             | Process-level outage on Backend-Service                                                                                                                                                                                                               |
-| `proxy-library-search`  | `GET /proxy/library/search?artist=Stereolab&limit=5`                                                                                            | anonymous device | LML degradation, BS proxy regressions                                                                                                                                                                                                                 |
-| `semantic-index-search` | `GET https://explore.wxyc.org/graph/artists/search?q=Stereolab&limit=1`                                                                         | none             | semantic-index 5xx; missing `results` envelope                                                                                                                                                                                                        |
-| `dj-library-search`     | `GET /library/?artist_name=Stereolab&n=5`                                                                                                       | DJ JWT           | The 2026-04-30 catalog-search 503 incident, exactly                                                                                                                                                                                                   |
-| `dj-flowsheet-read`     | `GET /v2/flowsheet?n=5`                                                                                                                         | DJ JWT           | V2 flowsheet read regressions                                                                                                                                                                                                                         |
-| `dj-rotation`           | `GET /library/rotation`                                                                                                                         | DJ JWT           | Rotation endpoint 5xx, fully empty rotation                                                                                                                                                                                                           |
-| `dj-rotation-picker`    | `GET /library/rotation/{id}/tracks` (id discovered from list)                                                                                   | DJ JWT           | The BS#994 / BS#1030 cascade-to-502 class; LML-cascade timeouts on the picker that previously surfaced via on-air Slack                                                                                                                               |
-| `lml-auth`              | `POST /api/v1/lookup` directly to LML — twice, once with `LML_API_KEY` (assert 2xx) and once with a synthetic known-bad bearer (assert 401/403) | LML bearer       | BS#1094 `LML_API_KEY` rotation drift (good-bearer 401/403); LML auth disabled regression (known-bad bearer 200, i.e. `LML_REQUIRE_AUTH=false` flip or rollback); LML down (5xx). Distinct error messages route the operator to the right remediation. |
-| `enrichment-quality`    | insert sentinel → poll for enrichment → delete                                                                                                  | DJ JWT (write)   | The 2026-05-13 LML cascade regression (null-metadata on inserts)                                                                                                                                                                                      |
+| Check                   | Endpoint                                                                                                                                        | Auth             | What it would have caught                                                                                                                                                                                                                                  |
+| ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- | ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `backend-healthcheck`   | `GET /healthcheck`                                                                                                                              | none             | Process-level outage on Backend-Service                                                                                                                                                                                                                    |
+| `proxy-library-search`  | `GET /proxy/library/search?artist=Stereolab&limit=5`                                                                                            | anonymous device | LML degradation, BS proxy regressions                                                                                                                                                                                                                      |
+| `semantic-index-search` | `GET https://explore.wxyc.org/graph/artists/search?q=Stereolab&limit=1`                                                                         | none             | semantic-index 5xx; missing `results` envelope                                                                                                                                                                                                             |
+| `dj-library-search`     | `GET /library/?artist_name=Stereolab&n=5`                                                                                                       | DJ JWT           | The 2026-04-30 catalog-search 503 incident, exactly                                                                                                                                                                                                        |
+| `dj-flowsheet-read`     | `GET /v2/flowsheet?n=5`                                                                                                                         | DJ JWT           | V2 flowsheet read regressions                                                                                                                                                                                                                              |
+| `dj-rotation`           | `GET /library/rotation`                                                                                                                         | DJ JWT           | Rotation endpoint 5xx, fully empty rotation                                                                                                                                                                                                                |
+| `dj-rotation-picker`    | `GET /library/rotation/{id}/tracks` (id discovered from list)                                                                                   | DJ JWT           | The BS#994 / BS#1030 cascade-to-502 class; LML-cascade timeouts on the picker that previously surfaced via on-air Slack                                                                                                                                    |
+| `lml-auth`              | `POST /api/v1/lookup` directly to LML — twice, once with `LML_API_KEY` (assert 2xx) and once with a synthetic known-bad bearer (assert 401/403) | LML bearer       | BS#1094 `LML_API_KEY` rotation drift (good-bearer 401/403); LML auth disabled regression (known-bad bearer 200, i.e. `LML_REQUIRE_AUTH=false` flip or rollback); LML down (5xx). Distinct error messages route the operator to the right remediation.      |
+| `gha-runner-online`     | `GET /orgs/{org}/actions/runners/{id}`                                                                                                          | GH PAT           | Staging-gate runner host wedge / systemd unit death / network egress break — the on-call signal the EC2-hosted runner (WXYC/wiki#80 phase 1) needs replacing or rebooting. Distinct messages route offline vs 404 (runner replaced) vs 401 (PAT rotation). |
+| `enrichment-quality`    | insert sentinel → poll for enrichment → delete                                                                                                  | DJ JWT (write)   | The 2026-05-13 LML cascade regression (null-metadata on inserts)                                                                                                                                                                                           |
 
-DJ-auth checks downgrade to `skipped` (a distinct CloudWatch metric, not `failed`) when no DJ credentials are configured, so the alarm doesn't fire on operator-caused gaps. The `lml-auth` check follows the same shape: it skips when no `LML_API_KEY` is configured. The `enrichment-quality` write canary additionally requires `CANARY_ENABLE_WRITE_PROBE=true` and skips when another DJ is on-air — the canary deliberately doesn't inject sentinel rows into a real DJ's flowsheet.
+DJ-auth checks downgrade to `skipped` (a distinct CloudWatch metric, not `failed`) when no DJ credentials are configured, so the alarm doesn't fire on operator-caused gaps. The `lml-auth` check follows the same shape: it skips when no `LML_API_KEY` is configured. The `gha-runner-online` check skips when no GitHub PAT or runner id is configured. The `enrichment-quality` write canary additionally requires `CANARY_ENABLE_WRITE_PROBE=true` and skips when another DJ is on-air — the canary deliberately doesn't inject sentinel rows into a real DJ's flowsheet.
 
 ## Architecture
 
@@ -147,6 +148,42 @@ Dedup key is the `canary:check:{name}` label, not the title. Labels are durable 
 
 To turn off GitHub-issue reporting, redeploy with empty `GitHubTokenSsmParamName` (the conditional in `template.yaml` then removes the SSM IAM grant and env vars).
 
+### Runner liveness probe (`gha-runner-online`)
+
+The `gha-runner-online` check polls the WXYC org's self-hosted GitHub Actions runner that hosts the staging-gate E2E suites (WXYC/wiki#80 phase 1 — see wxyc-shared `scripts/e2e-runner/README.md` for the runner bootstrap + topology). It calls `GET /orgs/WXYC/actions/runners/{id}` every five minutes and fails when `status != "online"`. The existing `wxyc-canary-check-failure` alarm (3 evaluations × 5 min, 2 datapoints to alarm) gives the spec's ≥10 minutes of sustained breach for free — no new alarm.
+
+1. Create a GitHub fine-scoped PAT:
+   - Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token.
+   - **Resource owner**: `WXYC`. **Repository access**: doesn't matter — this is an org-scoped permission.
+   - **Permissions** → **Organization permissions** → **Self-hosted runners**: Read.
+   - No other scopes. Set a reasonable expiry and a calendar reminder to rotate.
+2. Store it in SSM as a SecureString. Keep it under `/wxyc-canary/*` so it shares the rotation cadence and IAM grant pattern with the GitHub-issues reporter PAT:
+   ```bash
+   aws ssm put-parameter \
+     --name /wxyc-canary/gha-runner-token \
+     --type SecureString \
+     --value "$PAT" \
+     --description "PAT for wxyc-canary runner-liveness probe. Rotate by overwriting with --overwrite."
+   ```
+3. Discover the runner id (changes on re-registration):
+   ```bash
+   gh api /orgs/WXYC/actions/runners \
+     --jq '.runners[] | select(.name=="wxyc-e2e-runner") | {id, status, labels: [.labels[].name]}'
+   ```
+4. Pass three stack parameters on the next deploy:
+   ```bash
+   sam deploy \
+     --parameter-overrides \
+       GhaRunnerTokenSsmParamName=/wxyc-canary/gha-runner-token \
+       GhaRunnerOrg=WXYC \
+       GhaRunnerId=<id from step 3> \
+       # ...other params
+   ```
+
+When the runner is replaced (instance swap or re-registration), repeat step 3 and redeploy with the new `GhaRunnerId`. The check will fail with a 404-flavoured message until the parameter is re-set — that's intentional, since a stale `GhaRunnerId` is itself a real signal the operator should fix.
+
+To turn the probe off, redeploy with an empty `GhaRunnerTokenSsmParamName` or `GhaRunnerId=0`. The conditional in `template.yaml` then strips the SSM IAM grant and the env vars; the check downgrades to `skipped` and the alarm stays quiet.
+
 ### CI deploys
 
 `.github/workflows/deploy.yml` builds + deploys on push to `main`. Required GitHub secrets:
@@ -166,6 +203,14 @@ Required GitHub variables (override defaults if needed):
 2. Tail the canary log: `aws logs tail /aws/lambda/wxyc-canary --since 30m`. Each invocation prints a JSON line with all six outcomes.
 3. Reproduce the failing endpoint manually (the `description` column above tells you the URL).
 4. If the failure is real, page the on-call. If the canary itself is buggy, file an issue and disable the check by removing it from `src/checks.ts`.
+
+### Alarm fires: `wxyc-canary-check-failure` (`Check=gha-runner-online`)
+
+The staging-gate runner has been failing its liveness probe for ≥10 minutes. The check message distinguishes the failure mode — route accordingly:
+
+- **`offline`** — the runner process stopped polling GitHub. SSH to `wxyc-e2e-runner` (per wxyc-shared `scripts/e2e-runner/README.md`) and check `systemctl status 'actions.runner.*.service'`. If the host itself is unreachable, the EC2 instance is wedged — reboot or rebuild from the bootstrap script.
+- **`404 — runner was likely replaced`** — someone replaced the runner without re-setting `GhaRunnerId`. Discover the new id with `gh api /orgs/WXYC/actions/runners --jq '.runners[] | select(.name=="wxyc-e2e-runner")'` and redeploy with the updated parameter.
+- **`PAT rejected with 401/403`** — the SSM-stored PAT was revoked, scoped down, or expired. Generate a fresh fine-scoped PAT (Self-hosted runners: Read on `WXYC`) and overwrite `/wxyc-canary/gha-runner-token` via `aws ssm put-parameter --overwrite`.
 
 ### Alarm fires: `wxyc-canary-lambda-errors`
 

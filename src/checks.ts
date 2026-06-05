@@ -299,6 +299,82 @@ const lmlAuth: Check = {
 };
 
 /**
+ * Liveness probe for the EC2-hosted self-hosted GitHub Actions runner
+ * (label `e2e-runner`) that backs the staging-gate suites in
+ * Backend-Service, library-metadata-lookup, and dj-site. Wired up as
+ * part of WXYC/wiki#80 phase 1; the runner bootstrap + runbook live in
+ * wxyc-shared (`scripts/e2e-runner/`).
+ *
+ * Probe: `GET /orgs/{org}/actions/runners/{id}` with a fine-scoped PAT.
+ * Pass on `status === "online"`. Fail on any other status (`offline`
+ * is the spec's primary failure mode), 404 (runner id no longer exists
+ * after a host replacement that didn't re-set the stack parameter),
+ * 401/403 (PAT rotation drift), or 5xx (GitHub itself degraded — rare
+ * but distinct enough to surface separately).
+ *
+ * The existing `wxyc-canary-check-failure` alarm gives the spec's
+ * "≥10 minutes of `status != online`" window for free: 3 evaluations ×
+ * 5 min, 2 datapoints to alarm = ~10 min sustained breach. No new
+ * alarm needed.
+ *
+ * Skip semantics mirror `lml-auth` / DJ credentials: missing PAT or
+ * runner-id is an operator gap (alarm stays quiet), but a downstream
+ * resolution error fails (real signal, paged).
+ */
+const ghaRunnerOnline: Check = {
+  name: 'gha-runner-online',
+  description: 'GET /orgs/{org}/actions/runners/{id} — staging-gate runner liveness',
+  requiresAuth: false,
+  run: async (ctx): Promise<CheckResult | void> => {
+    if (!ctx.ghaRunnerToken) {
+      return { skipped: true, skipReason: 'no GitHub PAT configured for runner-liveness probe' };
+    }
+    if (typeof ctx.ghaRunnerId !== 'number') {
+      return { skipped: true, skipReason: 'no runner id configured (CANARY_GHA_RUNNER_ID)' };
+    }
+    const url = `${ctx.ghaRunnerApiBase}/orgs/${ctx.ghaRunnerOrg}/actions/runners/${ctx.ghaRunnerId}`;
+    const r = await canaryFetch(url, {
+      headers: {
+        Authorization: `Bearer ${ctx.ghaRunnerToken}`,
+        Accept: 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+      },
+    });
+    if (r.status === 404) {
+      // Runner id no longer exists — the operator replaced the host and
+      // did not re-set the CFN parameter. Distinct from "offline" so the
+      // on-call routes to the replacement runbook, not "the runner died".
+      throw new Error(
+        `GitHub returned 404 for runner id ${ctx.ghaRunnerId} — runner was likely replaced; re-set GhaRunnerId stack parameter: ${r.rawText.slice(0, 200)}`
+      );
+    }
+    if (r.status === 401 || r.status === 403) {
+      // PAT is revoked / unscoped / expired. Operator action: rotate
+      // the SSM parameter — different runbook entry from "runner down".
+      throw new Error(
+        `GitHub rejected PAT with ${r.status} — rotate the runner-liveness PAT in SSM: ${r.rawText.slice(0, 200)}`
+      );
+    }
+    if (!r.ok) {
+      throw new Error(`expected 2xx from GitHub runner endpoint, got ${r.status}: ${r.rawText.slice(0, 200)}`);
+    }
+    const body = r.body as { status?: string; name?: string; id?: number };
+    if (!body || typeof body !== 'object' || typeof body.status !== 'string') {
+      throw new Error(`expected {status: string} from GitHub runner endpoint, got: ${r.rawText.slice(0, 200)}`);
+    }
+    if (body.status !== 'online') {
+      // The spec's primary failure mode: the runner stopped polling
+      // GitHub (host wedge, systemd unit died, network egress to
+      // github.com broken). Include the human-readable name so the
+      // alarm message points the on-call at the right host.
+      throw new Error(
+        `runner ${body.name ?? `id=${ctx.ghaRunnerId}`} is offline (status="${body.status}") — investigate per scripts/e2e-runner/README.md`
+      );
+    }
+  },
+};
+
+/**
  * Write canary (v1). Inserts a sentinel flowsheet row, polls until LML
  * enrichment populates `youtube_music_url`, deletes the row, ends the
  * canary's show. Returns an `EnrichmentLagSeconds` metric the runner
@@ -331,6 +407,7 @@ export const checks: readonly Check[] = [
   djRotation,
   djRotationPicker,
   lmlAuth,
+  ghaRunnerOnline,
   enrichmentQuality,
 ];
 

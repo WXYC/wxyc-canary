@@ -34,6 +34,10 @@ function loadConfigFromEnv(): CanaryConfig {
     enrichmentPollIntervalMs: process.env.CANARY_ENRICHMENT_POLL_INTERVAL_MS
       ? Number(process.env.CANARY_ENRICHMENT_POLL_INTERVAL_MS)
       : undefined,
+    ghaRunnerApiBase: process.env.CANARY_GHA_RUNNER_API_BASE,
+    ghaRunnerOrg: process.env.CANARY_GHA_RUNNER_ORG,
+    ghaRunnerId: process.env.CANARY_GHA_RUNNER_ID ? Number(process.env.CANARY_GHA_RUNNER_ID) : undefined,
+    ghaRunnerToken: process.env.CANARY_GHA_RUNNER_TOKEN,
   };
 }
 
@@ -88,6 +92,30 @@ async function resolveLmlApiKey(config: CanaryConfig): Promise<string | undefine
 }
 
 /**
+ * Resolve the GitHub PAT used by the `gha-runner-online` check, in order:
+ *   1. `CANARY_GHA_RUNNER_TOKEN` env (local + tests).
+ *   2. `CANARY_GHA_RUNNER_TOKEN_SSM_PARAM` → SSM SecureString (prod).
+ * Returns undefined when neither is configured — the check then skips
+ * with reason. The PAT is stored in SSM (not Secrets Manager) to match
+ * the existing GitHub-issues-reporter PAT, which keeps all GitHub-PAT
+ * storage co-located under `/wxyc-canary/*` for the same rotation
+ * cadence and IAM grant pattern.
+ */
+async function resolveGhaRunnerToken(config: CanaryConfig): Promise<string | undefined> {
+  if (config.ghaRunnerToken) return config.ghaRunnerToken;
+  const paramName = process.env.CANARY_GHA_RUNNER_TOKEN_SSM_PARAM;
+  if (!paramName) return undefined;
+
+  const ssm = new SSMClient({ region: config.awsRegion ?? 'us-east-1' });
+  const result = await ssm.send(new GetParameterCommand({ Name: paramName, WithDecryption: true }));
+  const value = result.Parameter?.Value;
+  if (!value) {
+    throw new Error(`SSM parameter ${paramName} has no Value`);
+  }
+  return value;
+}
+
+/**
  * Run every check, regardless of individual failures. Returns one outcome
  * per check. DJ-auth checks downgrade to 'skipped' when no DJ credentials
  * are configured — distinct from 'fail' so the alarm only fires on real
@@ -113,6 +141,17 @@ export async function runCanary(config: CanaryConfig): Promise<CheckOutcome[]> {
     lmlApiKey = await resolveLmlApiKey(config);
   } catch (err) {
     lmlAuthError = `LML bearer resolution failed: ${(err as Error).message}`;
+  }
+
+  // GH runner PAT resolution: same shape as lml-auth — skip on absence,
+  // fail on resolve errors. SSM outage / IAM regression here would
+  // silently disable the runner-liveness probe if collapsed to "skipped".
+  let ghaRunnerToken: string | undefined;
+  let ghaRunnerTokenError: string | undefined;
+  try {
+    ghaRunnerToken = await resolveGhaRunnerToken(config);
+  } catch (err) {
+    ghaRunnerTokenError = `GH runner PAT resolution failed: ${(err as Error).message}`;
   }
 
   let djBearerToken: string | undefined;
@@ -146,6 +185,10 @@ export async function runCanary(config: CanaryConfig): Promise<CheckOutcome[]> {
     djUserId,
     enrichmentPollTimeoutMs: config.enrichmentPollTimeoutMs ?? DEFAULT_ENRICHMENT_POLL_TIMEOUT_MS,
     enrichmentPollIntervalMs: config.enrichmentPollIntervalMs ?? DEFAULT_ENRICHMENT_POLL_INTERVAL_MS,
+    ghaRunnerApiBase: config.ghaRunnerApiBase ?? 'https://api.github.com',
+    ghaRunnerOrg: config.ghaRunnerOrg ?? 'WXYC',
+    ghaRunnerId: config.ghaRunnerId,
+    ghaRunnerToken,
   };
 
   const outcomes = await Promise.all(
@@ -161,6 +204,12 @@ export async function runCanary(config: CanaryConfig): Promise<CheckOutcome[]> {
       // signal that warrants paging, not a silent skip.
       if (check.name === 'lml-auth' && lmlAuthError) {
         return { name: check.name, status: 'fail', latencyMs: 0, message: lmlAuthError };
+      }
+      // Same rule for gha-runner-online: an SSM outage / IAM regression
+      // is a real signal; collapsing to "skipped" would silently disable
+      // the runner-liveness probe.
+      if (check.name === 'gha-runner-online' && ghaRunnerTokenError) {
+        return { name: check.name, status: 'fail', latencyMs: 0, message: ghaRunnerTokenError };
       }
       if (check.writes && !config.enableWriteProbe) {
         return {
