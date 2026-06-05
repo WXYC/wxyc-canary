@@ -3,7 +3,7 @@ import { GetSecretValueCommand, SecretsManagerClient } from '@aws-sdk/client-sec
 import { GetParameterCommand, SSMClient } from '@aws-sdk/client-ssm';
 import { checks, signInDj } from './checks.js';
 import { reportOutcomesToGitHub } from './github-issues.js';
-import type { CanaryConfig, CheckContext, CheckOutcome, CheckResult } from './types.js';
+import type { CanaryConfig, Check, CheckContext, CheckOutcome, CheckResult } from './types.js';
 
 const METRIC_NAMESPACE = 'WXYC/Canary';
 const DEFAULT_ENRICHMENT_POLL_TIMEOUT_MS = 45_000;
@@ -125,8 +125,17 @@ async function resolveGhaRunnerToken(config: CanaryConfig): Promise<string | und
  * are configured — distinct from 'fail' so the alarm only fires on real
  * regressions, not on operator-caused gaps. Write-canary checks also
  * downgrade to 'skipped' when `enableWriteProbe=false` (the default).
+ *
+ * `opts.checks` overrides which checks run — the CLI passes
+ * `checksForSuite('smoke')` here so the staging-gate workflow runs the
+ * BS+LML subset and skips Lambda-only probes (runner-liveness, writes).
+ * Lambda callers omit the opt and get the full `checks` array. Credential
+ * resolution + ctx assembly happen unconditionally so the per-check skip
+ * logic (lml-auth no-bearer, dj-* no-creds) still works when the suite
+ * happens to include the affected check.
  */
-export async function runCanary(config: CanaryConfig): Promise<CheckOutcome[]> {
+export async function runCanary(config: CanaryConfig, opts?: { checks?: readonly Check[] }): Promise<CheckOutcome[]> {
+  const ranChecks = opts?.checks ?? checks;
   let djCreds: { email: string; password: string } | undefined;
   let djAuthError: string | undefined;
   try {
@@ -216,7 +225,7 @@ export async function runCanary(config: CanaryConfig): Promise<CheckOutcome[]> {
   };
 
   const outcomes = await Promise.all(
-    checks.map(async (check): Promise<CheckOutcome> => {
+    ranChecks.map(async (check): Promise<CheckOutcome> => {
       if (check.requiresAuth && !djCreds && !djAuthError) {
         return { name: check.name, status: 'skipped', latencyMs: 0, message: 'no DJ credentials configured' };
       }
