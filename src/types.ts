@@ -87,6 +87,32 @@ export type CheckContext = {
   enrichmentPollTimeoutMs: number;
   /** Spacing between poll iterations for the enrichment-quality check. */
   enrichmentPollIntervalMs: number;
+  /**
+   * GitHub REST API base for the runner-liveness probe (no trailing
+   * slash). Defaults to `https://api.github.com` in the handler when
+   * unset; overridable so tests can route to a synthetic host.
+   */
+  ghaRunnerApiBase: string;
+  /**
+   * GitHub organization that owns the self-hosted runner. Defaults to
+   * `WXYC`.
+   */
+  ghaRunnerOrg: string;
+  /**
+   * Numeric runner id assigned by GitHub on registration. Required for
+   * the `gha-runner-online` check to run — undefined → skip with reason.
+   * The id changes when the runner is replaced (re-registration), so
+   * the operator must re-set the CFN parameter after an instance swap.
+   */
+  ghaRunnerId: number | undefined;
+  /**
+   * Fine-scoped PAT with `admin:org → Self-hosted runners: Read`
+   * (classic) or the fine-grained equivalent (`Administration` /
+   * `Self-hosted runners` on the org). Undefined → check skips.
+   * Resolution errors (Secrets Manager / SSM IAM regressions) fail
+   * rather than skip, mirroring the lml-auth bearer-resolution path.
+   */
+  ghaRunnerToken: string | undefined;
 };
 
 export type CheckOutcome = {
@@ -141,4 +167,18 @@ export type CanaryConfig = {
   enrichmentPollTimeoutMs?: number;
   /** See CheckContext.enrichmentPollIntervalMs. */
   enrichmentPollIntervalMs?: number;
+  /** See CheckContext.ghaRunnerApiBase. */
+  ghaRunnerApiBase?: string;
+  /** See CheckContext.ghaRunnerOrg. */
+  ghaRunnerOrg?: string;
+  /** See CheckContext.ghaRunnerId. */
+  ghaRunnerId?: number;
+  /**
+   * GH PAT for the runner-liveness probe. Either set this directly
+   * (`CANARY_GHA_RUNNER_TOKEN` env, local/test) or set
+   * `CANARY_GHA_RUNNER_TOKEN_SSM_PARAM` for SSM SecureString resolution
+   * (prod). When unset and no SSM param is configured, the
+   * `gha-runner-online` check downgrades to skipped.
+   */
+  ghaRunnerToken?: string;
 };

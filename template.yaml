@@ -91,6 +91,36 @@ Parameters:
     Description: >
       Optional `owner/repo` target for canary-filed issues, e.g.
       `WXYC/wxyc-canary`. Paired with GitHubTokenSsmParamName.
+  GhaRunnerTokenSsmParamName:
+    Type: String
+    Default: ''
+    AllowedPattern: '^(|/.+)$'
+    Description: >
+      Optional SSM Parameter Store name (SecureString) holding a
+      fine-scoped GitHub PAT with `admin:org → Self-hosted runners:
+      Read` (classic) or the fine-grained equivalent on the WXYC org.
+      Must begin with `/` (e.g. `/wxyc-canary/gha-runner-token`) so
+      the IAM policy ARN composes correctly. When set together with
+      `GhaRunnerId`, the `gha-runner-online` check polls
+      `GET /orgs/{org}/actions/runners/{id}` every 5 minutes and the
+      `wxyc-canary-check-failure` alarm fires after ~10 minutes of
+      sustained `status != "online"`. Leave empty to skip the probe
+      (operator gap, no alarm).
+  GhaRunnerOrg:
+    Type: String
+    Default: WXYC
+    Description: GitHub organization that owns the self-hosted runner.
+  GhaRunnerId:
+    Type: Number
+    Default: 0
+    Description: >
+      Numeric runner id assigned by GitHub at registration. Discover via
+      `gh api /orgs/WXYC/actions/runners --jq '.runners[] | select(.name=="wxyc-e2e-runner") | .id'`.
+      The id changes when the runner is replaced (re-registration), so
+      this parameter must be re-set after an instance swap — see
+      wxyc-shared `scripts/e2e-runner/README.md`. Leave at 0 to skip the
+      probe (the check downgrades to skipped, no alarm). The handler
+      forwards 0 verbatim; the check skips on "no runner id configured".
 
 Conditions:
   HasDjCredentials: !Not [!Equals [!Ref DjCredentialsSecretArn, '']]
@@ -99,6 +129,11 @@ Conditions:
   HasGitHubReporter: !And
     - !Not [!Equals [!Ref GitHubTokenSsmParamName, '']]
     - !Not [!Equals [!Ref GitHubIssuesRepo, '']]
+  HasGhaRunnerProbe: !And
+    - !Not [!Equals [!Ref GhaRunnerTokenSsmParamName, '']]
+    # !Ref on a Number parameter returns the value as a string ("0"), so the
+    # right-hand operand of !Equals must be the literal string "0", not 0.
+    - !Not [!Equals [!Ref GhaRunnerId, '0']]
 
 Resources:
   CanaryFunction:
@@ -124,6 +159,12 @@ Resources:
           CANARY_ENABLE_WRITE_PROBE: !Ref EnableWriteProbe
           CANARY_GITHUB_TOKEN_SSM_PARAM: !If [HasGitHubReporter, !Ref GitHubTokenSsmParamName, '']
           CANARY_GITHUB_ISSUES_REPO: !If [HasGitHubReporter, !Ref GitHubIssuesRepo, '']
+          CANARY_GHA_RUNNER_TOKEN_SSM_PARAM: !If [HasGhaRunnerProbe, !Ref GhaRunnerTokenSsmParamName, '']
+          CANARY_GHA_RUNNER_ORG: !Ref GhaRunnerOrg
+          # Empty-string when the probe is disabled so the handler env loader
+          # sees a falsy value and the check downgrades to skipped (no alarm).
+          # When the probe is enabled, CFN stringifies the Number to e.g. "250".
+          CANARY_GHA_RUNNER_ID: !If [HasGhaRunnerProbe, !Ref GhaRunnerId, '']
       Policies:
         - Statement:
             - Effect: Allow
@@ -152,6 +193,13 @@ Resources:
               - Effect: Allow
                 Action: ssm:GetParameter
                 Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${GitHubTokenSsmParamName}
+          - !Ref AWS::NoValue
+        - !If
+          - HasGhaRunnerProbe
+          - Statement:
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${GhaRunnerTokenSsmParamName}
           - !Ref AWS::NoValue
       Events:
         Schedule:

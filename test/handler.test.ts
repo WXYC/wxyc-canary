@@ -83,10 +83,10 @@ describe('runCanary — anonymous-only configuration', () => {
     vi.unstubAllGlobals();
   });
 
-  it('passes the 2 truly-anonymous checks and skips the 7 conditional checks when no credentials are configured', async () => {
+  it('passes the 2 truly-anonymous checks and skips the 8 conditional checks when no credentials are configured', async () => {
     const outcomes = await runCanary(baseConfig);
 
-    expect(outcomes).toHaveLength(9);
+    expect(outcomes).toHaveLength(10);
     const byName = Object.fromEntries(outcomes.map((o) => [o.name, o]));
     expect(byName['backend-healthcheck'].status).toBe('pass');
     expect(byName['semantic-index-search'].status).toBe('pass');
@@ -101,6 +101,12 @@ describe('runCanary — anonymous-only configuration', () => {
     // `baseConfig` fixture leaves `lmlApiKey` undefined.
     expect(byName['lml-auth'].status).toBe('skipped');
     expect(byName['lml-auth'].message).toMatch(/no LML_API_KEY configured/);
+    // `gha-runner-online` skips when no GitHub PAT + runner id are
+    // configured (operator gap, mirrors lml-auth/DJ-creds). The probe
+    // exists to alarm when the EC2-hosted staging-gate runner stops
+    // checking in; the alarm only fires on `fail`, not `skipped`.
+    expect(byName['gha-runner-online'].status).toBe('skipped');
+    expect(byName['gha-runner-online'].message).toMatch(/no GitHub PAT|no runner id/);
   });
 });
 
@@ -544,6 +550,211 @@ describe('runCanary — lml-auth check (BS#1094 layer 1)', () => {
 });
 
 /**
+ * `gha-runner-online` is the liveness probe for the EC2-hosted self-hosted
+ * GitHub Actions runner that backs the staging-gate suites (Backend-Service,
+ * library-metadata-lookup, dj-site). Wired up as part of WXYC/wiki#80
+ * phase 1 acceptance: the bootstrap script and runbook (wxyc-shared#167)
+ * stand the runner up; this check pages on-call when it stops checking in.
+ *
+ * Probe shape: `GET /orgs/{org}/actions/runners/{id}` with a fine-scoped
+ * PAT. The API returns `{status: "online" | "offline", busy: bool, ...}`.
+ * The check passes on `status === "online"` and fails on anything else.
+ *
+ * The existing `wxyc-canary-check-failure` alarm (3 evaluations × 5 min,
+ * 2 datapoints-to-alarm) gives the spec's "≥10 minutes of `status != online`"
+ * window for free — no new alarm needed. Sustained outage breach: ~10 min.
+ *
+ * Skips with a meaningful reason when no PAT or no runner ID is configured
+ * (operator gap, mirrors `lml-auth` and DJ-creds). A PAT-resolution error
+ * (Secrets Manager / SSM IAM regression) fails the check rather than
+ * skipping — that's a real signal, not a config-gap.
+ *
+ * URL-substring matches use a synthetic host (`gha.example.test`) so the
+ * existing `setUpFetchMock` substring routing doesn't shadow other checks.
+ */
+describe('runCanary — gha-runner-online check (runner liveness probe, wiki#80 phase 1)', () => {
+  const RUNNER_ID = 250;
+  const ghaRunnerConfig: CanaryConfig = {
+    ...baseConfig,
+    ghaRunnerApiBase: 'https://gha.example.test',
+    ghaRunnerOrg: 'WXYC',
+    ghaRunnerId: RUNNER_ID,
+    ghaRunnerToken: 'fake-gha-pat',
+  };
+
+  /**
+   * Bearer-aware mock for the GH API: routes on the runners endpoint and
+   * returns the per-test status payload. The 2 truly-anonymous checks
+   * (`backend-healthcheck` + `semantic-index-search`) need their own
+   * stubs so the canary run produces the full happy-path-except-runner
+   * outcome shape — leaving them on 599 would make this test catch the
+   * unrelated anonymous-check failures instead of the runner one.
+   */
+  function setUpGhaApiMock(opts: { runnerStatus: number; runnerBody: unknown }) {
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const urlString = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      const respond = (resp: { status: number; body: unknown }) =>
+        new Response(typeof resp.body === 'string' ? resp.body : JSON.stringify(resp.body), {
+          status: resp.status,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      if (urlString.includes('/healthcheck')) return respond({ status: 200, body: { ok: true } });
+      if (urlString.includes('/graph/artists/search')) return respond({ status: 200, body: { results: [{ id: 1 }] } });
+      if (urlString.includes(`gha.example.test/orgs/WXYC/actions/runners/${RUNNER_ID}`)) {
+        // Headers contract: Authorization bearer + GH-version header. Captured
+        // for assertions in the dedicated test below; routed here so the
+        // body/status pin per-test.
+        void (init?.headers as Record<string, string> | undefined);
+        return respond({ status: opts.runnerStatus, body: opts.runnerBody });
+      }
+      return new Response(`unmatched mock for ${urlString}`, { status: 599 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    return fetchMock;
+  }
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('passes when the runner status is "online"', async () => {
+    setUpGhaApiMock({
+      runnerStatus: 200,
+      runnerBody: {
+        id: RUNNER_ID,
+        name: 'wxyc-e2e-runner',
+        status: 'online',
+        busy: false,
+        labels: [{ name: 'self-hosted' }, { name: 'e2e-runner' }],
+      },
+    });
+
+    const outcomes = await runCanary(ghaRunnerConfig);
+    const runner = outcomes.find((o) => o.name === 'gha-runner-online')!;
+    expect(runner.status).toBe('pass');
+  });
+
+  it('fails with an offline message when the runner status is "offline" (the spec\'s primary failure mode)', async () => {
+    setUpGhaApiMock({
+      runnerStatus: 200,
+      runnerBody: {
+        id: RUNNER_ID,
+        name: 'wxyc-e2e-runner',
+        // The runner has stopped polling GitHub — either the host is down,
+        // the systemd unit died, or the network egress to github.com is
+        // broken. All three need on-call attention. The alarm window
+        // (3 evals × 5 min, 2 to alarm) gives the spec's ≥10 min sustained
+        // breach.
+        status: 'offline',
+        busy: false,
+        labels: [{ name: 'self-hosted' }, { name: 'e2e-runner' }],
+      },
+    });
+
+    const outcomes = await runCanary(ghaRunnerConfig);
+    const runner = outcomes.find((o) => o.name === 'gha-runner-online')!;
+
+    expect(runner.status).toBe('fail');
+    expect(runner.message).toMatch(/offline/);
+    expect(runner.message).toMatch(/wxyc-e2e-runner|250/);
+  });
+
+  it('fails with a clear message when the runner id no longer exists (404 — runner was replaced without updating the stack param)', async () => {
+    // When the operator replaces the EC2 host, the new runner gets a new
+    // id and the old one is removed from the org. If the CFN parameter
+    // `GhaRunnerId` is not updated to point at the new id, the probe 404s.
+    // Distinct failure class from "offline" so the on-call routes to the
+    // runbook entry on runner replacement, not "the runner died".
+    setUpGhaApiMock({
+      runnerStatus: 404,
+      runnerBody: { message: 'Not Found', documentation_url: 'https://docs.github.com/rest' },
+    });
+
+    const outcomes = await runCanary(ghaRunnerConfig);
+    const runner = outcomes.find((o) => o.name === 'gha-runner-online')!;
+
+    expect(runner.status).toBe('fail');
+    expect(runner.message).toMatch(/404|not found/i);
+  });
+
+  it('fails with a distinct message when the PAT is revoked or unscoped (401/403)', async () => {
+    setUpGhaApiMock({
+      runnerStatus: 401,
+      runnerBody: { message: 'Bad credentials', documentation_url: 'https://docs.github.com/rest' },
+    });
+
+    const outcomes = await runCanary(ghaRunnerConfig);
+    const runner = outcomes.find((o) => o.name === 'gha-runner-online')!;
+
+    expect(runner.status).toBe('fail');
+    // Operator routing: rotate the PAT, not "the runner is down".
+    expect(runner.message).toMatch(/401|credentials|PAT/i);
+  });
+
+  it('skips when no GitHub PAT is configured (operator gap, not regression)', async () => {
+    setUpFetchMock({
+      '/healthcheck': { status: 200, body: { ok: true } },
+      '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+      '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
+    });
+
+    const outcomes = await runCanary({
+      ...baseConfig,
+      ghaRunnerApiBase: 'https://gha.example.test',
+      ghaRunnerOrg: 'WXYC',
+      ghaRunnerId: RUNNER_ID,
+      // ghaRunnerToken intentionally omitted
+    });
+    const runner = outcomes.find((o) => o.name === 'gha-runner-online')!;
+
+    expect(runner.status).toBe('skipped');
+    expect(runner.message).toMatch(/no GitHub PAT/);
+  });
+
+  it('skips when no runner id is configured (operator gap)', async () => {
+    setUpFetchMock({
+      '/healthcheck': { status: 200, body: { ok: true } },
+      '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+      '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
+    });
+
+    const outcomes = await runCanary({
+      ...baseConfig,
+      ghaRunnerApiBase: 'https://gha.example.test',
+      ghaRunnerOrg: 'WXYC',
+      ghaRunnerToken: 'fake-gha-pat',
+      // ghaRunnerId intentionally omitted
+    });
+    const runner = outcomes.find((o) => o.name === 'gha-runner-online')!;
+
+    expect(runner.status).toBe('skipped');
+    expect(runner.message).toMatch(/no runner id/);
+  });
+
+  it('sends the PAT as Authorization: Bearer and targets /orgs/{org}/actions/runners/{id}', async () => {
+    const fetchMock = setUpGhaApiMock({
+      runnerStatus: 200,
+      runnerBody: { id: RUNNER_ID, status: 'online' },
+    });
+
+    await runCanary(ghaRunnerConfig);
+
+    const ghaCalls = fetchMock.mock.calls.filter(([url]) => String(url).includes('gha.example.test'));
+    expect(ghaCalls).toHaveLength(1);
+    const [url, init] = ghaCalls[0] as unknown as [string, RequestInit];
+    expect(url).toBe('https://gha.example.test/orgs/WXYC/actions/runners/250');
+    const headers = (init?.headers ?? {}) as Record<string, string>;
+    expect(headers.Authorization).toBe('Bearer fake-gha-pat');
+    // GitHub REST v3 prefers a versioned Accept header; the bare API
+    // version header is also recommended for forwards-compat. Pin both so
+    // a future GH-API rev that drops support for the unversioned default
+    // surfaces here as a test failure rather than a silent 404/406.
+    expect(headers.Accept).toMatch(/application\/vnd\.github/);
+    expect(headers['X-GitHub-Api-Version']).toBeDefined();
+  });
+});
+
+/**
  * Auth sign-in is the one place the canary retries (see signInDj). The
  * carve-out exists because a single 429 on sign-in cascades into 4 fail
  * outcomes plus a Lambda Errors alarm, even when the surfaces being
@@ -757,9 +968,9 @@ describe('publishMetrics — dimensioned + dimensionless emit-twice', () => {
     const dimensioned = checkFailureData.filter((d) => d.Dimensions && d.Dimensions.length > 0);
     const dimensionless = checkFailureData.filter((d) => !d.Dimensions || d.Dimensions.length === 0);
 
-    // Nine checks, each contributes one dimensioned and one dimensionless datapoint.
-    expect(dimensioned).toHaveLength(9);
-    expect(dimensionless).toHaveLength(9);
+    // Ten checks, each contributes one dimensioned and one dimensionless datapoint.
+    expect(dimensioned).toHaveLength(10);
+    expect(dimensionless).toHaveLength(10);
     // Without an inducer, every value is 0 (passes + skips).
     expect(dimensioned.every((d) => d.Value === 0)).toBe(true);
     expect(dimensionless.every((d) => d.Value === 0)).toBe(true);
@@ -791,7 +1002,7 @@ describe('publishMetrics — dimensioned + dimensionless emit-twice', () => {
     // isn't enough — `Statistic: Maximum` on the alarm needs at least one
     // `1` in the window, so this asserts the count of 1s explicitly.
     expect(dimensionless.filter((d) => d.Value === 1)).toHaveLength(1);
-    expect(dimensionless.filter((d) => d.Value === 0)).toHaveLength(8);
+    expect(dimensionless.filter((d) => d.Value === 0)).toHaveLength(9);
   });
 
   // `CheckSkipped` and `CheckLatency` are dashboard data, not alarm inputs.
@@ -812,8 +1023,8 @@ describe('publishMetrics — dimensioned + dimensionless emit-twice', () => {
     expect(metricData.filter((d) => d.MetricName === 'CheckSkipped' && isDimensionless(d))).toHaveLength(0);
     expect(metricData.filter((d) => d.MetricName === 'CheckLatency' && isDimensionless(d))).toHaveLength(0);
     // Sanity: the dimensioned series for each is present (one per check).
-    expect(metricData.filter((d) => d.MetricName === 'CheckSkipped')).toHaveLength(9);
-    expect(metricData.filter((d) => d.MetricName === 'CheckLatency')).toHaveLength(9);
+    expect(metricData.filter((d) => d.MetricName === 'CheckSkipped')).toHaveLength(10);
+    expect(metricData.filter((d) => d.MetricName === 'CheckLatency')).toHaveLength(10);
   });
 });
 
