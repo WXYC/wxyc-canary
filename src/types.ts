@@ -1,4 +1,13 @@
 /**
+ * Named subset of `checks` invokable from the CLI. The Lambda always runs
+ * the full `checks` array, ignoring suite tags. Add a suite by extending
+ * this union AND `VALID_SUITES` in `checks.ts` AND tagging the checks that
+ * belong to it. Future likely additions: `'dj-site'` for the dj-site
+ * staging gate, `'full'` for an ad-hoc local sweep.
+ */
+export type Suite = 'smoke';
+
+/**
  * A single canary check that exercises one user-facing surface of the WXYC
  * stack. Each check returns a result; failures don't throw — they're a
  * first-class state so a single broken endpoint doesn't short-circuit the
@@ -19,6 +28,13 @@ export type Check = {
    * them. Defaults to false (read-only).
    */
   writes?: boolean;
+  /**
+   * CLI suite membership. Untagged checks are unreachable from the CLI
+   * (Lambda-only). The set of valid suite tags is the `Suite` union;
+   * `checksForSuite(suite)` filters the global `checks` array by
+   * `suites?.includes(suite)`.
+   */
+  suites?: readonly Suite[];
   /**
    * The actual probe. Throws on failure with a message that's safe to alert
    * on. May optionally return a `CheckResult` carrying custom metrics the

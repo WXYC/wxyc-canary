@@ -61,6 +61,94 @@ export CANARY_LOCAL=true
 npm run local
 ```
 
+## CLI for staging-gate consumers
+
+The same check code that runs in the Lambda is also exposed as a `wxyc-canary` CLI for the [WXYC/wiki#80](https://github.com/WXYC/wiki/issues/80) staging-gate workflows (wxyc-shared `bs-lml-gate.yml`, dj-site `staging-gate.yml`). The CLI runs probes against arbitrary BS/LML URLs — staging, preview, prod — and reports exit codes a GHA workflow can branch on.
+
+### Invocation
+
+```bash
+wxyc-canary check \
+  --base-url=https://bs-staging.wxyc.org \
+  --auth-url=https://bs-staging.wxyc.org/auth \
+  --lml-url=https://library-metadata-lookup-staging.up.railway.app \
+  --suite=smoke
+```
+
+Credentials come from environment variables only (flags would leak into shell history and CI logs):
+
+| Env var              | Purpose                                                                                                                      |
+| -------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `CANARY_DJ_EMAIL`    | DJ login for auth-protected checks. Without it, those checks `skipped` (not fail).                                           |
+| `CANARY_DJ_PASSWORD` | Pairs with `CANARY_DJ_EMAIL`.                                                                                                |
+| `CANARY_LML_API_KEY` | LML bearer for the `lml-auth` check. Without it, the check `skipped`.                                                        |
+| `CANARY_ORIGIN_URL`  | Sent as `Origin:` on better-auth calls. Must match a `BETTER_AUTH_TRUSTED_ORIGINS` value. Defaults to `https://dj.wxyc.org`. |
+| `CANARY_TIMEOUT_MS`  | Per-check fetch timeout. Defaults to 8000.                                                                                   |
+
+### Suites
+
+| Suite   | Checks included                                                                                     | Use case                                  |
+| ------- | --------------------------------------------------------------------------------------------------- | ----------------------------------------- |
+| `smoke` | `backend-healthcheck`, `proxy-library-search`, `dj-library-search`, `dj-flowsheet-read`, `lml-auth` | BS+LML staging-gate, dj-site gate-vs-prod |
+
+Lambda-only checks (`gha-runner-online`, `enrichment-quality`, `semantic-index-search`, `dj-rotation`, `dj-rotation-picker`) are unreachable from the CLI by design — they're either prod-only operator concerns, writes, or out-of-scope services. Add a new suite by extending the `Suite` union in `src/types.ts`, appending to `VALID_SUITES` in `src/checks.ts`, and tagging the relevant checks with `suites: [...]`.
+
+### Output
+
+Stdout is one JSON line, parseable by `jq`:
+
+```json
+{
+  "suite": "smoke",
+  "passed": 4,
+  "failed": 0,
+  "skipped": 1,
+  "outcomes": [
+    { "name": "backend-healthcheck", "status": "pass", "latencyMs": 12 },
+    { "name": "proxy-library-search", "status": "pass", "latencyMs": 45 },
+    { "name": "dj-library-search", "status": "pass", "latencyMs": 67 },
+    { "name": "dj-flowsheet-read", "status": "pass", "latencyMs": 22 },
+    { "name": "lml-auth", "status": "skipped", "latencyMs": 0, "message": "no LML_API_KEY configured" }
+  ]
+}
+```
+
+Stderr is a human-readable summary headline plus a line for every non-pass outcome — readable from a GHA workflow log without piping stdout through `jq`.
+
+### Exit codes
+
+| Code | Meaning                                                                                                                                                                                          |
+| ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `0`  | Every check returned `pass` or `skipped`.                                                                                                                                                        |
+| `1`  | At least one check returned `fail`. Stdout JSON names the failing check(s); stderr lists them with messages.                                                                                     |
+| `2`  | Invocation error (unknown subcommand, missing required flag, unknown flag, unknown suite). Distinct from `1` so the gate workflow can tell "your config is wrong" from "your service is broken". |
+
+### Distribution (e2e-runner consumption)
+
+The CLI is consumed by cloning the repo onto the e2e-runner host during bootstrap:
+
+```bash
+sudo mkdir -p /opt/wxyc-canary
+sudo chown $USER /opt/wxyc-canary
+git clone https://github.com/WXYC/wxyc-canary.git /opt/wxyc-canary
+cd /opt/wxyc-canary
+git checkout <pinned-sha>
+npm ci
+npm run build:cli
+```
+
+Workflows then invoke it as:
+
+```bash
+node /opt/wxyc-canary/dist/cli.js check --base-url=... --auth-url=... --lml-url=... --suite=smoke
+```
+
+Pinning to a SHA gives consumers an explicit upgrade lever — bump the SHA in the runner-bootstrap script to pick up a non-breaking change; a breaking change forces re-running the bootstrap. The full update procedure lives in the staging-gate runbook ([WXYC/wiki#81](https://github.com/WXYC/wiki/issues/81)).
+
+### Side-effect contract
+
+The CLI never instantiates the AWS SDK. It hard-codes `publishMetrics: false`, doesn't read any `*_SSM_PARAM` or `*_SECRET_ARN` env vars, and never reaches the GitHub-issue-mirroring code path. The Lambda's runner-liveness probe (`gha-runner-online`) and write canary (`enrichment-quality`) stay invisible to the CLI even when a future operator sets the corresponding env vars — they're not in any suite.
+
 ## Deploying
 
 ### One-time setup

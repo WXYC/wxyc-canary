@@ -1,6 +1,6 @@
 import { canaryFetch, type FetchResult } from './client.js';
 import { runEnrichmentCheck } from './enrichment-check.js';
-import type { Check, CheckResult } from './types.js';
+import type { Check, CheckResult, Suite } from './types.js';
 
 /**
  * The canonical artist used for read-side probes. Stereolab has been on
@@ -15,6 +15,7 @@ const healthcheck: Check = {
   name: 'backend-healthcheck',
   description: 'GET /healthcheck on Backend-Service',
   requiresAuth: false,
+  suites: ['smoke'],
   run: async (ctx) => {
     const r = await canaryFetch(`${ctx.backendUrl}/healthcheck`);
     if (!r.ok) throw new Error(`expected 2xx, got ${r.status}: ${r.rawText.slice(0, 200)}`);
@@ -32,6 +33,7 @@ const proxyLibrarySearch: Check = {
   name: 'proxy-library-search',
   description: 'GET /proxy/library/search — exercises BS → LML',
   requiresAuth: true,
+  suites: ['smoke'],
   run: async (ctx) => {
     if (!ctx.djBearerToken) throw new Error('DJ bearer token missing');
     const r = await canaryFetch(
@@ -79,6 +81,7 @@ const djLibrarySearch: Check = {
   name: 'dj-library-search',
   description: 'GET /library/?artist_name=... as DJ — catches catalog-search 503',
   requiresAuth: true,
+  suites: ['smoke'],
   run: async (ctx) => {
     if (!ctx.djBearerToken) throw new Error('DJ bearer token missing');
     const r = await canaryFetch(`${ctx.backendUrl}/library/?artist_name=${encodeURIComponent(PROBE_ARTIST)}&n=5`, {
@@ -104,6 +107,7 @@ const djFlowsheetRead: Check = {
   name: 'dj-flowsheet-read',
   description: 'GET /flowsheet?n=5 as DJ',
   requiresAuth: true,
+  suites: ['smoke'],
   run: async (ctx) => {
     if (!ctx.djBearerToken) throw new Error('DJ bearer token missing');
     const r = await canaryFetch(`${ctx.backendUrl}/flowsheet?n=5`, {
@@ -236,6 +240,7 @@ const lmlAuth: Check = {
   description:
     'POST /api/v1/lookup directly to LML with LML_API_KEY — catches BS#1094 bearer rotation drift + LML_REQUIRE_AUTH=false',
   requiresAuth: false,
+  suites: ['smoke'],
   run: async (ctx): Promise<CheckResult | void> => {
     if (!ctx.lmlApiKey) {
       return { skipped: true, skipReason: 'no LML_API_KEY configured' };
@@ -469,6 +474,30 @@ export const checks: readonly Check[] = [
   ghaRunnerOnline,
   enrichmentQuality,
 ];
+
+/**
+ * The complete set of suite tags accepted by the CLI's `--suite` flag. The
+ * `satisfies` clause forces a compile error if a string here drifts from
+ * the `Suite` union, and the `as const` makes the array readable as a
+ * literal type so the CLI can list valid values in error messages.
+ *
+ * Add a new suite by extending the `Suite` union in types.ts, appending
+ * here, and tagging the relevant checks. The CLI's `--suite` validator
+ * reads this constant — no third place to update.
+ */
+export const VALID_SUITES = ['smoke'] as const satisfies readonly Suite[];
+
+/**
+ * Return the checks tagged with the given suite. Untagged checks (no
+ * `suites` field) are unreachable from the CLI by design — they're the
+ * Lambda-only checks (prod-only operator concerns like `gha-runner-online`,
+ * writes like `enrichment-quality`, scope-mismatched probes like
+ * `semantic-index-search` that hits a different service). The Lambda
+ * continues to consume the full `checks` array directly.
+ */
+export function checksForSuite(suite: Suite): readonly Check[] {
+  return checks.filter((c) => c.suites?.includes(suite));
+}
 
 /**
  * Parse a `Retry-After` header in seconds form (the date form is rare on
