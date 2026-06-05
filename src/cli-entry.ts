@@ -2,8 +2,7 @@
 // dist/cli.js, so this file is the executable. All testable logic lives
 // in `./cli.js`'s `runCli`; this entry is a thin IO wiring shell so the
 // test suite can import `runCli` directly without firing process.exit.
-import { runCli } from './cli.js';
-import { sanitizeForLog } from './cli.js';
+import { runCli, sanitizeForLog } from './cli.js';
 
 /**
  * Format a thrown value for the fatal-error stderr line. `err` is typed
@@ -54,9 +53,21 @@ async function exitAfterDrain(code: number): Promise<never> {
   // Trigger empty writes whose callbacks fire after the previously
   // queued bytes have flushed to the underlying transport. If the
   // streams are already drained, the callback fires on the next tick.
-  await Promise.all([
-    new Promise<void>((resolve) => process.stdout.write('', () => resolve())),
-    new Promise<void>((resolve) => process.stderr.write('', () => resolve())),
+  //
+  // Race against a 500ms timeout — if a stream is in a wedged state
+  // (e.g. EPIPE after `wxyc-canary check | head -1`, where the reader
+  // hangs up mid-write), the drain callback can sit on the writable's
+  // pending queue indefinitely. The timeout caps total exit latency
+  // so a stuck pipe doesn't leave the CLI hanging in a GHA workflow.
+  // 500ms is comfortably longer than any local pipe drain takes; if
+  // we hit it the bytes are lost anyway, and exiting promptly is more
+  // valuable than blocking forever.
+  await Promise.race([
+    Promise.all([
+      new Promise<void>((resolve) => process.stdout.write('', () => resolve())),
+      new Promise<void>((resolve) => process.stderr.write('', () => resolve())),
+    ]),
+    new Promise<void>((resolve) => setTimeout(resolve, 500).unref()),
   ]);
   process.exit(code);
 }

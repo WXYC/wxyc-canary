@@ -119,16 +119,37 @@ const baseArgv = [
 // don't leak between cases or to other test files. Vitest gives each
 // test a shared process, so beforeEach/afterEach discipline is the
 // difference between deterministic and order-dependent runs.
-const POLLUTED_VARS = [
+//
+// Snapshot the full CANARY_* surface (not just the *_SECRET_ARN /
+// *_SSM_PARAM keys we pollute) so any CI-set CANARY_DJ_EMAIL etc.
+// doesn't leak through `runCli(baseArgv, process.env, io)`. Otherwise
+// a real DJ login would attempt against the mock'd fetch and a future
+// refactor that moved an AWS-SDK call behind the signin/lml-auth path
+// would surface flakes only in CI.
+const SNAPSHOTTED_VARS = [
+  // Polluted directly by each test:
   'CANARY_DJ_SECRET_ARN',
   'CANARY_LML_API_KEY_SECRET_ARN',
   'CANARY_GHA_RUNNER_TOKEN_SSM_PARAM',
   'CANARY_GITHUB_TOKEN_SSM_PARAM',
   'CANARY_PUBLISH_METRICS',
   'CANARY_LOCAL',
+  // Cleared so a CI-set value doesn't reach runCli:
+  'CANARY_DJ_EMAIL',
+  'CANARY_DJ_PASSWORD',
+  'CANARY_LML_API_KEY',
+  'CANARY_ORIGIN_URL',
 ] as const;
 
-function pollute(values: Partial<Record<(typeof POLLUTED_VARS)[number], string>>): void {
+type PollutableVar =
+  | 'CANARY_DJ_SECRET_ARN'
+  | 'CANARY_LML_API_KEY_SECRET_ARN'
+  | 'CANARY_GHA_RUNNER_TOKEN_SSM_PARAM'
+  | 'CANARY_GITHUB_TOKEN_SSM_PARAM'
+  | 'CANARY_PUBLISH_METRICS'
+  | 'CANARY_LOCAL';
+
+function pollute(values: Partial<Record<PollutableVar, string>>): void {
   for (const [k, v] of Object.entries(values)) {
     process.env[k] = v;
   }
@@ -141,15 +162,17 @@ beforeEach(() => {
   ssmCtorSpy.mockReset();
   secretsManagerCtorSpy.mockReset();
   setUpFetchMock();
-  // Snapshot every var we might pollute so afterEach can restore.
-  for (const k of POLLUTED_VARS) {
+  // Snapshot + clear every CANARY_* var the CLI might react to, so
+  // each test starts from a known-clean env regardless of what the CI
+  // runner or other test files set.
+  for (const k of SNAPSHOTTED_VARS) {
     savedEnv[k] = process.env[k];
     delete process.env[k];
   }
 });
 
 afterEach(() => {
-  for (const k of POLLUTED_VARS) {
+  for (const k of SNAPSHOTTED_VARS) {
     if (savedEnv[k] === undefined) {
       delete process.env[k];
     } else {

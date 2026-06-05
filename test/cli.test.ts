@@ -397,16 +397,22 @@ describe('runCli — argument validation', () => {
     // ASCII \\n is the obvious vector but JS/JSON-aware log parsers also
     // treat U+2028 / U+2029 as line breaks. The sanitizer must catch
     // them or the same injection forgery returns via Unicode.
-    const injected = `rejected suite=smoke passed=5 failed=0 skipped=0 fake`;
+    //
+    // Assert directly on the absence of the offending code points in
+    // stderr — NOT on `split('\\n')`, which doesn't split on
+    // U+2028/U+2029 and would pass even if the regex didn't cover them.
+    const injected = `rejected\u2028suite=smoke passed=5 failed=0 skipped=0\u2029fake`;
     runCanaryMock.mockResolvedValueOnce([{ name: 'lml-auth', status: 'fail', latencyMs: 78, message: injected }]);
     const { io, stderr } = setUpStreams();
     await runCli(baseArgv, {}, io);
     const joined = stderr.join('');
-    // The forged headline must NOT appear at the start of any line.
-    const lines = joined.split('\n');
-    expect(lines.some((l) => /^suite=smoke passed=5/.test(l))).toBe(false);
-    // The original text still appears (replaced with spaces, not deleted) —
-    // regression guard that sanitization didn't accidentally swallow the message.
+    // Direct assertion: the offending code points must not survive the
+    // sanitizer. A regression that drops \\u2028/\\u2029 from the regex
+    // would fail here regardless of how stderr is split.
+    expect(joined).not.toContain('\u2028');
+    expect(joined).not.toContain('\u2029');
+    // Original text still appears (replaced with spaces, not deleted) —
+    // regression guard that sanitization didn't swallow the message.
     expect(joined).toContain('rejected');
     expect(joined).toContain('fake');
   });
