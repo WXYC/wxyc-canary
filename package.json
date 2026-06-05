@@ -15,6 +15,7 @@
     "build": "npm run build:lambda && npm run build:cli",
     "build:lambda": "esbuild src/handler.ts --bundle --platform=node --target=node24 --format=cjs --outfile=dist/handler.js --external:aws-sdk",
     "build:cli": "esbuild src/cli-entry.ts --bundle --platform=node --target=node24 --format=esm --outfile=dist/cli.js --banner:js='#!/usr/bin/env node' --external:@aws-sdk/* --external:@smithy/* && chmod +x dist/cli.js",
+    "prepare": "npm run build",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
