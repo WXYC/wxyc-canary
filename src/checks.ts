@@ -488,6 +488,23 @@ export const checks: readonly Check[] = [
 export const VALID_SUITES = ['smoke'] as const satisfies readonly Suite[];
 
 /**
+ * Exhaustiveness check: the type below errors at compile time when a
+ * member of the `Suite` union is missing from `VALID_SUITES`. The
+ * `satisfies` clause above enforces the other direction (every entry
+ * in `VALID_SUITES` is a valid `Suite`); together they pin the two in
+ * lock-step. Without this, extending `Suite = 'smoke' | 'dj-site'`
+ * without bumping `VALID_SUITES` would type-check cleanly and the CLI
+ * would reject `--suite=dj-site` as unknown at runtime.
+ */
+type _ExhaustivenessCheck =
+  Exclude<Suite, (typeof VALID_SUITES)[number]> extends never
+    ? true
+    : 'Suite union has a member missing from VALID_SUITES';
+const _exhaustivenessCheck: _ExhaustivenessCheck = true;
+// Silence "declared but never read" — the assignment site is the assertion.
+void _exhaustivenessCheck;
+
+/**
  * Return the checks tagged with the given suite. Untagged checks (no
  * `suites` field) are unreachable from the CLI by design — they're the
  * Lambda-only checks (prod-only operator concerns like `gha-runner-online`,

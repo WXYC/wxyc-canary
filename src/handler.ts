@@ -47,17 +47,28 @@ function loadConfigFromEnv(): CanaryConfig {
 
 /**
  * Resolve DJ credentials from one of two sources, in order:
- *   1. `CANARY_DJ_EMAIL` + `CANARY_DJ_PASSWORD` env vars (local + tests).
- *   2. `CANARY_DJ_SECRET_ARN` pointing at a Secrets Manager secret with a
- *      JSON value of shape `{"email": "...", "password": "..."}` (prod).
+ *   1. `config.djEmail` + `config.djPassword` (set by the Lambda's
+ *      env loader or the CLI's flag-parser).
+ *   2. `env.CANARY_DJ_SECRET_ARN` pointing at a Secrets Manager secret
+ *      with a JSON value of shape `{"email": "...", "password": "..."}`.
  * Returns undefined when neither is configured — DJ-auth checks downgrade
  * to skipped in that case.
+ *
+ * `env` is passed explicitly (not read from `process.env`) so callers
+ * that want to suppress the SecretsManager fallback can pass a
+ * sanitized env. The CLI does exactly that — its README contracts on
+ * "never instantiates the AWS SDK", and an operator with
+ * `CANARY_DJ_SECRET_ARN` in their shell would otherwise silently
+ * trigger SDK instantiation despite the CLI's intent.
  */
-async function resolveDjCredentials(config: CanaryConfig): Promise<{ email: string; password: string } | undefined> {
+async function resolveDjCredentials(
+  config: CanaryConfig,
+  env: NodeJS.ProcessEnv
+): Promise<{ email: string; password: string } | undefined> {
   if (config.djEmail && config.djPassword) {
     return { email: config.djEmail, password: config.djPassword };
   }
-  const secretArn = process.env.CANARY_DJ_SECRET_ARN;
+  const secretArn = env.CANARY_DJ_SECRET_ARN;
   if (!secretArn) return undefined;
 
   const sm = new SecretsManagerClient({ region: config.awsRegion ?? 'us-east-1' });
@@ -74,17 +85,19 @@ async function resolveDjCredentials(config: CanaryConfig): Promise<{ email: stri
 
 /**
  * Resolve the LML bearer from one of two sources, in order:
- *   1. `CANARY_LML_API_KEY` env var (local + tests + simple prod).
- *   2. `CANARY_LML_API_KEY_SECRET_ARN` pointing at a Secrets Manager
+ *   1. `config.lmlApiKey` (set by env loader / CLI flag-parser).
+ *   2. `env.CANARY_LML_API_KEY_SECRET_ARN` pointing at a Secrets Manager
  *      secret whose `SecretString` is the bearer itself (plain string,
  *      not JSON — Railway-style secret-store convention so the bearer
  *      rotates in one place across BS + rom + tubafrenzy + canary).
  * Returns undefined when neither is configured — the `lml-auth` check
  * then downgrades to skipped (operator gap, not regression).
+ *
+ * See `resolveDjCredentials` for the env-parameter rationale.
  */
-async function resolveLmlApiKey(config: CanaryConfig): Promise<string | undefined> {
+async function resolveLmlApiKey(config: CanaryConfig, env: NodeJS.ProcessEnv): Promise<string | undefined> {
   if (config.lmlApiKey) return config.lmlApiKey;
-  const secretArn = process.env.CANARY_LML_API_KEY_SECRET_ARN;
+  const secretArn = env.CANARY_LML_API_KEY_SECRET_ARN;
   if (!secretArn) return undefined;
 
   const sm = new SecretsManagerClient({ region: config.awsRegion ?? 'us-east-1' });
@@ -97,17 +110,19 @@ async function resolveLmlApiKey(config: CanaryConfig): Promise<string | undefine
 
 /**
  * Resolve the GitHub PAT used by the `gha-runner-online` check, in order:
- *   1. `CANARY_GHA_RUNNER_TOKEN` env (local + tests).
- *   2. `CANARY_GHA_RUNNER_TOKEN_SSM_PARAM` → SSM SecureString (prod).
+ *   1. `config.ghaRunnerToken` (set by env loader / CLI flag-parser).
+ *   2. `env.CANARY_GHA_RUNNER_TOKEN_SSM_PARAM` → SSM SecureString.
  * Returns undefined when neither is configured — the check then skips
  * with reason. The PAT is stored in SSM (not Secrets Manager) to match
  * the existing GitHub-issues-reporter PAT, which keeps all GitHub-PAT
  * storage co-located under `/wxyc-canary/*` for the same rotation
  * cadence and IAM grant pattern.
+ *
+ * See `resolveDjCredentials` for the env-parameter rationale.
  */
-async function resolveGhaRunnerToken(config: CanaryConfig): Promise<string | undefined> {
+async function resolveGhaRunnerToken(config: CanaryConfig, env: NodeJS.ProcessEnv): Promise<string | undefined> {
   if (config.ghaRunnerToken) return config.ghaRunnerToken;
-  const paramName = process.env.CANARY_GHA_RUNNER_TOKEN_SSM_PARAM;
+  const paramName = env.CANARY_GHA_RUNNER_TOKEN_SSM_PARAM;
   if (!paramName) return undefined;
 
   const ssm = new SSMClient({ region: config.awsRegion ?? 'us-east-1' });
@@ -134,12 +149,20 @@ async function resolveGhaRunnerToken(config: CanaryConfig): Promise<string | und
  * logic (lml-auth no-bearer, dj-* no-creds) still works when the suite
  * happens to include the affected check.
  */
-export async function runCanary(config: CanaryConfig, opts?: { checks?: readonly Check[] }): Promise<CheckOutcome[]> {
+export async function runCanary(
+  config: CanaryConfig,
+  opts?: { checks?: readonly Check[]; env?: NodeJS.ProcessEnv }
+): Promise<CheckOutcome[]> {
   const ranChecks = opts?.checks ?? checks;
+  // `env` defaults to `process.env` for the Lambda call path (which
+  // wants the SecretsManager / SSM fallbacks to fire). The CLI passes
+  // a sanitized env so the fallbacks short-circuit on missing env vars
+  // and never instantiate any AWS SDK client.
+  const env = opts?.env ?? process.env;
   let djCreds: { email: string; password: string } | undefined;
   let djAuthError: string | undefined;
   try {
-    djCreds = await resolveDjCredentials(config);
+    djCreds = await resolveDjCredentials(config, env);
   } catch (err) {
     djAuthError = `credential resolution failed: ${(err as Error).message}`;
   }
@@ -151,7 +174,7 @@ export async function runCanary(config: CanaryConfig, opts?: { checks?: readonly
   let lmlApiKey: string | undefined;
   let lmlAuthError: string | undefined;
   try {
-    lmlApiKey = await resolveLmlApiKey(config);
+    lmlApiKey = await resolveLmlApiKey(config, env);
   } catch (err) {
     lmlAuthError = `LML bearer resolution failed: ${(err as Error).message}`;
   }
@@ -168,7 +191,7 @@ export async function runCanary(config: CanaryConfig, opts?: { checks?: readonly
     typeof config.ghaRunnerId === 'number' && Number.isInteger(config.ghaRunnerId) && config.ghaRunnerId > 0;
   if (probeIdConfigured) {
     try {
-      ghaRunnerToken = await resolveGhaRunnerToken(config);
+      ghaRunnerToken = await resolveGhaRunnerToken(config, env);
     } catch (err) {
       ghaRunnerTokenError = `GH runner PAT resolution failed: ${(err as Error).message}`;
     }
@@ -416,11 +439,9 @@ export const handler = async (): Promise<{ outcomes: CheckOutcome[]; failed: num
   return { outcomes, failed, skipped };
 };
 
-if (process.env.CANARY_LOCAL === 'true') {
-  handler()
-    .then(() => process.exit(0))
-    .catch((err) => {
-      console.error(err);
-      process.exit(1);
-    });
-}
+// The `npm run local` autorun now lives in `src/handler-local.ts` so
+// that `import { runCanary } from './handler.js'` from the CLI never
+// fires a Lambda invocation as a top-level side effect. The race was
+// real: an operator with `CANARY_LOCAL=true` in their shell would
+// otherwise see the Lambda `handler()` execute concurrently with the
+// CLI's `runCli` call.

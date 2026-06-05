@@ -20,7 +20,7 @@
     "typecheck": "tsc --noEmit",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "local": "tsx src/handler.ts",
+    "local": "tsx src/handler-local.ts",
     "local:cli": "tsx src/cli-entry.ts"
   },
   "keywords": [
@@ -30,10 +30,12 @@
     "lambda"
   ],
   "license": "ISC",
-  "devDependencies": {
+  "dependencies": {
     "@aws-sdk/client-cloudwatch": "^3.700.0",
     "@aws-sdk/client-secrets-manager": "^3.700.0",
-    "@aws-sdk/client-ssm": "^3.1056.0",
+    "@aws-sdk/client-ssm": "^3.1056.0"
+  },
+  "devDependencies": {
     "@types/aws-lambda": "^8.10.146",
     "@types/node": "^22.10.0",
     "esbuild": "^0.24.0",
