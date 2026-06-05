@@ -731,7 +731,7 @@ describe('runCanary — gha-runner-online check (runner liveness probe, wiki#80 
     expect(runner.message).toMatch(/no runner id/);
   });
 
-  it('sends the PAT as Authorization: Bearer and targets /orgs/{org}/actions/runners/{id}', async () => {
+  it('sends the PAT as Authorization: Bearer and targets /orgs/{org}/actions/runners/{id} via GET', async () => {
     const fetchMock = setUpGhaApiMock({
       runnerStatus: 200,
       runnerBody: { id: RUNNER_ID, status: 'online' },
@@ -743,6 +743,10 @@ describe('runCanary — gha-runner-online check (runner liveness probe, wiki#80 
     expect(ghaCalls).toHaveLength(1);
     const [url, init] = ghaCalls[0] as unknown as [string, RequestInit];
     expect(url).toBe('https://gha.example.test/orgs/WXYC/actions/runners/250');
+    // The check must use GET. The lml-auth check this one was modeled on uses
+    // POST; pin the method so a copy-paste refactor that swaps it doesn't
+    // silently start 404'ing in prod with a 'runner was likely replaced' page.
+    expect(String(init?.method ?? 'GET').toUpperCase()).toBe('GET');
     const headers = (init?.headers ?? {}) as Record<string, string>;
     expect(headers.Authorization).toBe('Bearer fake-gha-pat');
     // GitHub REST v3 prefers a versioned Accept header; the bare API
@@ -751,6 +755,186 @@ describe('runCanary — gha-runner-online check (runner liveness probe, wiki#80 
     // surfaces here as a test failure rather than a silent 404/406.
     expect(headers.Accept).toMatch(/application\/vnd\.github/);
     expect(headers['X-GitHub-Api-Version']).toBeDefined();
+  });
+
+  // Hardening tests addressing review feedback on the initial check shape.
+  // Each pins a known footgun the first pass either had or could grow into.
+
+  it('skips when ghaRunnerId is NaN (CANARY_GHA_RUNNER_ID was a non-numeric typo)', async () => {
+    // The env loader does `process.env.X ? Number(...) : undefined`. A typo
+    // like CANARY_GHA_RUNNER_ID=abc is truthy as a string; Number('abc') → NaN;
+    // typeof NaN === 'number'. Without an explicit isFinite/isInteger guard
+    // the check would URL-template NaN and 404, then misroute as 'runner was
+    // likely replaced'. Skip instead — operator-visible config error.
+    setUpFetchMock({
+      '/healthcheck': { status: 200, body: { ok: true } },
+      '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
+    });
+
+    const outcomes = await runCanary({
+      ...baseConfig,
+      ghaRunnerApiBase: 'https://gha.example.test',
+      ghaRunnerOrg: 'WXYC',
+      ghaRunnerToken: 'fake-gha-pat',
+      ghaRunnerId: Number.NaN,
+    });
+    const runner = outcomes.find((o) => o.name === 'gha-runner-online')!;
+
+    expect(runner.status).toBe('skipped');
+    expect(runner.message).toMatch(/no runner id|invalid runner id/i);
+  });
+
+  it('skips when ghaRunnerId is 0 (the CFN-documented disabling sentinel) instead of probing /runners/0', async () => {
+    // The template treats GhaRunnerId=0 as the disabling sentinel and strips
+    // the env var to empty string. Belt-and-suspenders: the check itself
+    // must also treat 0 (and any non-positive integer) as the skip case so
+    // non-CFN deploy paths (local invoke, manual env override, future
+    // template refactor) cannot bypass the sentinel.
+    setUpFetchMock({
+      '/healthcheck': { status: 200, body: { ok: true } },
+      '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
+    });
+
+    const outcomes = await runCanary({
+      ...baseConfig,
+      ghaRunnerApiBase: 'https://gha.example.test',
+      ghaRunnerOrg: 'WXYC',
+      ghaRunnerToken: 'fake-gha-pat',
+      ghaRunnerId: 0,
+    });
+    const runner = outcomes.find((o) => o.name === 'gha-runner-online')!;
+
+    expect(runner.status).toBe('skipped');
+    expect(runner.message).toMatch(/no runner id|invalid runner id/i);
+  });
+
+  it('fails with a distinct "GitHub rate-limited" message when 403 is a rate-limit, not a PAT-rejection', async () => {
+    // Primary-rate-limit 403s carry `X-RateLimit-Remaining: 0` and a body
+    // mentioning "rate limit". The check must NOT route this to "rotate the
+    // runner-liveness PAT" — that wastes operator time on a token that's
+    // perfectly valid. Distinct message + 'wait' framing instead.
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const urlString = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      const respond = (resp: { status: number; body: unknown; headers?: Record<string, string> }) =>
+        new Response(typeof resp.body === 'string' ? resp.body : JSON.stringify(resp.body), {
+          status: resp.status,
+          headers: { 'Content-Type': 'application/json', ...(resp.headers ?? {}) },
+        });
+      if (urlString.includes('/healthcheck')) return respond({ status: 200, body: { ok: true } });
+      if (urlString.includes('/graph/artists/search')) return respond({ status: 200, body: { results: [{ id: 1 }] } });
+      if (urlString.includes(`gha.example.test/orgs/WXYC/actions/runners/${RUNNER_ID}`)) {
+        return respond({
+          status: 403,
+          body: {
+            message: 'API rate limit exceeded for user ID 12345.',
+            documentation_url: 'https://docs.github.com/rest',
+          },
+          headers: { 'X-RateLimit-Remaining': '0', 'X-RateLimit-Reset': '1718000000' },
+        });
+      }
+      return new Response(`unmatched mock for ${urlString}`, { status: 599 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const outcomes = await runCanary(ghaRunnerConfig);
+    const runner = outcomes.find((o) => o.name === 'gha-runner-online')!;
+
+    expect(runner.status).toBe('fail');
+    expect(runner.message).toMatch(/rate limit/i);
+    // Must NOT mis-route to the PAT rotation runbook.
+    expect(runner.message).not.toMatch(/rotate/i);
+  });
+
+  it('fails with a distinct "GitHub degraded" message on 5xx (not the generic !ok branch)', async () => {
+    // The docstring on the check promises 5xx routes distinctly so the
+    // on-call goes to githubstatus.com, not the runner. Pin the contract.
+    setUpGhaApiMock({
+      runnerStatus: 503,
+      runnerBody: { message: 'Service Unavailable' },
+    });
+
+    const outcomes = await runCanary(ghaRunnerConfig);
+    const runner = outcomes.find((o) => o.name === 'gha-runner-online')!;
+
+    expect(runner.status).toBe('fail');
+    expect(runner.message).toMatch(/GitHub.*degraded|githubstatus/i);
+    // Must NOT mis-route to the runner-replaced or PAT-rotation runbook.
+    expect(runner.message).not.toMatch(/replaced/i);
+    expect(runner.message).not.toMatch(/rotate/i);
+  });
+
+  it('uses the WXYC default for ghaRunnerOrg when the env value is an empty string (not just undefined)', async () => {
+    // `??` only catches nullish; an env-driven empty string for
+    // CANARY_GHA_RUNNER_ORG would let '' through and produce `/orgs//actions`.
+    // Pin that the default kicks in for both undefined and ''.
+    const fetchMock = setUpGhaApiMock({
+      runnerStatus: 200,
+      runnerBody: { id: RUNNER_ID, status: 'online' },
+    });
+
+    await runCanary({
+      ...ghaRunnerConfig,
+      ghaRunnerOrg: '',
+    });
+
+    const ghaCalls = fetchMock.mock.calls.filter(([url]) => String(url).includes('gha.example.test'));
+    expect(ghaCalls).toHaveLength(1);
+    const [url] = ghaCalls[0] as unknown as [string];
+    expect(url).toBe('https://gha.example.test/orgs/WXYC/actions/runners/250');
+  });
+
+  it('does not attempt SSM PAT resolution when no runner id is configured (half-configured probe must not page)', async () => {
+    // Half-configured-probe defense: a deploy that sets the SSM token param
+    // but forgets the runner-id parameter should NOT page on-call when SSM
+    // glitches transiently. The runner-id is the load-bearing gate; without
+    // it the probe wouldn't run anyway, so SSM resolution must be SKIPPED
+    // entirely. Pins both the resulting outcome AND that no SSM call was
+    // attempted — the latter is the actual contract; the former is the
+    // observable consequence.
+    ssmSendMock.mockClear();
+    setUpFetchMock({
+      '/healthcheck': { status: 200, body: { ok: true } },
+      '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
+    });
+    process.env.CANARY_GHA_RUNNER_TOKEN_SSM_PARAM = '/wxyc-canary/gha-runner-token';
+
+    try {
+      const outcomes = await runCanary({
+        ...baseConfig,
+        ghaRunnerApiBase: 'https://gha.example.test',
+        ghaRunnerOrg: 'WXYC',
+        // ghaRunnerId intentionally omitted (probe not actually enabled)
+        // ghaRunnerToken intentionally omitted so resolution path would run
+        //   absent the gate
+      });
+      const runner = outcomes.find((o) => o.name === 'gha-runner-online')!;
+
+      expect(runner.status).toBe('skipped');
+      expect(runner.message).toMatch(/no runner id|invalid runner id/i);
+      // The actual contract: zero SSM calls when the runner-id is absent.
+      expect(ssmSendMock).not.toHaveBeenCalled();
+    } finally {
+      delete process.env.CANARY_GHA_RUNNER_TOKEN_SSM_PARAM;
+    }
+  });
+
+  it('normalizes a trailing slash on ghaRunnerApiBase so the URL has no double slash', async () => {
+    // Operator copy-paste hazard. GitHub today tolerates `//`; a path-strict
+    // proxy or future GH rev would 404 and misroute as 'runner replaced'.
+    const fetchMock = setUpGhaApiMock({
+      runnerStatus: 200,
+      runnerBody: { id: RUNNER_ID, status: 'online' },
+    });
+
+    await runCanary({
+      ...ghaRunnerConfig,
+      ghaRunnerApiBase: 'https://gha.example.test/',
+    });
+
+    const ghaCalls = fetchMock.mock.calls.filter(([url]) => String(url).includes('gha.example.test'));
+    expect(ghaCalls).toHaveLength(1);
+    const [url] = ghaCalls[0] as unknown as [string];
+    expect(url).toBe('https://gha.example.test/orgs/WXYC/actions/runners/250');
   });
 });
 
@@ -1668,6 +1852,11 @@ describe('handler — GitHub issue reporting dispatch', () => {
     delete process.env.CANARY_DJ_EMAIL;
     delete process.env.CANARY_DJ_PASSWORD;
     delete process.env.CANARY_DJ_SECRET_ARN;
+    // Defensive: the runner-liveness probe shares the SSM-mock dispatch
+    // with this block's `ssmSendMock.toHaveBeenCalledTimes(1)` assertion.
+    // A leaked CANARY_GHA_RUNNER_TOKEN_SSM_PARAM from CI shell or a prior
+    // test would cause a 2nd SSM call and fail this assertion opaquely.
+    delete process.env.CANARY_GHA_RUNNER_TOKEN_SSM_PARAM;
   });
 
   afterEach(() => {
@@ -1678,6 +1867,7 @@ describe('handler — GitHub issue reporting dispatch', () => {
     delete process.env.CANARY_PUBLISH_METRICS;
     delete process.env.CANARY_GITHUB_TOKEN_SSM_PARAM;
     delete process.env.CANARY_GITHUB_ISSUES_REPO;
+    delete process.env.CANARY_GHA_RUNNER_TOKEN_SSM_PARAM;
   });
 
   it('fetches the SSM PAT and invokes the reporter when both env vars are set', async () => {

@@ -326,13 +326,38 @@ const ghaRunnerOnline: Check = {
   description: 'GET /orgs/{org}/actions/runners/{id} — staging-gate runner liveness',
   requiresAuth: false,
   run: async (ctx): Promise<CheckResult | void> => {
+    // Check the runner-id sentinel before the token: when both are missing
+    // the id is the load-bearing knob (a configured probe without a token
+    // would fail to resolve; a configured token without an id would have
+    // nothing to probe). Surfacing "no runner id" first matches the
+    // dominant operator failure mode.
+    //
+    // Defense-in-depth on the runner-id sentinel. The CFN HasGhaRunnerProbe
+    // condition strips the env var to '' when GhaRunnerId=0; the env loader
+    // turns '' into undefined. But non-CFN deploy paths (local invoke, manual
+    // env override, a future template refactor) can land NaN (typo) or 0
+    // (sentinel) or non-positive-integer values. `typeof NaN === 'number'`
+    // and `typeof 0 === 'number'`, so a bare `typeof !== 'number'` is not
+    // enough — without isInteger/`> 0` the URL would template `/runners/NaN`
+    // or `/runners/0` and 404, mis-routing to "runner was likely replaced".
+    if (typeof ctx.ghaRunnerId !== 'number' || !Number.isInteger(ctx.ghaRunnerId) || ctx.ghaRunnerId <= 0) {
+      return {
+        skipped: true,
+        skipReason:
+          ctx.ghaRunnerId === undefined
+            ? 'no runner id configured (CANARY_GHA_RUNNER_ID)'
+            : `invalid runner id (CANARY_GHA_RUNNER_ID=${ctx.ghaRunnerId}); expected positive integer`,
+      };
+    }
     if (!ctx.ghaRunnerToken) {
       return { skipped: true, skipReason: 'no GitHub PAT configured for runner-liveness probe' };
     }
-    if (typeof ctx.ghaRunnerId !== 'number') {
-      return { skipped: true, skipReason: 'no runner id configured (CANARY_GHA_RUNNER_ID)' };
-    }
-    const url = `${ctx.ghaRunnerApiBase}/orgs/${ctx.ghaRunnerOrg}/actions/runners/${ctx.ghaRunnerId}`;
+    // Normalize a trailing slash on the API base. Operator copy-paste
+    // hazard — GH today tolerates `//orgs/...` but a path-strict proxy or
+    // future GH rev would 404 and the failure would mis-route through the
+    // "runner replaced" runbook.
+    const apiBase = ctx.ghaRunnerApiBase.replace(/\/+$/, '');
+    const url = `${apiBase}/orgs/${ctx.ghaRunnerOrg}/actions/runners/${ctx.ghaRunnerId}`;
     const r = await canaryFetch(url, {
       headers: {
         Authorization: `Bearer ${ctx.ghaRunnerToken}`,
@@ -344,15 +369,49 @@ const ghaRunnerOnline: Check = {
       // Runner id no longer exists — the operator replaced the host and
       // did not re-set the CFN parameter. Distinct from "offline" so the
       // on-call routes to the replacement runbook, not "the runner died".
+      // NOTE: a fine-scoped PAT with insufficient scope ALSO returns 404
+      // (GitHub hides resources from underprivileged tokens). The runbook
+      // entry for this message must mention the PAT-scope possibility as a
+      // second-line check after the operator confirms the runner id.
       throw new Error(
-        `GitHub returned 404 for runner id ${ctx.ghaRunnerId} — runner was likely replaced; re-set GhaRunnerId stack parameter: ${r.rawText.slice(0, 200)}`
+        `GitHub returned 404 for runner id ${ctx.ghaRunnerId} — runner was likely replaced (or PAT lacks Self-hosted runners: Read scope); re-set GhaRunnerId or rotate PAT: ${r.rawText.slice(0, 200)}`
       );
     }
-    if (r.status === 401 || r.status === 403) {
-      // PAT is revoked / unscoped / expired. Operator action: rotate
-      // the SSM parameter — different runbook entry from "runner down".
+    if (r.status === 403) {
+      // 403 is overloaded: primary rate-limit returns 403 with `X-RateLimit-
+      // Remaining: 0` and a body mentioning "rate limit". PAT rotation
+      // drift returns 403 too. Disambiguate so on-call doesn't rotate a
+      // perfectly valid PAT chasing a transient rate-limit window.
+      const remaining = r.headers?.['x-ratelimit-remaining'];
+      const bodyText = r.rawText.toLowerCase();
+      if (remaining === '0' || bodyText.includes('rate limit') || bodyText.includes('secondary rate')) {
+        const reset = r.headers?.['x-ratelimit-reset'];
+        const resetSuffix = reset ? ` (reset epoch ${reset})` : '';
+        // Phrased to keep the on-call away from PAT-rotation actions: the
+        // PAT is valid; the bucket needs to refill.
+        throw new Error(
+          `GitHub rate limit exceeded${resetSuffix} — wait for the bucket to reset; the PAT is valid: ${r.rawText.slice(0, 200)}`
+        );
+      }
       throw new Error(
-        `GitHub rejected PAT with ${r.status} — rotate the runner-liveness PAT in SSM: ${r.rawText.slice(0, 200)}`
+        `GitHub rejected PAT with 403 — rotate the runner-liveness PAT in SSM: ${r.rawText.slice(0, 200)}`
+      );
+    }
+    if (r.status === 401) {
+      // PAT is revoked / expired / malformed. Operator action: rotate the
+      // SSM parameter — different runbook entry from "runner down" or "rate
+      // limit".
+      throw new Error(
+        `GitHub rejected PAT with 401 — rotate the runner-liveness PAT in SSM: ${r.rawText.slice(0, 200)}`
+      );
+    }
+    if (r.status >= 500) {
+      // GitHub itself is degraded. Route the on-call to githubstatus.com
+      // before they SSH the runner or rotate the PAT — the runner has
+      // nothing to do with this failure. The docstring above promised this
+      // would be a distinct surface; here it actually is.
+      throw new Error(
+        `GitHub API degraded (status ${r.status}) — check githubstatus.com before investigating the runner: ${r.rawText.slice(0, 200)}`
       );
     }
     if (!r.ok) {

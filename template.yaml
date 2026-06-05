@@ -119,8 +119,12 @@ Parameters:
       The id changes when the runner is replaced (re-registration), so
       this parameter must be re-set after an instance swap — see
       wxyc-shared `scripts/e2e-runner/README.md`. Leave at 0 to skip the
-      probe (the check downgrades to skipped, no alarm). The handler
-      forwards 0 verbatim; the check skips on "no runner id configured".
+      probe (the check downgrades to skipped, no alarm). Disabling
+      mechanism: the `HasGhaRunnerProbe` condition sets the env var to
+      empty string when this parameter is 0, which the handler env loader
+      reads as undefined; the check's own runner-id guard
+      (`Number.isInteger(id) && id > 0`) is the second line of defense
+      for any non-CFN deploy path (local invoke, manual env override).
 
 Conditions:
   HasDjCredentials: !Not [!Equals [!Ref DjCredentialsSecretArn, '']]
