@@ -46,17 +46,27 @@ jobs:
       - name: SAM build
         run: sam build
       - name: SAM deploy
-        # `GhaRunnerTokenSsmParamName` defaults empty and `GhaRunnerId` defaults
-        # '0' so the runner-liveness probe stays disabled until the SSM PAT
-        # exists in the canary's AWS account AND the corresponding GH Action
-        # variables (`GHA_RUNNER_TOKEN_SSM_PARAM_NAME`, `GHA_RUNNER_ID`) are
-        # set. See `scripts/e2e-runner/README.md` (in wxyc-shared) for the
-        # runner topology and the README in this repo's "Runner liveness probe"
-        # section for the SSM PAT setup. Sequencing intent: probe ships
-        # disabled, operator opts in by creating the SSM PAT then flipping
-        # the GH vars, then a workflow_dispatch run enables the probe
-        # atomically without an alarm window.
+        # Runner-liveness probe params are conditionally appended only when
+        # the operator has set the corresponding GH Action variable. `sam
+        # deploy --parameter-overrides` (shorthand `Key=Value` form) rejects
+        # empty values like `GhaRunnerTokenSsmParamName=` with a parse error
+        # — building the args via shell is the cleanest way to omit the
+        # param entirely when the var is unset. The probe stays disabled
+        # via the template's own `HasGhaRunnerProbe` CFN-default behavior
+        # when no override is passed. See README "Runner liveness probe"
+        # for the operator setup (create SSM PAT → set GH Action vars →
+        # deploy).
+        env:
+          GHA_RUNNER_TOKEN_SSM_PARAM_NAME: ${{ vars.GHA_RUNNER_TOKEN_SSM_PARAM_NAME }}
+          GHA_RUNNER_ORG: ${{ vars.GHA_RUNNER_ORG || 'WXYC' }}
+          GHA_RUNNER_ID: ${{ vars.GHA_RUNNER_ID || '0' }}
         run: |
+          PROBE_ARGS=()
+          if [ -n "$GHA_RUNNER_TOKEN_SSM_PARAM_NAME" ]; then
+            PROBE_ARGS+=("GhaRunnerTokenSsmParamName=$GHA_RUNNER_TOKEN_SSM_PARAM_NAME")
+            PROBE_ARGS+=("GhaRunnerOrg=$GHA_RUNNER_ORG")
+            PROBE_ARGS+=("GhaRunnerId=$GHA_RUNNER_ID")
+          fi
           sam deploy \
             --no-confirm-changeset \
             --no-fail-on-empty-changeset \
@@ -71,6 +81,4 @@ jobs:
               LmlApiKeySecretArn=${{ secrets.LML_API_KEY_SECRET_ARN }} \
               DjCredentialsSecretArn=${{ secrets.DJ_CREDENTIALS_SECRET_ARN }} \
               AlertEmail=${{ vars.ALERT_EMAIL }} \
-              GhaRunnerTokenSsmParamName=${{ vars.GHA_RUNNER_TOKEN_SSM_PARAM_NAME }} \
-              GhaRunnerOrg=${{ vars.GHA_RUNNER_ORG || 'WXYC' }} \
-              GhaRunnerId=${{ vars.GHA_RUNNER_ID || '0' }}
+              "${PROBE_ARGS[@]}"
