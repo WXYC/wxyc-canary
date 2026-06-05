@@ -9,9 +9,15 @@ import { handler } from './handler.js';
 // the drain step `npm run local | jq` could see truncated output. Same
 // pattern as `cli-entry.ts`.
 async function exitAfterDrain(code: number): Promise<never> {
-  await Promise.all([
-    new Promise<void>((resolve) => process.stdout.write('', () => resolve())),
-    new Promise<void>((resolve) => process.stderr.write('', () => resolve())),
+  // Cap drain wait at 500ms so a wedged pipe (EPIPE from a reader that
+  // hung up mid-write) doesn't leave the process hanging. See
+  // cli-entry.ts for the full rationale.
+  await Promise.race([
+    Promise.all([
+      new Promise<void>((resolve) => process.stdout.write('', () => resolve())),
+      new Promise<void>((resolve) => process.stderr.write('', () => resolve())),
+    ]),
+    new Promise<void>((resolve) => setTimeout(resolve, 500).unref()),
   ]);
   process.exit(code);
 }

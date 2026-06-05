@@ -76,12 +76,12 @@ wxyc-canary check \
 
 Credentials come from environment variables only (flags would leak into shell history and CI logs):
 
-| Env var              | Purpose                                                                                                                                                                     |
-| -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `CANARY_DJ_EMAIL`    | DJ login email. Pairs with `CANARY_DJ_PASSWORD`; both must be set together or both unset (XOR is rejected as exit 2). When both unset, DJ-auth checks `skipped` (not fail). |
-| `CANARY_DJ_PASSWORD` | DJ login password. See above.                                                                                                                                               |
-| `CANARY_LML_API_KEY` | LML bearer for the `lml-auth` check. Without it, the check `skipped`.                                                                                                       |
-| `CANARY_ORIGIN_URL`  | Sent as `Origin:` on better-auth calls. Must match a `BETTER_AUTH_TRUSTED_ORIGINS` value. Defaults to `https://dj.wxyc.org`.                                                |
+| Env var              | Purpose                                                                                                                                                                                                                                                                    |
+| -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `CANARY_DJ_EMAIL`    | DJ login email. Pairs with `CANARY_DJ_PASSWORD`; when the selected suite includes a DJ-auth check, both must be set together or both unset (XOR is rejected as exit 2). Whitespace-only values are treated as unset. When both unset, DJ-auth checks `skipped` (not fail). |
+| `CANARY_DJ_PASSWORD` | DJ login password. See above.                                                                                                                                                                                                                                              |
+| `CANARY_LML_API_KEY` | LML bearer for the `lml-auth` check. Without it, the check `skipped`.                                                                                                                                                                                                      |
+| `CANARY_ORIGIN_URL`  | Sent as `Origin:` on better-auth calls. Must match a `BETTER_AUTH_TRUSTED_ORIGINS` value. Defaults to `https://dj.wxyc.org`.                                                                                                                                               |
 
 `*_SECRET_ARN` and `*_SSM_PARAM` env vars used by the Lambda are **not** read by the CLI. The CLI passes a sanitized env to `runCanary` so an operator with those vars exported in their shell cannot accidentally trigger AWS-SDK calls from a CLI invocation — verified by `test/cli-aws-isolation.test.ts`.
 
@@ -113,7 +113,7 @@ Stdout is exactly one JSON line, parseable by `jq`. The outcome shape is project
 }
 ```
 
-`outcomes[i].message` is present only when `status !== 'pass'`. Control characters in messages are stripped before they reach stderr to neutralize log-injection attempts via probed-endpoint response bodies.
+`outcomes[i].message` is present only when `status !== 'pass'`. Control characters AND Unicode line separators (U+2028, U+2029, U+0085) in messages are stripped before they reach stderr to neutralize log-injection attempts via probed-endpoint response bodies. The same sanitizer is applied to the fatal-error path (any uncaught throw out of `runCli` runs through `sanitizeForLog` before being written to stderr) so a thrown Error whose message interpolates a server response body cannot bypass the defense.
 
 Stderr is a human-readable summary headline plus a line for every non-pass outcome — readable from a GHA workflow log without piping stdout through `jq`.
 
