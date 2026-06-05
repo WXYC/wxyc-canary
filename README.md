@@ -209,8 +209,11 @@ Required GitHub variables (override defaults if needed):
 The staging-gate runner has been failing its liveness probe for ≥10 minutes. The check message distinguishes the failure mode — route accordingly:
 
 - **`offline`** — the runner process stopped polling GitHub. SSH to `wxyc-e2e-runner` (per wxyc-shared `scripts/e2e-runner/README.md`) and check `systemctl status 'actions.runner.*.service'`. If the host itself is unreachable, the EC2 instance is wedged — reboot or rebuild from the bootstrap script.
-- **`404 — runner was likely replaced`** — someone replaced the runner without re-setting `GhaRunnerId`. Discover the new id with `gh api /orgs/WXYC/actions/runners --jq '.runners[] | select(.name=="wxyc-e2e-runner")'` and redeploy with the updated parameter.
-- **`PAT rejected with 401/403`** — the SSM-stored PAT was revoked, scoped down, or expired. Generate a fresh fine-scoped PAT (Self-hosted runners: Read on `WXYC`) and overwrite `/wxyc-canary/gha-runner-token` via `aws ssm put-parameter --overwrite`.
+- **`404 — runner was likely replaced (or PAT lacks Self-hosted runners: Read scope)`** — two-step diagnosis: (1) Confirm the runner id is still current with `gh api /orgs/WXYC/actions/runners --jq '.runners[] | select(.name=="wxyc-e2e-runner")'`. If the id changed, redeploy with the new `GhaRunnerId`. (2) If the id is unchanged, the PAT is missing the `Self-hosted runners: Read` org-level permission — GitHub returns 404 to hide resources from underprivileged tokens. Generate a fresh fine-scoped PAT with the correct scope and overwrite `/wxyc-canary/gha-runner-token`.
+- **`GitHub rate limit exceeded — the PAT is valid`** — do NOT rotate the PAT. The 5000/hr REST bucket is shared across everything the PAT identity touches; wait for the reset epoch in the message and investigate any other tooling that may share the token.
+- **`GitHub API degraded`** — check [githubstatus.com](https://www.githubstatus.com) before SSHing the runner or rotating anything. The runner is fine; GitHub itself is the problem.
+- **`PAT rejected with 401`** — the SSM-stored PAT was revoked, expired, or malformed. Generate a fresh fine-scoped PAT (Self-hosted runners: Read on `WXYC`) and overwrite `/wxyc-canary/gha-runner-token` via `aws ssm put-parameter --overwrite`.
+- **`PAT rejected with 403`** — same remediation as 401, but only after ruling out the rate-limit message (which also surfaces as 403).
 
 ### Alarm fires: `wxyc-canary-lambda-errors`
 

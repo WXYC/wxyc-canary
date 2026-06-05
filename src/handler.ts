@@ -36,6 +36,10 @@ function loadConfigFromEnv(): CanaryConfig {
       : undefined,
     ghaRunnerApiBase: process.env.CANARY_GHA_RUNNER_API_BASE,
     ghaRunnerOrg: process.env.CANARY_GHA_RUNNER_ORG,
+    // Pass NaN through verbatim: the check layer treats anything that isn't
+    // a positive integer as "skip with invalid-id reason", so an operator
+    // typo (e.g. CANARY_GHA_RUNNER_ID=abc → Number → NaN) surfaces as a
+    // skipped check with a precise reason rather than a misrouted 404.
     ghaRunnerId: process.env.CANARY_GHA_RUNNER_ID ? Number(process.env.CANARY_GHA_RUNNER_ID) : undefined,
     ghaRunnerToken: process.env.CANARY_GHA_RUNNER_TOKEN,
   };
@@ -143,15 +147,28 @@ export async function runCanary(config: CanaryConfig): Promise<CheckOutcome[]> {
     lmlAuthError = `LML bearer resolution failed: ${(err as Error).message}`;
   }
 
-  // GH runner PAT resolution: same shape as lml-auth — skip on absence,
-  // fail on resolve errors. SSM outage / IAM regression here would
-  // silently disable the runner-liveness probe if collapsed to "skipped".
+  // GH runner PAT resolution: skip when the probe isn't configured at all
+  // (no runner-id → check would skip anyway), fail when it IS configured
+  // and resolution errors (SSM outage / IAM regression — real signal).
+  // Asymmetric vs lml-auth on purpose: lml-auth has one knob, this probe
+  // has two; resolving the PAT when the operator forgot the runner-id half
+  // would page on-call for a probe that wouldn't have run.
   let ghaRunnerToken: string | undefined;
   let ghaRunnerTokenError: string | undefined;
-  try {
-    ghaRunnerToken = await resolveGhaRunnerToken(config);
-  } catch (err) {
-    ghaRunnerTokenError = `GH runner PAT resolution failed: ${(err as Error).message}`;
+  const probeIdConfigured =
+    typeof config.ghaRunnerId === 'number' && Number.isInteger(config.ghaRunnerId) && config.ghaRunnerId > 0;
+  if (probeIdConfigured) {
+    try {
+      ghaRunnerToken = await resolveGhaRunnerToken(config);
+    } catch (err) {
+      ghaRunnerTokenError = `GH runner PAT resolution failed: ${(err as Error).message}`;
+    }
+  } else {
+    // Still resolve the inline (env-provided) token so tests / local runs
+    // that pass `ghaRunnerToken` directly through CanaryConfig continue to
+    // work even when no runner-id is set. The check will skip; the token
+    // is just threaded through ctx for completeness.
+    ghaRunnerToken = config.ghaRunnerToken;
   }
 
   let djBearerToken: string | undefined;
@@ -185,8 +202,15 @@ export async function runCanary(config: CanaryConfig): Promise<CheckOutcome[]> {
     djUserId,
     enrichmentPollTimeoutMs: config.enrichmentPollTimeoutMs ?? DEFAULT_ENRICHMENT_POLL_TIMEOUT_MS,
     enrichmentPollIntervalMs: config.enrichmentPollIntervalMs ?? DEFAULT_ENRICHMENT_POLL_INTERVAL_MS,
-    ghaRunnerApiBase: config.ghaRunnerApiBase ?? 'https://api.github.com',
-    ghaRunnerOrg: config.ghaRunnerOrg ?? 'WXYC',
+    // `||` (not `??`) on the two string defaults so an empty-string env
+    // value also picks up the default. The CFN template wires
+    // CANARY_GHA_RUNNER_ORG unconditionally, so even probe-disabled stacks
+    // forward 'WXYC' here; but a future template change that sets either
+    // to '' (or a manual override) must NOT compose a URL like
+    // `/orgs//actions/...` and 404 with a misleading "runner replaced"
+    // failure.
+    ghaRunnerApiBase: config.ghaRunnerApiBase || 'https://api.github.com',
+    ghaRunnerOrg: config.ghaRunnerOrg || 'WXYC',
     ghaRunnerId: config.ghaRunnerId,
     ghaRunnerToken,
   };
