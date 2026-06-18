@@ -364,7 +364,8 @@ Resources:
 
   # Catches the case where the Lambda itself fails to run (timeout, crash
   # before reaching the metric publish, etc). Without this, a Lambda that
-  # never publishes metrics would let the CheckFailure alarm sit at OK.
+  # never publishes metrics would let the check-failure and infra-degraded
+  # alarms sit at OK (no data → notBreaching).
   LambdaErrorAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:

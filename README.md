@@ -204,7 +204,7 @@ aws cloudwatch get-metric-statistics \
 
 ### GitHub-issue reporting (optional)
 
-When you want canary failures to land as GitHub issues for morning triage (instead of, or in addition to, SNS email), wire a fine-scoped PAT through SSM Parameter Store and pass two stack parameters. The reporter is best-effort and non-fatal: a GitHub outage never masks the canary's primary signal (the dimensionless `CheckFailure` series). SNS + the `wxyc-canary-lambda-errors` alarm stay armed as the fallback for when the Lambda itself dies before the reporter runs.
+When you want canary failures to land as GitHub issues for morning triage (instead of, or in addition to, SNS email), wire a fine-scoped PAT through SSM Parameter Store and pass two stack parameters. The reporter is best-effort and non-fatal: a GitHub outage never masks the canary's primary signal (the `UserFacingCheckFailure` / `InfraCheckFailure` tier aggregates that back the alarms). SNS + the `wxyc-canary-lambda-errors` alarm stay armed as the fallback for when the Lambda itself dies before the reporter runs.
 
 1. Create a GitHub fine-scoped PAT:
    - Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token.
