@@ -9,6 +9,17 @@ const METRIC_NAMESPACE = 'WXYC/Canary';
 const DEFAULT_ENRICHMENT_POLL_TIMEOUT_MS = 45_000;
 const DEFAULT_ENRICHMENT_POLL_INTERVAL_MS = 2_000;
 
+/**
+ * Paging tier per check name, resolved once from the single source of truth
+ * (the `checks` array, which `handler.ts` already imports). `pagesOncall !==
+ * false` so both the default (undefined) and explicit `true` page — only an
+ * explicit `false` (the two infra probes) opts out. `publishMetrics` uses
+ * this to route each outcome into the `UserFacingCheckFailure` (page) or
+ * `InfraCheckFailure` (low-urgency) dimensionless aggregate. See
+ * wxyc-canary#48 and CLAUDE.md "Conventions".
+ */
+const pagesOncallByName = new Map<string, boolean>(checks.map((c) => [c.name, c.pagesOncall !== false]));
+
 function loadConfigFromEnv(): CanaryConfig {
   const required = (key: string): string => {
     const v = process.env[key];
@@ -365,6 +376,23 @@ async function publishMetrics(outcomes: CheckOutcome[], region: string): Promise
         Dimensions: [{ Name: 'Check', Value: o.name }],
       },
     ];
+    // Tier-split aggregate (wxyc-canary#48): route this outcome's failure
+    // value into exactly one of two dimensionless series. `UserFacingCheckFailure`
+    // backs the `wxyc-canary-check-failure` page; `InfraCheckFailure` backs the
+    // low-urgency `wxyc-canary-infra-degraded` alarm. An unknown name pages
+    // (fail-safe). These are dimensionless-only on purpose — per-surface
+    // drill-down is already served by the dimensioned `CheckFailure` above, so
+    // a `Tier` dimension or a second dimensioned emission would add cost for no
+    // benefit. `failureValue` (skipped/pass → 0) preserves skip-semantics on
+    // both tiers.
+    const userFacing = pagesOncallByName.get(o.name) ?? true;
+    base.push({
+      MetricName: userFacing ? 'UserFacingCheckFailure' : 'InfraCheckFailure',
+      Value: failureValue,
+      Unit: StandardUnit.Count,
+      Timestamp: timestamp,
+      Dimensions: [],
+    });
     if (o.metrics) {
       for (const [name, value] of Object.entries(o.metrics)) {
         const unit = unitForMetric(name);

@@ -52,3 +52,44 @@ describe('VALID_SUITES', () => {
     expect([...VALID_SUITES]).toEqual(['smoke']);
   });
 });
+
+/**
+ * Classification pin for the paging tier (`pagesOncall`). This is the
+ * load-bearing guard the noise-split (wxyc-canary#48) rests on: the
+ * `wxyc-canary-check-failure` page reads the `UserFacingCheckFailure`
+ * aggregate, which only collects checks whose `pagesOncall !== false`.
+ *
+ * `pagesOncall` defaults to true (fail-safe — a new check pages until
+ * someone explicitly opts it out), and is DELIBERATELY independent of the
+ * `suites` tag: `dj-rotation` / `dj-rotation-picker` are untagged
+ * (CLI-unreachable) yet user-facing, so they must keep the paging default.
+ * Deriving the tier from `suites` would silently demote both — the exact
+ * regression this test exists to catch.
+ */
+describe('pagesOncall — paging-tier classification', () => {
+  it('only gha-runner-online and semantic-index-search opt out of paging', () => {
+    // The infra/CI probes that flap on non-user-facing causes (runner
+    // offline; nightly explore.wxyc.org sync contention). Everything else
+    // pages. A new entry here is an intentional coverage reduction — it
+    // should arrive with a tracked follow-up, never silently.
+    const nonPaging = checks
+      .filter((c) => c.pagesOncall === false)
+      .map((c) => c.name)
+      .sort();
+    expect(nonPaging).toEqual(['gha-runner-online', 'semantic-index-search']);
+  });
+
+  it('every other check pages by default (pagesOncall !== false)', () => {
+    // Explicitly assert the two untagged-but-user-facing checks keep the
+    // paging default — they are the ones a `suites`-derived tier would drop.
+    const paging = new Set(checks.filter((c) => c.pagesOncall !== false).map((c) => c.name));
+    expect(paging).toContain('dj-rotation');
+    expect(paging).toContain('dj-rotation-picker');
+    // The 7 user-facing checks + enrichment-quality (writes; pages by
+    // default though it skips in prod) all page; only the 2 infra checks
+    // are excluded.
+    expect(checks.length - paging.size).toBe(2);
+    expect(paging.has('gha-runner-online')).toBe(false);
+    expect(paging.has('semantic-index-search')).toBe(false);
+  });
+});

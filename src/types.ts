@@ -36,6 +36,18 @@ export type Check = {
    */
   suites?: readonly Suite[];
   /**
+   * Whether a failure of this check pages the operator via the
+   * `wxyc-canary-check-failure` alarm. Default true (fail-safe: a new check
+   * pages until explicitly opted out). Set false ONLY for infra/CI probes
+   * that are not DJ-facing surfaces — currently `gha-runner-online` and
+   * `semantic-index-search`. Explicit, type-checked, and deliberately NOT
+   * derived from `suites`: the untagged `dj-rotation` / `dj-rotation-picker`
+   * are user-facing and must keep the true default. Routes the failure into
+   * the `UserFacingCheckFailure` (page) vs `InfraCheckFailure` (low-urgency)
+   * dimensionless aggregate in `publishMetrics`.
+   */
+  pagesOncall?: boolean;
+  /**
    * The actual probe. Throws on failure with a message that's safe to alert
    * on. May optionally return a `CheckResult` carrying custom metrics the
    * runner should publish (see CheckResult docs).

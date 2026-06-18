@@ -1213,6 +1213,201 @@ describe('publishMetrics — dimensioned + dimensionless emit-twice', () => {
 });
 
 /**
+ * Tier split (wxyc-canary#48). The `wxyc-canary-check-failure` page reads
+ * the `UserFacingCheckFailure` aggregate; `wxyc-canary-infra-degraded`
+ * reads `InfraCheckFailure`. Both are dimensionless-only (per-surface
+ * drill-down is already served by the dimensioned `CheckFailure`). Each
+ * check contributes exactly one aggregate datum, routed by `pagesOncall`:
+ * `gha-runner-online` and `semantic-index-search` → `InfraCheckFailure`,
+ * everything else → `UserFacingCheckFailure`. The alarms use
+ * `Statistic: Maximum`, so the contract these tests pin is "the max of the
+ * tier's dimensionless series over the run".
+ */
+describe('publishMetrics — tier split (UserFacingCheckFailure / InfraCheckFailure)', () => {
+  // All aggregate emissions are dimensionless; filter by name and read values.
+  const tierMax = (metrics: MetricDatum[], name: string): number => {
+    const values = metrics.filter((d) => d.MetricName === name).map((d) => d.Value ?? 0);
+    return values.length === 0 ? Number.NaN : Math.max(...values);
+  };
+  const tierValues = (metrics: MetricDatum[], name: string): number[] =>
+    metrics.filter((d) => d.MetricName === name).map((d) => d.Value ?? 0);
+  // The dimensioned CheckFailure carries `Check=<name>`, so it tells us
+  // *which* check failed without reaching into the handler's log line.
+  const dimensionedFailureValue = (metrics: MetricDatum[], checkName: string): number | undefined =>
+    metrics.find(
+      (d) =>
+        d.MetricName === 'CheckFailure' &&
+        (d.Dimensions ?? []).some((dim) => dim.Name === 'Check' && dim.Value === checkName)
+    )?.Value;
+
+  beforeEach(() => {
+    cloudWatchSendMock.mockClear();
+    process.env.CANARY_BACKEND_URL = 'https://api.example.test';
+    process.env.CANARY_AUTH_URL = 'https://auth.example.test';
+    process.env.CANARY_SEMANTIC_INDEX_URL = 'https://explore.example.test';
+    process.env.CANARY_PUBLISH_METRICS = 'true';
+    delete process.env.CANARY_DJ_EMAIL;
+    delete process.env.CANARY_DJ_PASSWORD;
+    delete process.env.CANARY_DJ_SECRET_ARN;
+    delete process.env.CANARY_GHA_RUNNER_API_BASE;
+    delete process.env.CANARY_GHA_RUNNER_ORG;
+    delete process.env.CANARY_GHA_RUNNER_ID;
+    delete process.env.CANARY_GHA_RUNNER_TOKEN;
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    delete process.env.CANARY_BACKEND_URL;
+    delete process.env.CANARY_AUTH_URL;
+    delete process.env.CANARY_SEMANTIC_INDEX_URL;
+    delete process.env.CANARY_PUBLISH_METRICS;
+    delete process.env.CANARY_DJ_EMAIL;
+    delete process.env.CANARY_DJ_PASSWORD;
+    delete process.env.CANARY_GHA_RUNNER_API_BASE;
+    delete process.env.CANARY_GHA_RUNNER_ORG;
+    delete process.env.CANARY_GHA_RUNNER_ID;
+    delete process.env.CANARY_GHA_RUNNER_TOKEN;
+  });
+
+  // Replay of the 2026-06-17 22:30 page: the staging-gate runner went
+  // offline. Infra failure must NOT trip the user-facing page.
+  it('does not page when only gha-runner-online fails (runner offline → InfraCheckFailure, not UserFacingCheckFailure)', async () => {
+    process.env.CANARY_GHA_RUNNER_API_BASE = 'https://gha.example.test';
+    process.env.CANARY_GHA_RUNNER_ORG = 'WXYC';
+    process.env.CANARY_GHA_RUNNER_ID = '250';
+    process.env.CANARY_GHA_RUNNER_TOKEN = 'fake-gha-pat';
+    setUpFetchMock({
+      '/healthcheck': { status: 200, body: { ok: true } },
+      '/graph/artists/search': { status: 200, body: { results: [{ id: 1, canonical_name: 'stereolab' }] } },
+      'gha.example.test/orgs/WXYC/actions/runners/250': {
+        status: 200,
+        body: { id: 250, name: 'wxyc-e2e-runner', status: 'offline' },
+      },
+    });
+
+    await expect(handler()).rejects.toThrow(/canary failed/);
+    const metrics = getPublishedMetrics();
+
+    // The runner check is the failing one…
+    expect(dimensionedFailureValue(metrics, 'gha-runner-online')).toBe(1);
+    // …but no user-facing check failed → the page series stays flat at 0.
+    expect(tierMax(metrics, 'UserFacingCheckFailure')).toBe(0);
+    // The infra series carries exactly the runner's failure.
+    expect(tierMax(metrics, 'InfraCheckFailure')).toBe(1);
+    expect(tierValues(metrics, 'InfraCheckFailure').filter((v) => v === 1)).toHaveLength(1);
+  });
+
+  // DP1: the nightly ~09:00 UTC explore.wxyc.org blip. Real availability
+  // probe, but not a DJ-on-air path — demoted to infra so it stops paging.
+  it('does not page when only semantic-index-search fails (nightly blip → InfraCheckFailure)', async () => {
+    setUpFetchMock({
+      '/healthcheck': { status: 200, body: { ok: true } },
+      // Missing `results` envelope — the shape regression the check catches.
+      '/graph/artists/search': { status: 200, body: { something_else: [] } },
+    });
+
+    await expect(handler()).rejects.toThrow(/canary failed/);
+    const metrics = getPublishedMetrics();
+
+    expect(dimensionedFailureValue(metrics, 'semantic-index-search')).toBe(1);
+    expect(tierMax(metrics, 'UserFacingCheckFailure')).toBe(0);
+    expect(tierMax(metrics, 'InfraCheckFailure')).toBe(1);
+    expect(tierValues(metrics, 'InfraCheckFailure').filter((v) => v === 1)).toHaveLength(1);
+  });
+
+  // The two untagged-but-user-facing checks must each page on their own.
+  // Distinct cases catch a name mix-up or one being commented out; the
+  // classification-pin test in checks.test.ts guards the tier assignment.
+  it.each([
+    {
+      name: 'dj-rotation',
+      // A non-array rotation body fails dj-rotation (and, as a side effect,
+      // the picker's precondition). dj-rotation is the asserted failure.
+      mocks: {
+        '/library/?artist_name=': { status: 200, body: stereolabSearchResults },
+        '/flowsheet': { status: 200, body: [] },
+        '/library/rotation': { status: 200, body: { not: 'an array' } },
+      } as Record<string, { status: number; body: unknown }>,
+    },
+    {
+      name: 'dj-rotation-picker',
+      // Rotation list is healthy (dj-rotation passes); the picker's
+      // /tracks fetch 502s — the BS#994/#1030 cascade-to-502 class, in
+      // isolation.
+      mocks: {
+        '/library/?artist_name=': { status: 200, body: stereolabSearchResults },
+        '/flowsheet': { status: 200, body: [] },
+        '/library/rotation/4242/tracks': { status: 502, body: { message: 'LML cascade timed out' } },
+        '/library/rotation': { status: 200, body: [{ id: 4242 }] },
+      } as Record<string, { status: number; body: unknown }>,
+    },
+  ])('pages when only $name fails (untagged but user-facing)', async ({ name, mocks }) => {
+    process.env.CANARY_DJ_EMAIL = 'canary@wxyc.org';
+    process.env.CANARY_DJ_PASSWORD = 'pw';
+    setUpFetchMock({
+      '/healthcheck': { status: 200, body: { ok: true } },
+      '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+      '/graph/artists/search': { status: 200, body: { results: [{ id: 1, canonical_name: 'stereolab' }] } },
+      '/sign-in/email': { status: 200, body: { token: 'fake-session-token', user: { id: 'u1' } } },
+      '/token': { status: 200, body: { token: 'fake-jwt' } },
+      ...mocks,
+    });
+
+    await expect(handler()).rejects.toThrow(/canary failed/);
+    const metrics = getPublishedMetrics();
+
+    // The named check is the one that failed (guards against a name mix-up
+    // or the check being commented out of the array).
+    expect(dimensionedFailureValue(metrics, name)).toBe(1);
+    // The page fires (UserFacingCheckFailure trips), and no infra page does.
+    expect(tierMax(metrics, 'UserFacingCheckFailure')).toBe(1);
+    expect(tierMax(metrics, 'InfraCheckFailure')).toBe(0);
+  });
+
+  // Replay of the 2026-06-15 / 2026-06-16 7-check blips: a genuine
+  // user-facing surface 5xx'd → the page MUST fire.
+  it('pages when a user-facing check fails (backend-healthcheck 500 → UserFacingCheckFailure)', async () => {
+    setUpFetchMock({
+      '/healthcheck': { status: 500, body: { error: 'oops' } },
+      '/graph/artists/search': { status: 200, body: { results: [{ id: 1, canonical_name: 'stereolab' }] } },
+    });
+
+    await expect(handler()).rejects.toThrow(/canary failed/);
+    const metrics = getPublishedMetrics();
+
+    expect(dimensionedFailureValue(metrics, 'backend-healthcheck')).toBe(1);
+    expect(tierMax(metrics, 'UserFacingCheckFailure')).toBe(1);
+    // Infra series stays flat — semantic passes and the runner check skips.
+    expect(tierMax(metrics, 'InfraCheckFailure')).toBe(0);
+  });
+
+  // Skip is not a failure on EITHER tier. With no DJ creds / LML key /
+  // runner id, the auth + write + runner checks all skip; the aggregate
+  // contributions must be 0 (CheckSkipped semantics preserved).
+  it('emits 0 on both tiers when every check passes or skips', async () => {
+    setUpFetchMock({
+      '/healthcheck': { status: 200, body: { ok: true } },
+      '/graph/artists/search': { status: 200, body: { results: [{ id: 1, canonical_name: 'stereolab' }] } },
+    });
+
+    await handler();
+    const metrics = getPublishedMetrics();
+
+    // 8 paging checks (7 user-facing + enrichment-quality), 2 infra checks;
+    // every aggregate datum is dimensionless and 0.
+    expect(tierValues(metrics, 'UserFacingCheckFailure')).toHaveLength(8);
+    expect(tierValues(metrics, 'InfraCheckFailure')).toHaveLength(2);
+    expect(tierMax(metrics, 'UserFacingCheckFailure')).toBe(0);
+    expect(tierMax(metrics, 'InfraCheckFailure')).toBe(0);
+    // The aggregates are dimensionless-only — no `Check`-dimensioned twin.
+    const aggregates = metrics.filter(
+      (d) => d.MetricName === 'UserFacingCheckFailure' || d.MetricName === 'InfraCheckFailure'
+    );
+    expect(aggregates.every((d) => !d.Dimensions || d.Dimensions.length === 0)).toBe(true);
+  });
+});
+
+/**
  * Catches the wxyc-canary#13 drift class: an alarm in `template.yaml` that
  * targets a (Namespace, MetricName, Dimensions) tuple the Lambda never
  * actually publishes. The alarm definition (YAML) and metric emission (TS)

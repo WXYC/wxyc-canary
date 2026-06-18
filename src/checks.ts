@@ -59,6 +59,13 @@ const semanticIndexSearch: Check = {
   name: 'semantic-index-search',
   description: 'GET /graph/artists/search on explore.wxyc.org',
   requiresAuth: false,
+  // Infra/non-paging tier (wxyc-canary#48 DP1): a real availability probe of
+  // explore.wxyc.org, but not a DJ-on-air path, and it flaps every night
+  // ~09:00 UTC on semantic-index sync/rebuild contention. CloudWatch metric
+  // alarms can't suppress a known time-of-day window, so failures route to
+  // `InfraCheckFailure` (low-urgency) rather than the page. The nightly
+  // contention is tracked as a follow-up — see README "What it checks".
+  pagesOncall: false,
   run: async (ctx) => {
     const r = await canaryFetch(
       `${ctx.semanticIndexUrl}/graph/artists/search?q=${encodeURIComponent(PROBE_ARTIST)}&limit=1`
@@ -330,6 +337,13 @@ const ghaRunnerOnline: Check = {
   name: 'gha-runner-online',
   description: 'GET /orgs/{org}/actions/runners/{id} — staging-gate runner liveness',
   requiresAuth: false,
+  // Infra/non-paging tier (wxyc-canary#48 DP2): the self-hosted CI runner is
+  // an operator concern, not a DJ-facing surface, and a runner offline (or a
+  // PAT/rate-limit hiccup) shouldn't page on-call at 3am. Failures route to
+  // `InfraCheckFailure` and the low-urgency `wxyc-canary-infra-degraded`
+  // alarm. The probe is still valuable — it catches a queued staging-gate
+  // job waiting on a dead runner that GitHub itself never notifies on.
+  pagesOncall: false,
   run: async (ctx): Promise<CheckResult | void> => {
     // Check the runner-id sentinel before the token: when both are missing
     // the id is the load-bearing knob (a configured probe without a token
@@ -506,11 +520,21 @@ void _exhaustivenessCheck;
 
 /**
  * Return the checks tagged with the given suite. Untagged checks (no
- * `suites` field) are unreachable from the CLI by design — they're the
- * Lambda-only checks (prod-only operator concerns like `gha-runner-online`,
- * writes like `enrichment-quality`, scope-mismatched probes like
- * `semantic-index-search` that hits a different service). The Lambda
- * continues to consume the full `checks` array directly.
+ * `suites` field) are unreachable from the CLI by design. "Untagged" reflects
+ * CLI-reachability ONLY, and that axis is independent of the paging tier:
+ *
+ *   (1) CLI-reachability — some untagged checks are prod-only operator
+ *       concerns (`gha-runner-online`), writes (`enrichment-quality`), or
+ *       probe a different service (`semantic-index-search`); the staging-gate
+ *       CLI has no business running them.
+ *   (2) Paging tier — `dj-rotation` and `dj-rotation-picker` are ALSO untagged
+ *       (left out of `smoke` for staging-gate flakiness reasons) but are
+ *       genuinely user-facing and page on-call.
+ *
+ * So the `suites` tag is a CLI-reachability axis only; paging tier is
+ * determined by `pagesOncall` in the check definition (default true; false
+ * only for the two infra probes). The Lambda continues to consume the full
+ * `checks` array directly, regardless of suite tags.
  */
 export function checksForSuite(suite: Suite): readonly Check[] {
   return checks.filter((c) => c.suites?.includes(suite));
