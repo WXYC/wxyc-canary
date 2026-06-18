@@ -554,7 +554,9 @@ describe('runCanary — lml-auth check (BS#1094 layer 1)', () => {
  * GitHub Actions runner that backs the staging-gate suites (Backend-Service,
  * library-metadata-lookup, dj-site). Wired up as part of WXYC/wiki#80
  * phase 1 acceptance: the bootstrap script and runbook (wxyc-shared#167)
- * stand the runner up; this check pages on-call when it stops checking in.
+ * stand the runner up; this check is infra-tier (`pagesOncall: false`), so
+ * when the runner stops checking in it raises the low-urgency
+ * `wxyc-canary-infra-degraded` alarm, not the on-call page.
  *
  * Probe shape: `GET /orgs/{org}/actions/runners/{id}` with a fine-scoped
  * PAT. The API returns `{status: "online" | "offline", busy: bool, ...}`.
@@ -745,7 +747,7 @@ describe('runCanary — gha-runner-online check (runner liveness probe, wiki#80 
     expect(url).toBe('https://gha.example.test/orgs/WXYC/actions/runners/250');
     // The check must use GET. The lml-auth check this one was modeled on uses
     // POST; pin the method so a copy-paste refactor that swaps it doesn't
-    // silently start 404'ing in prod with a 'runner was likely replaced' page.
+    // silently start 404'ing in prod with a 'runner was likely replaced' alarm.
     expect(String(init?.method ?? 'GET').toUpperCase()).toBe('GET');
     const headers = (init?.headers ?? {}) as Record<string, string>;
     expect(headers.Authorization).toBe('Bearer fake-gha-pat');
@@ -883,9 +885,9 @@ describe('runCanary — gha-runner-online check (runner liveness probe, wiki#80 
     expect(url).toBe('https://gha.example.test/orgs/WXYC/actions/runners/250');
   });
 
-  it('does not attempt SSM PAT resolution when no runner id is configured (half-configured probe must not page)', async () => {
+  it('does not attempt SSM PAT resolution when no runner id is configured (half-configured probe must not alarm)', async () => {
     // Half-configured-probe defense: a deploy that sets the SSM token param
-    // but forgets the runner-id parameter should NOT page on-call when SSM
+    // but forgets the runner-id parameter should NOT raise an alarm when SSM
     // glitches transiently. The runner-id is the load-bearing gate; without
     // it the probe wouldn't run anyway, so SSM resolution must be SKIPPED
     // entirely. Pins both the resulting outcome AND that no SSM call was
@@ -1113,14 +1115,16 @@ function getPublishedMetrics(): MetricDatum[] {
 }
 
 /**
- * The `wxyc-canary-check-failure` alarm targets a plain
- * `Namespace=WXYC/Canary, MetricName=CheckFailure` series with no Dimensions
- * filter. CloudWatch alarms cannot use `SUM(SEARCH(...))` (issue #13), so
- * the canary publishes each `CheckFailure` datapoint twice: once with the
- * `Check` dimension (for dashboards / slicing) and once dimensionless (so a
- * plain alarm aggregates across every check). These regressions pin both
- * emissions, the failure-case value flow, and the dimensioned-only contract
- * for `CheckSkipped` / `CheckLatency` (alarming on those would be noise).
+ * `CheckFailure` is published twice: once with the `Check` dimension (for
+ * dashboards / slicing) and once dimensionless. CloudWatch alarms cannot use
+ * `SUM(SEARCH(...))` (issue #13), so emit-twice is how a plain-form alarm
+ * reads a metric we also publish dimensioned. Post-#48 the dimensionless
+ * `CheckFailure` is a dashboard-only rollup — no alarm reads it; the page
+ * reads the `UserFacingCheckFailure` aggregate (covered by the
+ * `publishMetrics — tier split` block below). These regressions pin both
+ * `CheckFailure` emissions, the failure-case value flow, and the
+ * dimensioned-only contract for `CheckSkipped` / `CheckLatency` (alarming on
+ * those would be noise).
  */
 describe('publishMetrics — dimensioned + dimensionless emit-twice', () => {
   beforeEach(() => {

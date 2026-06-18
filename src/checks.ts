@@ -333,7 +333,9 @@ const lmlAuth: Check = {
  *
  * Skip semantics mirror `lml-auth` / DJ credentials: missing PAT or
  * runner-id is an operator gap (alarm stays quiet), but a downstream
- * resolution error fails (real signal, paged).
+ * resolution error fails (real signal — surfaced on the low-urgency
+ * `wxyc-canary-infra-degraded` alarm, not the page, since this check is
+ * `pagesOncall: false`).
  */
 const ghaRunnerOnline: Check = {
   name: 'gha-runner-online',
