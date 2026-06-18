@@ -81,4 +81,5 @@ jobs:
               LmlApiKeySecretArn=${{ secrets.LML_API_KEY_SECRET_ARN }} \
               DjCredentialsSecretArn=${{ secrets.DJ_CREDENTIALS_SECRET_ARN }} \
               AlertEmail=${{ vars.ALERT_EMAIL }} \
+              InfraAlertEmail=${{ vars.INFRA_ALERT_EMAIL }} \
               "${PROBE_ARGS[@]}"

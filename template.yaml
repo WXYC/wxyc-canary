@@ -46,9 +46,22 @@ Parameters:
     Type: String
     Default: ''
     Description: >
-      Optional email address subscribed to the alarm SNS topic. Leave
-      empty to manage subscriptions outside this stack (e.g., wire to a
-      Slack webhook via a separate subscription).
+      Optional email address subscribed to the user-facing-outage page
+      (`wxyc-canary-check-failure`, via `AlertTopic`). Leave empty to manage
+      subscriptions outside this stack (e.g., wire to a Slack webhook via a
+      separate subscription).
+  InfraAlertEmail:
+    Type: String
+    Default: ''
+    Description: >
+      Optional email address subscribed to the low-urgency
+      infra-degraded alarm (`wxyc-canary-infra-degraded`, via
+      `InfraAlertTopic`) — the tier that catches a CI-runner offline or a
+      nightly explore.wxyc.org blip without paging on-call (wxyc-canary#48
+      DP2). Leave empty (the default) for console-only: the alarm still
+      transitions in CloudWatch but nothing is notified. Set it to a
+      filtered alias to get low-urgency email without a code change. An
+      empty value is an accepted gap, not a silent one — record it.
   ScheduleExpression:
     Type: String
     Default: rate(5 minutes)
@@ -130,6 +143,7 @@ Conditions:
   HasDjCredentials: !Not [!Equals [!Ref DjCredentialsSecretArn, '']]
   HasLmlApiKey: !Not [!Equals [!Ref LmlApiKeySecretArn, '']]
   HasAlertEmail: !Not [!Equals [!Ref AlertEmail, '']]
+  HasInfraAlertEmail: !Not [!Equals [!Ref InfraAlertEmail, '']]
   HasGitHubReporter: !And
     - !Not [!Equals [!Ref GitHubTokenSsmParamName, '']]
     - !Not [!Equals [!Ref GitHubIssuesRepo, '']]
@@ -232,19 +246,45 @@ Resources:
       Protocol: email
       Endpoint: !Ref AlertEmail
 
-  # Aggregated check-failure alarm. Fires when any check has reported a
+  # Separate low-urgency channel for the infra/CI tier (wxyc-canary#48 DP2).
+  # Kept distinct from AlertTopic so the page (`wxyc-canary-check-failure`)
+  # stays clean while the infra signal — runner offline, nightly
+  # explore.wxyc.org blip — remains a config toggle (subscribe `InfraAlertEmail`)
+  # rather than a redeploy. SNS topics are free; an unsubscribed topic is
+  # console-only (the alarm transitions in CloudWatch, nothing is notified).
+  InfraAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: wxyc-canary-infra-alerts
+      DisplayName: WXYC Canary Infra Alerts (low-urgency)
+
+  InfraAlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasInfraAlertEmail
+    Properties:
+      TopicArn: !Ref InfraAlertTopic
+      Protocol: email
+      Endpoint: !Ref InfraAlertEmail
+
+  # User-facing-outage page. Fires when any USER-FACING check has reported a
   # failure 2 of the last 3 evaluations (~10 minutes at the 5-minute schedule),
   # which avoids alerting on a single transient blip while still catching
-  # sustained outages quickly. Targets the dimensionless CheckFailure series
-  # the Lambda publishes alongside the per-check one — see CLAUDE.md
-  # "Conventions" for why this isn't a SUM(SEARCH(...)) alarm.
+  # sustained outages quickly. Targets the dimensionless `UserFacingCheckFailure`
+  # aggregate (wxyc-canary#48) — every check except the two infra/CI probes
+  # (`gha-runner-online`, `semantic-index-search`, tagged `pagesOncall: false`)
+  # contributes to it. Those two route to `InfraCheckFailure` /
+  # `wxyc-canary-infra-degraded` below so a runner-offline or nightly
+  # explore.wxyc.org blip no longer pages on-call and trains it to ignore the
+  # page. See CLAUDE.md "Conventions" for the tier split and for why this isn't
+  # a SUM(SEARCH(...)) alarm. AlarmName kept as `wxyc-canary-check-failure` so
+  # pinned dashboards / runbook references survive the metric repoint.
   CheckFailureAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
       AlarmName: wxyc-canary-check-failure
-      AlarmDescription: One or more WXYC canary checks have been failing.
+      AlarmDescription: One or more user-facing WXYC canary checks have been failing.
       Namespace: WXYC/Canary
-      MetricName: CheckFailure
+      MetricName: UserFacingCheckFailure
       Statistic: Maximum
       Period: 300
       EvaluationPeriods: 3
@@ -256,6 +296,33 @@ Resources:
         - !Ref AlertTopic
       OKActions:
         - !Ref AlertTopic
+
+  # Low-urgency infra/CI tier alarm (wxyc-canary#48 DP2). Same 2-of-3 ×
+  # 5-min Maximum shape as the page, but targets the dimensionless
+  # `InfraCheckFailure` aggregate — the series the two `pagesOncall: false`
+  # probes (`gha-runner-online`, `semantic-index-search`) contribute to.
+  # Wired to `InfraAlertTopic` (NOT `AlertTopic`) so it never trips the
+  # user-facing page; with `InfraAlertEmail` empty the topic is unsubscribed
+  # and the alarm is console-only. The contract test in test/handler.test.ts
+  # pins that this alarm targets a metric shape the handler actually emits.
+  InfraDegradedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: wxyc-canary-infra-degraded
+      AlarmDescription: A WXYC canary infra/CI probe (runner liveness / semantic-index) has been failing.
+      Namespace: WXYC/Canary
+      MetricName: InfraCheckFailure
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref InfraAlertTopic
+      OKActions:
+        - !Ref InfraAlertTopic
 
   # Enrichment-quality SLO alarm. Targets the dimensionless EnrichmentLag
   # series emitted by the `enrichment-quality` write canary. Threshold and
@@ -356,4 +423,7 @@ Outputs:
     Value: !GetAtt CanaryFunction.Arn
   AlertTopicArn:
     Value: !Ref AlertTopic
-    Description: Subscribe additional endpoints (Slack webhook, PagerDuty, etc.) to this topic.
+    Description: User-facing-outage page topic. Subscribe additional endpoints (Slack webhook, PagerDuty, etc.) here.
+  InfraAlertTopicArn:
+    Value: !Ref InfraAlertTopic
+    Description: Low-urgency infra/CI tier topic (wxyc-canary#48 DP2). Subscribe a filtered alias or Slack channel for non-paging signal.

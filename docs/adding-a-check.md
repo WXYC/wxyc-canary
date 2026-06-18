@@ -5,6 +5,14 @@
 3. `npm run typecheck && npm test`.
 4. Open a PR. CI runs the same checks before deploy.
 
+## Paging tier
+
+A new check **pages on-call by default** — it joins the `UserFacingCheckFailure` aggregate behind the `wxyc-canary-check-failure` alarm. That's the fail-safe: a DJ-facing surface is the common case, so you have to opt out, not opt in.
+
+Only opt out if the check probes infra/CI rather than a DJ-on-air surface — set `pagesOncall: false` on the check definition. Its failure then routes to the low-urgency `InfraCheckFailure` aggregate / `wxyc-canary-infra-degraded` alarm instead, which is console-only unless `InfraAlertEmail` is subscribed. Today only `gha-runner-online` and `semantic-index-search` are opted out. **`pagesOncall` is independent of `suites`** — leaving a check out of the `smoke` suite (CLI-unreachable) does NOT demote it from paging; `dj-rotation` and `dj-rotation-picker` are both untagged yet page.
+
+Demoting a check to the infra tier reduces paging coverage of whatever it probes — file a tracked follow-up for the underlying flakiness rather than letting the demotion swallow it silently. The classification-pin test in `test/checks.test.ts` will fail until you update its expected opt-out set, which is the intended speed bump.
+
 ## Tests cover
 
 - All anonymous checks pass when upstreams behave; DJ-auth checks skip without creds.
