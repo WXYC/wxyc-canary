@@ -21,6 +21,8 @@ The canary exists because three production incidents on 2026-04-30 (catalog-sear
 
 DJ-auth checks downgrade to `skipped` (a distinct CloudWatch metric, not `failed`) when no DJ credentials are configured, so the alarm doesn't fire on operator-caused gaps. The `lml-auth` check follows the same shape: it skips when no `LML_API_KEY` is configured. The `gha-runner-online` check skips when no GitHub PAT or runner id is configured. The `enrichment-quality` write canary additionally requires `CANARY_ENABLE_WRITE_PROBE=true` and skips when another DJ is on-air — the canary deliberately doesn't inject sentinel rows into a real DJ's flowsheet.
 
+**Paging tier (wxyc-canary#48).** Not every failing check should page on-call. Eight of these checks are user-facing and **page** via `wxyc-canary-check-failure`: `backend-healthcheck`, `proxy-library-search`, `dj-library-search`, `dj-flowsheet-read`, `dj-rotation`, `dj-rotation-picker`, `lml-auth`, and `enrichment-quality` (which pages only if the write probe is enabled and its insert fails). Two are infra/CI probes and **don't page** — they route to the low-urgency `wxyc-canary-infra-degraded` alarm instead: `gha-runner-online` (the self-hosted CI runner is an operator concern, not a DJ-on-air path) and `semantic-index-search` (a real explore.wxyc.org availability probe, but it flaps every night ~09:00 UTC on semantic-index sync/rebuild contention, and CloudWatch can't suppress a known time-of-day window). The tier is set by the explicit `pagesOncall` field on each check (default `true`), **not** by suite membership — `dj-rotation` / `dj-rotation-picker` are untagged for CLI reasons but still page. **Accepted gap:** demoting `semantic-index-search` gives up paging coverage of a real surface; the nightly contention is tracked as a separate follow-up to root-cause. **Accepted gap:** the infra tier is **console-only until `InfraAlertEmail` is set** — leaving it empty means `wxyc-canary-infra-degraded` transitions in CloudWatch but notifies nobody.
+
 ## Architecture
 
 ```
@@ -36,8 +38,8 @@ EventBridge Scheduler (rate(5 minutes))
 ```
 
 - One Lambda invocation per schedule. All checks run in parallel; one failure does not short-circuit the others.
-- Per-check metrics: `CheckFailure`, `CheckSkipped`, `CheckLatency`, all dimensioned on `Check=<name>`. Plus `EnrichmentLagSeconds` from the v1 write canary (dimensioned + dimensionless).
-- Three alarms: `wxyc-canary-check-failure` (any check failed in 2 of last 3 evaluations), `wxyc-canary-enrichment-lag` (sentinel row took > 30 s to enrich for 3 consecutive evaluations), and `wxyc-canary-lambda-errors` (Lambda crashed before publishing metrics).
+- Per-check metrics: `CheckFailure`, `CheckSkipped`, `CheckLatency`, all dimensioned on `Check=<name>`. Plus `EnrichmentLagSeconds` from the v1 write canary (dimensioned + dimensionless). Two dimensionless-only aggregates route failures by paging tier: `UserFacingCheckFailure` and `InfraCheckFailure` (see "Paging tier" above).
+- Four alarms: `wxyc-canary-check-failure` (a **user-facing** check failed in 2 of last 3 evaluations → `AlertTopic`), `wxyc-canary-infra-degraded` (an **infra/CI** probe failed, same 2-of-3 window → low-urgency `InfraAlertTopic`), `wxyc-canary-enrichment-lag` (sentinel row took > 30 s to enrich for 3 consecutive evaluations), and `wxyc-canary-lambda-errors` (Lambda crashed before publishing metrics).
 
 ## Local development
 
@@ -284,6 +286,7 @@ To turn the probe off, redeploy with an empty `GhaRunnerTokenSsmParamName` or `G
 Required GitHub variables (override defaults if needed):
 
 - `BACKEND_URL`, `AUTH_URL`, `SEMANTIC_INDEX_URL`, `ALERT_EMAIL`
+- `INFRA_ALERT_EMAIL` — optional low-urgency recipient for `wxyc-canary-infra-degraded` (the infra/CI tier, wxyc-canary#48). Leave unset for console-only; set it to a filtered alias to get non-paging email. An empty value is an accepted gap, not a silent one.
 
 Optional GitHub variables for the runner-liveness probe (when all three are set the next deploy enables `gha-runner-online`; leave unset to keep it skipped):
 
@@ -295,21 +298,25 @@ Optional GitHub variables for the runner-liveness probe (when all three are set 
 
 ### Alarm fires: `wxyc-canary-check-failure`
 
-1. Open CloudWatch → Metrics → `WXYC/Canary` → `CheckFailure`. The `Check` dimension names which surface is broken.
-2. Tail the canary log: `aws logs tail /aws/lambda/wxyc-canary --since 30m`. Each invocation prints a JSON line with all six outcomes.
+This is the **user-facing-outage page** — a DJ-facing surface has been failing for ~10 minutes. (Infra/CI probes route to `wxyc-canary-infra-degraded` instead; see below.)
+
+1. Open CloudWatch → Metrics → `WXYC/Canary` → `CheckFailure`, filtered to the `Check` dimension, to see which surface is broken. (The alarm itself reads the dimensionless `UserFacingCheckFailure` aggregate, which names the tier but not the specific check — the dimensioned `CheckFailure` is the drill-down.)
+2. Tail the canary log: `aws logs tail /aws/lambda/wxyc-canary --since 30m`. Each invocation prints a JSON line with all check outcomes.
 3. Reproduce the failing endpoint manually (the `description` column above tells you the URL).
 4. If the failure is real, page the on-call. If the canary itself is buggy, file an issue and disable the check by removing it from `src/checks.ts`.
 
-### Alarm fires: `wxyc-canary-check-failure` (`Check=gha-runner-online`)
+### Alarm fires: `wxyc-canary-infra-degraded`
 
-The staging-gate runner has been failing its liveness probe for ≥10 minutes. The check message distinguishes the failure mode — route accordingly:
+The low-urgency infra/CI tier (wxyc-canary#48) — `gha-runner-online` or `semantic-index-search` has been failing for ≥10 minutes. This does **not** page; it notifies `InfraAlertTopic` only (and only when `InfraAlertEmail` is subscribed). Check the dimensioned `CheckFailure` to see which probe fired.
 
-- **`offline`** — the runner process stopped polling GitHub. SSH to `wxyc-e2e-runner` (per wxyc-shared `scripts/e2e-runner/README.md`) and check `systemctl status 'actions.runner.*.service'`. If the host itself is unreachable, the EC2 instance is wedged — reboot or rebuild from the bootstrap script.
-- **`404 — runner was likely replaced (or PAT lacks Self-hosted runners: Read scope)`** — two-step diagnosis: (1) Confirm the runner id is still current with `gh api /orgs/WXYC/actions/runners --jq '.runners[] | select(.name=="wxyc-e2e-runner")'`. If the id changed, redeploy with the new `GhaRunnerId`. (2) If the id is unchanged, the PAT is missing the `Self-hosted runners: Read` org-level permission — GitHub returns 404 to hide resources from underprivileged tokens. Generate a fresh fine-scoped PAT with the correct scope and overwrite `/wxyc-canary/gha-runner-token`.
-- **`GitHub rate limit exceeded — the PAT is valid`** — do NOT rotate the PAT. The 5000/hr REST bucket is shared across everything the PAT identity touches; wait for the reset epoch in the message and investigate any other tooling that may share the token.
-- **`GitHub API degraded`** — check [githubstatus.com](https://www.githubstatus.com) before SSHing the runner or rotating anything. The runner is fine; GitHub itself is the problem.
-- **`PAT rejected with 401`** — the SSM-stored PAT was revoked, expired, or malformed. Generate a fresh fine-scoped PAT (Self-hosted runners: Read on `WXYC`) and overwrite `/wxyc-canary/gha-runner-token` via `aws ssm put-parameter --overwrite`.
-- **`PAT rejected with 403`** — same remediation as 401, but only after ruling out the rate-limit message (which also surfaces as 403).
+- **`semantic-index-search`** — explore.wxyc.org's Graph API is 5xx'ing or returning a malformed envelope. If the timestamp is the nightly ~09:00 UTC window, this is most likely the known semantic-index sync/rebuild contention on the t3.small (the tracked follow-up) — confirm and move on. Off-window or sustained failures mean a real explore.wxyc.org outage; check the semantic-index EC2 host and logs.
+- **`gha-runner-online`** — the staging-gate runner has been failing its liveness probe. The check message distinguishes the failure mode — route accordingly:
+  - **`offline`** — the runner process stopped polling GitHub. SSH to `wxyc-e2e-runner` (per wxyc-shared `scripts/e2e-runner/README.md`) and check `systemctl status 'actions.runner.*.service'`. If the host itself is unreachable, the EC2 instance is wedged — reboot or rebuild from the bootstrap script.
+  - **`404 — runner was likely replaced (or PAT lacks Self-hosted runners: Read scope)`** — two-step diagnosis: (1) Confirm the runner id is still current with `gh api /orgs/WXYC/actions/runners --jq '.runners[] | select(.name=="wxyc-e2e-runner")'`. If the id changed, redeploy with the new `GhaRunnerId`. (2) If the id is unchanged, the PAT is missing the `Self-hosted runners: Read` org-level permission — GitHub returns 404 to hide resources from underprivileged tokens. Generate a fresh fine-scoped PAT with the correct scope and overwrite `/wxyc-canary/gha-runner-token`.
+  - **`GitHub rate limit exceeded — the PAT is valid`** — do NOT rotate the PAT. The 5000/hr REST bucket is shared across everything the PAT identity touches; wait for the reset epoch in the message and investigate any other tooling that may share the token.
+  - **`GitHub API degraded`** — check [githubstatus.com](https://www.githubstatus.com) before SSHing the runner or rotating anything. The runner is fine; GitHub itself is the problem.
+  - **`PAT rejected with 401`** — the SSM-stored PAT was revoked, expired, or malformed. Generate a fresh fine-scoped PAT (Self-hosted runners: Read on `WXYC`) and overwrite `/wxyc-canary/gha-runner-token` via `aws ssm put-parameter --overwrite`.
+  - **`PAT rejected with 403`** — same remediation as 401, but only after ruling out the rate-limit message (which also surfaces as 403).
 
 ### Alarm fires: `wxyc-canary-lambda-errors`
 
