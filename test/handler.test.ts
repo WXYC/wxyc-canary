@@ -1253,6 +1253,10 @@ describe('publishMetrics — tier split (UserFacingCheckFailure / InfraCheckFail
     delete process.env.CANARY_GHA_RUNNER_ORG;
     delete process.env.CANARY_GHA_RUNNER_ID;
     delete process.env.CANARY_GHA_RUNNER_TOKEN;
+    // Defensive: no tier-split test sets this, but clearing it guarantees the
+    // runner check resolves its token inline (never via the SSM mock) even if
+    // an earlier block leaked it — keeps cloudWatchSendMock the only AWS call.
+    delete process.env.CANARY_GHA_RUNNER_TOKEN_SSM_PARAM;
   });
 
   afterEach(() => {
@@ -1267,6 +1271,7 @@ describe('publishMetrics — tier split (UserFacingCheckFailure / InfraCheckFail
     delete process.env.CANARY_GHA_RUNNER_ORG;
     delete process.env.CANARY_GHA_RUNNER_ID;
     delete process.env.CANARY_GHA_RUNNER_TOKEN;
+    delete process.env.CANARY_GHA_RUNNER_TOKEN_SSM_PARAM;
   });
 
   // Replay of the 2026-06-17 22:30 page: the staging-gate runner went
@@ -1359,7 +1364,13 @@ describe('publishMetrics — tier split (UserFacingCheckFailure / InfraCheckFail
     // The named check is the one that failed (guards against a name mix-up
     // or the check being commented out of the array).
     expect(dimensionedFailureValue(metrics, name)).toBe(1);
-    // The page fires (UserFacingCheckFailure trips), and no infra page does.
+    // The page fires. NOTE the tier guard is the `InfraCheckFailure == 0`
+    // assertion, not `UserFacingCheckFailure == 1`: in the dj-rotation case
+    // the bad rotation list also fails dj-rotation-picker, so the page could
+    // be carried by the picker alone. But the named check IS failing here, so
+    // if it were misclassified to `pagesOncall: false` its failure value would
+    // land in InfraCheckFailure and trip the line below. Keep both assertions
+    // — together they pin that the named check routes to the page tier.
     expect(tierMax(metrics, 'UserFacingCheckFailure')).toBe(1);
     expect(tierMax(metrics, 'InfraCheckFailure')).toBe(0);
   });

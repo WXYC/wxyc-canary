@@ -116,9 +116,10 @@ Parameters:
       the IAM policy ARN composes correctly. When set together with
       `GhaRunnerId`, the `gha-runner-online` check polls
       `GET /orgs/{org}/actions/runners/{id}` every 5 minutes and the
-      `wxyc-canary-check-failure` alarm fires after ~10 minutes of
-      sustained `status != "online"`. Leave empty to skip the probe
-      (operator gap, no alarm).
+      low-urgency `wxyc-canary-infra-degraded` alarm fires after ~10
+      minutes of sustained `status != "online"` (this check is infra-tier,
+      `pagesOncall: false`, so it does not trip the user-facing page).
+      Leave empty to skip the probe (operator gap, no alarm).
   GhaRunnerOrg:
     Type: String
     Default: WXYC
