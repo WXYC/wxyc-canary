@@ -46,26 +46,32 @@ jobs:
       - name: SAM build
         run: sam build
       - name: SAM deploy
-        # Runner-liveness probe params are conditionally appended only when
-        # the operator has set the corresponding GH Action variable. `sam
-        # deploy --parameter-overrides` (shorthand `Key=Value` form) rejects
-        # empty values like `GhaRunnerTokenSsmParamName=` with a parse error
-        # — building the args via shell is the cleanest way to omit the
-        # param entirely when the var is unset. The probe stays disabled
-        # via the template's own `HasGhaRunnerProbe` CFN-default behavior
-        # when no override is passed. See README "Runner liveness probe"
-        # for the operator setup (create SSM PAT → set GH Action vars →
-        # deploy).
+        # Optional params (runner-liveness probe + InfraAlertEmail) are
+        # conditionally appended only when the operator has set the
+        # corresponding GH Action variable. `sam deploy --parameter-overrides`
+        # (shorthand `Key=Value` form) rejects empty values like
+        # `GhaRunnerTokenSsmParamName=` with a parse error (fixed for the probe
+        # params in 581f74b), so building the args via shell is the cleanest way
+        # to omit a param entirely when its var is unset. The probe then stays
+        # disabled (and InfraAlertEmail stays console-only) via the template's
+        # own CFN-default behavior. See README "Runner liveness probe" and
+        # "CI deploys" for the operator setup.
         env:
           GHA_RUNNER_TOKEN_SSM_PARAM_NAME: ${{ vars.GHA_RUNNER_TOKEN_SSM_PARAM_NAME }}
           GHA_RUNNER_ORG: ${{ vars.GHA_RUNNER_ORG || 'WXYC' }}
           GHA_RUNNER_ID: ${{ vars.GHA_RUNNER_ID || '0' }}
+          INFRA_ALERT_EMAIL: ${{ vars.INFRA_ALERT_EMAIL }}
         run: |
-          PROBE_ARGS=()
+          OPTIONAL_ARGS=()
           if [ -n "$GHA_RUNNER_TOKEN_SSM_PARAM_NAME" ]; then
-            PROBE_ARGS+=("GhaRunnerTokenSsmParamName=$GHA_RUNNER_TOKEN_SSM_PARAM_NAME")
-            PROBE_ARGS+=("GhaRunnerOrg=$GHA_RUNNER_ORG")
-            PROBE_ARGS+=("GhaRunnerId=$GHA_RUNNER_ID")
+            OPTIONAL_ARGS+=("GhaRunnerTokenSsmParamName=$GHA_RUNNER_TOKEN_SSM_PARAM_NAME")
+            OPTIONAL_ARGS+=("GhaRunnerOrg=$GHA_RUNNER_ORG")
+            OPTIONAL_ARGS+=("GhaRunnerId=$GHA_RUNNER_ID")
+          fi
+          # InfraAlertEmail is optional (empty -> console-only infra tier); omit
+          # it entirely when unset, for the same empty-value parse reason above.
+          if [ -n "$INFRA_ALERT_EMAIL" ]; then
+            OPTIONAL_ARGS+=("InfraAlertEmail=$INFRA_ALERT_EMAIL")
           fi
           sam deploy \
             --no-confirm-changeset \
@@ -81,5 +87,4 @@ jobs:
               LmlApiKeySecretArn=${{ secrets.LML_API_KEY_SECRET_ARN }} \
               DjCredentialsSecretArn=${{ secrets.DJ_CREDENTIALS_SECRET_ARN }} \
               AlertEmail=${{ vars.ALERT_EMAIL }} \
-              InfraAlertEmail=${{ vars.INFRA_ALERT_EMAIL }} \
-              "${PROBE_ARGS[@]}"
+              "${OPTIONAL_ARGS[@]}"

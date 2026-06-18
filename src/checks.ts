@@ -324,10 +324,12 @@ const lmlAuth: Check = {
  * 401/403 (PAT rotation drift), or 5xx (GitHub itself degraded — rare
  * but distinct enough to surface separately).
  *
- * The existing `wxyc-canary-check-failure` alarm gives the spec's
- * "≥10 minutes of `status != online`" window for free: 3 evaluations ×
- * 5 min, 2 datapoints to alarm = ~10 min sustained breach. No new
- * alarm needed.
+ * This check is infra-tier (`pagesOncall: false`, see below), so its
+ * failures feed the low-urgency `wxyc-canary-infra-degraded` alarm — NOT
+ * the `wxyc-canary-check-failure` page. That alarm's 3 evaluations ×
+ * 5 min, 2 datapoints-to-alarm window gives the spec's "≥10 minutes of
+ * `status != online`" sustained breach for free; it shares the exact
+ * shape of the page alarm, just on the infra series.
  *
  * Skip semantics mirror `lml-auth` / DJ credentials: missing PAT or
  * runner-id is an operator gap (alarm stays quiet), but a downstream
