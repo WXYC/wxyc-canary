@@ -334,12 +334,17 @@ function unitForMetric(metricName: string): StandardUnit {
 /**
  * Publish per-check failure, skip, latency, and any custom metrics in one
  * PutMetricData call. `CheckFailure` is emitted twice (dimensioned +
- * dimensionless) per the wxyc-canary#13 convention. Custom check metrics
- * (`outcome.metrics`) follow the same pattern: emitted once with the
- * `Check` dimension and once dimensionless, so a plain-form alarm can
- * target the dimensionless series without a SUM(SEARCH(...)) expression.
- * Failures stay non-fatal so the Lambda still exits on the outcome list,
- * not on a CloudWatch hiccup.
+ * dimensionless) per the wxyc-canary#13 convention; the dimensionless
+ * `CheckFailure` is now a dashboard rollup (no alarm reads it after the
+ * wxyc-canary#48 tier split). Each outcome ALSO emits exactly one tier
+ * aggregate — `UserFacingCheckFailure` (the `wxyc-canary-check-failure`
+ * page) or `InfraCheckFailure` (the low-urgency `wxyc-canary-infra-degraded`
+ * alarm) — routed by `pagesOncallByName`. Custom check metrics
+ * (`outcome.metrics`) follow the same emit-twice pattern: once with the
+ * `Check` dimension and once dimensionless, so a plain-form alarm can target
+ * the dimensionless series without a SUM(SEARCH(...)) expression. Failures
+ * stay non-fatal so the Lambda still exits on the outcome list, not on a
+ * CloudWatch hiccup.
  */
 async function publishMetrics(outcomes: CheckOutcome[], region: string): Promise<void> {
   const client = new CloudWatchClient({ region });
@@ -422,9 +427,10 @@ async function publishMetrics(outcomes: CheckOutcome[], region: string): Promise
 /**
  * Lambda entry. Exits non-zero (via thrown error) if any check failed, so
  * CloudWatch's built-in `Errors` metric on the Lambda function lights up
- * even before the custom metrics arrive. The CloudFormation alarm fires
- * on the per-check `CheckFailure` metric since that names *which* surface
- * is broken.
+ * even before the custom metrics arrive. The CloudFormation alarms fire on
+ * the dimensionless tier aggregates (`UserFacingCheckFailure` page /
+ * `InfraCheckFailure` low-urgency); the dimensioned `CheckFailure` series
+ * names *which* surface is broken for dashboards and drill-down.
  */
 export const handler = async (): Promise<{ outcomes: CheckOutcome[]; failed: number; skipped: number }> => {
   const config = loadConfigFromEnv();

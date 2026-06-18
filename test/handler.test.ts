@@ -1160,9 +1160,11 @@ describe('publishMetrics — dimensioned + dimensionless emit-twice', () => {
     expect(dimensionless.every((d) => d.Value === 0)).toBe(true);
   });
 
-  // The alarm reads the dimensionless series. If a regression flowed
-  // `failureValue` into only the dimensioned branch, the dashboard would
-  // light up but the pager wouldn't — exactly the failure mode this pins.
+  // Pins that `failureValue` flows into BOTH the dimensioned and dimensionless
+  // `CheckFailure` emissions. Post-#48 no alarm reads dimensionless
+  // `CheckFailure` (the page reads `UserFacingCheckFailure` — covered by the
+  // `publishMetrics — tier split` block below); this still guards the
+  // dimensioned-vs-dimensionless value parity the dashboards rely on.
   it('flows the failure value (1) into both the dimensioned and dimensionless emission for the failing check', async () => {
     setUpFetchMock({
       // backend-healthcheck fails; everything else passes (DJ-auth checks
