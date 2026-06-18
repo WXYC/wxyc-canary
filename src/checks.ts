@@ -694,8 +694,8 @@ function parseRetryAfterMs(result: FetchResult): number | undefined {
  *
  * Retry carve-out: the canary deliberately does not retry the surfaces it
  * measures (see `client.ts`). Sign-in is the exception, and only on 429.
- * Auth is a precondition shared by 4 of 6 checks, so a single 429 here
- * cascades into 4 simultaneous fail outcomes plus a Lambda Errors alarm —
+ * Auth is a precondition shared by 6 of the 11 checks, so a single 429 here
+ * cascades into 6 simultaneous fail outcomes plus a Lambda Errors alarm —
  * even when the surfaces being measured are healthy. One retry, only on
  * 429, only on the sign-in step (token exchange does not retry). Honors
  * `Retry-After` (seconds form) when present, capped to 5s so the Lambda
