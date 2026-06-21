@@ -1391,7 +1391,7 @@ describe('publishMetrics — dimensioned + dimensionless emit-twice', () => {
  * reads `InfraCheckFailure`. Both are dimensionless-only (per-surface
  * drill-down is already served by the dimensioned `CheckFailure`). Each
  * check contributes exactly one aggregate datum, routed by `pagesOncall`:
- * `gha-runner-online` and `semantic-index-search` → `InfraCheckFailure`,
+ * `gha-runner-online` and `semantic-index-freshness` → `InfraCheckFailure`,
  * everything else → `UserFacingCheckFailure`. The alarms use
  * `Statistic: Maximum`, so the contract these tests pin is "the max of the
  * tier's dimensionless series over the run".
@@ -1481,15 +1481,18 @@ describe('publishMetrics — tier split (UserFacingCheckFailure / InfraCheckFail
     expect(tierValues(metrics, 'InfraCheckFailure').filter((v) => v === 1)).toHaveLength(1);
   });
 
-  // DP1: the nightly ~09:00 UTC explore.wxyc.org blip. Real availability
-  // probe, but not a DJ-on-air path — demoted to infra so it stops paging.
-  it('does not page when only semantic-index-search fails (nightly blip → InfraCheckFailure)', async () => {
+  // DP1 (RESOLVED): the nightly ~09:00 UTC explore.wxyc.org blip was an
+  // OOM-restart of the in-process rebuild; semantic-index#347 moved the
+  // rebuild off-host, so the surface is reliably green again and was restored
+  // to the page (wxyc-canary#50). A real /graph/artists/search failure must
+  // now trip the user-facing page, not the low-urgency infra alarm.
+  it('pages when only semantic-index-search fails (shape regression → UserFacingCheckFailure)', async () => {
     setUpFetchMock({
       '/healthcheck': { status: 200, body: { ok: true } },
       // Missing `results` envelope — the shape regression the check catches.
       '/graph/artists/search': { status: 200, body: { something_else: [] } },
-      // Freshness (also infra) stays green so the infra series carries ONLY
-      // the search check's failure.
+      // Freshness (infra) stays green so the infra series stays flat — the
+      // search failure must land on the user-facing tier alone.
       'explore.example.test/health': {
         status: 200,
         body: { status: 'healthy', artist_count: 136_702, graph_db_age_seconds: 3_600 },
@@ -1500,9 +1503,9 @@ describe('publishMetrics — tier split (UserFacingCheckFailure / InfraCheckFail
     const metrics = getPublishedMetrics();
 
     expect(dimensionedFailureValue(metrics, 'semantic-index-search')).toBe(1);
-    expect(tierMax(metrics, 'UserFacingCheckFailure')).toBe(0);
-    expect(tierMax(metrics, 'InfraCheckFailure')).toBe(1);
-    expect(tierValues(metrics, 'InfraCheckFailure').filter((v) => v === 1)).toHaveLength(1);
+    expect(tierMax(metrics, 'UserFacingCheckFailure')).toBe(1);
+    expect(tierValues(metrics, 'UserFacingCheckFailure').filter((v) => v === 1)).toHaveLength(1);
+    expect(tierMax(metrics, 'InfraCheckFailure')).toBe(0);
   });
 
   // The new silent-stale-graph backstop (semantic-index#348 / wxyc-canary#53)
@@ -1626,11 +1629,11 @@ describe('publishMetrics — tier split (UserFacingCheckFailure / InfraCheckFail
     await handler();
     const metrics = getPublishedMetrics();
 
-    // 8 paging checks (7 user-facing + enrichment-quality), 3 infra checks
-    // (gha-runner-online, semantic-index-search, semantic-index-freshness);
-    // every aggregate datum is dimensionless and 0.
-    expect(tierValues(metrics, 'UserFacingCheckFailure')).toHaveLength(8);
-    expect(tierValues(metrics, 'InfraCheckFailure')).toHaveLength(3);
+    // 9 paging checks (8 user-facing + enrichment-quality), 2 infra checks
+    // (gha-runner-online, semantic-index-freshness); every aggregate datum is
+    // dimensionless and 0.
+    expect(tierValues(metrics, 'UserFacingCheckFailure')).toHaveLength(9);
+    expect(tierValues(metrics, 'InfraCheckFailure')).toHaveLength(2);
     expect(tierMax(metrics, 'UserFacingCheckFailure')).toBe(0);
     expect(tierMax(metrics, 'InfraCheckFailure')).toBe(0);
     // The aggregates are dimensionless-only — no `Check`-dimensioned twin.

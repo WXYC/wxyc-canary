@@ -59,13 +59,13 @@ const semanticIndexSearch: Check = {
   name: 'semantic-index-search',
   description: 'GET /graph/artists/search on explore.wxyc.org',
   requiresAuth: false,
-  // Infra/non-paging tier (wxyc-canary#48 DP1): a real availability probe of
-  // explore.wxyc.org, but not a DJ-on-air path, and it flaps every night
-  // ~09:00 UTC on semantic-index sync/rebuild contention. CloudWatch metric
-  // alarms can't suppress a known time-of-day window, so failures route to
-  // `InfraCheckFailure` (low-urgency) rather than the page. The nightly
-  // contention is tracked as a follow-up — see README "What it checks".
-  pagesOncall: false,
+  // Paging tier (default). Demoted to infra under wxyc-canary#48 DP1 because it
+  // flapped every night ~09:00 UTC on in-process sync/rebuild contention;
+  // semantic-index#347 moved the rebuild off-host (the in-process daemon that
+  // OOM-restarted uvicorn is now disabled), so the surface is reliably green
+  // again (verified ≥2 clean nights) and this user-facing availability probe is
+  // restored to the page per wxyc-canary#50. Its sibling `semantic-index-freshness`
+  // stays infra-tier for now — staleness is degradation, not an outage.
   run: async (ctx) => {
     const r = await canaryFetch(
       `${ctx.semanticIndexUrl}/graph/artists/search?q=${encodeURIComponent(PROBE_ARTIST)}&limit=1`
@@ -112,13 +112,15 @@ const ARTIST_COUNT_FLOOR = 100_000;
  *   - `artist_count` < 100,000 → a fresh-but-empty/truncated DB that would
  *     otherwise read green.
  *
- * Infra/non-paging tier (`pagesOncall: false`): during the semantic-index#347
- * off-host-rebuild window the OOM may recur nightly, so this check is expected
- * to fire every day by design. Routing it to `InfraCheckFailure` /
- * `wxyc-canary-infra-degraded` (not the page) avoids training on-call to swipe
- * away a nightly page — the exact fatigue wxyc-canary#48 removed. Promote to
- * `pagesOncall: true` once #347 lands and the graph is reliably fresh (ideally
- * in the same PR that restores `semantic-index-search` to paging — see #50).
+ * Infra/non-paging tier (`pagesOncall: false`): a served-but-stale graph is a
+ * degradation, not an outage — explore.wxyc.org keeps answering, just from an
+ * older DB — so it routes to `InfraCheckFailure` / `wxyc-canary-infra-degraded`
+ * (not the page). (It also fired every day by design while semantic-index#347's
+ * off-host rebuild was unshipped and the nightly OOM could recur; #347 has since
+ * landed.) Promotion to `pagesOncall: true` is a separate judgement call — once
+ * a stale graph is deemed page-worthy and freshness has held for a sustained
+ * window — and is NOT gated on wxyc-canary#50 (which only covers the
+ * `semantic-index-search` restore, already done).
  *
  * Keys on serving-host freshness via `/health`, NOT on the build job, so it
  * survives the #347 migration without rework. `graph_db_age_seconds` is added
@@ -133,12 +135,11 @@ const semanticIndexFreshness: Check = {
   name: 'semantic-index-freshness',
   description: 'GET /health on explore.wxyc.org — graph_db_age_seconds < 36h and artist_count >= 100k',
   requiresAuth: false,
-  // Infra/non-paging tier (semantic-index#348 + wxyc-canary#48): a real
-  // production backstop, but it fires by design during the #347 build window,
-  // and a nightly OOM-stale graph is an operator concern, not a DJ-on-air
-  // outage. Failures route to `InfraCheckFailure` / `wxyc-canary-infra-degraded`
-  // (low-urgency), NOT the page. Promote to paging once #347 lands and the
-  // graph is reliably fresh — see README "What it checks".
+  // Infra/non-paging tier (semantic-index#348 + wxyc-canary#48): a stale graph
+  // is degradation (explore.wxyc.org still answers from an older DB), not a
+  // DJ-on-air outage. Failures route to `InfraCheckFailure` /
+  // `wxyc-canary-infra-degraded` (low-urgency), NOT the page. Promotion is a
+  // separate decision, not gated on #50 — see README "What it checks".
   pagesOncall: false,
   run: async (ctx): Promise<CheckResult | void> => {
     const r = await canaryFetch(`${ctx.semanticIndexUrl}/health`);
