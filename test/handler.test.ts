@@ -428,6 +428,27 @@ describe('runCanary — semantic-index-freshness check (silent stale-graph backs
     expect(fresh.metrics?.GraphDbAgeSeconds).toBeUndefined();
   });
 
+  it('fails when graph_db_age_seconds is explicitly null (semantic-index#348 "DB file absent" sentinel)', async () => {
+    // Post-#348, an explicit null (distinct from the field being absent) is the
+    // sentinel for "the serving graph DB file is gone". That is non-green and
+    // must fail closed — `null > 36h` is silently false in JS, so without an
+    // explicit guard a missing graph would read green on the age axis. (#348
+    // emits null only alongside a 503 today, caught above; this pins the
+    // contract so it stays fail-closed if null ever surfaces on a 200.)
+    setUpHealthMock({
+      status: 200,
+      body: { status: 'healthy', artist_count: 136_702, graph_db_age_seconds: null },
+    });
+
+    const outcomes = await runCanary(baseConfig);
+    const fresh = outcomes.find((o) => o.name === 'semantic-index-freshness')!;
+
+    expect(fresh.status).toBe('fail');
+    expect(fresh.message).toMatch(/graph_db_age_seconds is null|absent/);
+    // A null age must not be published as a fabricated metric value.
+    expect(fresh.metrics?.GraphDbAgeSeconds).toBeUndefined();
+  });
+
   it('fails when artist_count is missing or non-numeric (shape regression)', async () => {
     setUpHealthMock({
       status: 200,
