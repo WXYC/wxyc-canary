@@ -272,11 +272,13 @@ Resources:
   # which avoids alerting on a single transient blip while still catching
   # sustained outages quickly. Targets the dimensionless `UserFacingCheckFailure`
   # aggregate (wxyc-canary#48) — every check except the two infra/CI probes
-  # (`gha-runner-online`, `semantic-index-search`, tagged `pagesOncall: false`)
+  # (`gha-runner-online`, `semantic-index-freshness`, tagged `pagesOncall: false`)
   # contributes to it. Those two route to `InfraCheckFailure` /
-  # `wxyc-canary-infra-degraded` below so a runner-offline or nightly
-  # explore.wxyc.org blip no longer pages on-call and trains it to ignore the
-  # page. See CLAUDE.md "Conventions" for the tier split and for why this isn't
+  # `wxyc-canary-infra-degraded` below so a runner-offline or stale-graph signal
+  # no longer pages on-call and trains it to ignore the page. (`semantic-index-search`
+  # was demoted here for its nightly-blip window but is back on the page now that
+  # semantic-index#347 ended the in-process OOM-restart — wxyc-canary#50.)
+  # See CLAUDE.md "Conventions" for the tier split and for why this isn't
   # a SUM(SEARCH(...)) alarm. AlarmName kept as `wxyc-canary-check-failure` so
   # pinned dashboards / runbook references survive the metric repoint.
   CheckFailureAlarm:
@@ -301,7 +303,7 @@ Resources:
   # Low-urgency infra/CI tier alarm (wxyc-canary#48 DP2). Same 2-of-3 ×
   # 5-min Maximum shape as the page, but targets the dimensionless
   # `InfraCheckFailure` aggregate — the series the two `pagesOncall: false`
-  # probes (`gha-runner-online`, `semantic-index-search`) contribute to.
+  # probes (`gha-runner-online`, `semantic-index-freshness`) contribute to.
   # Wired to `InfraAlertTopic` (NOT `AlertTopic`) so it never trips the
   # user-facing page; with `InfraAlertEmail` empty the topic is unsubscribed
   # and the alarm is console-only. The contract test in test/handler.test.ts
