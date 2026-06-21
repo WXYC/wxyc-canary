@@ -79,6 +79,109 @@ const semanticIndexSearch: Check = {
 };
 
 /**
+ * Maximum tolerated age of the served graph DB, in seconds. The
+ * semantic-index nightly sync runs at 09:00 UTC, so a graph older than 36 h
+ * means at least one scheduled run has missed or failed. 36 h (vs a tight 25 h)
+ * absorbs a single skipped/slow run and the canary's own evaluation window
+ * before paging the infra tier.
+ */
+const GRAPH_DB_MAX_AGE_SECONDS = 36 * 60 * 60; // 129_600
+
+/**
+ * Absolute floor on the served `artist_count`. Production is ~136,700 and
+ * grows monotonically (~250/month — it's a cumulative count of every distinct
+ * artist ever played), so 100K sits ~27% below live: legitimate drift can't
+ * trip it, but an empty/truncated build fails instantly. Absolute (not
+ * relative) because the canary is a stateless Lambda and can't cheaply carry
+ * prior-count state. This is the post-swap external backstop — distinct from
+ * semantic-index#349's pre-swap relative collapse-fraction gate (the two are
+ * complementary; do not import #349's machinery here).
+ */
+const ARTIST_COUNT_FLOOR = 100_000;
+
+/**
+ * Anonymous: semantic-index graph-DB freshness. Polls `GET /health` on
+ * explore.wxyc.org and fails when the served graph is stale or empty. The
+ * nightly sync can fail completely silently — an OOM/SIGKILL kills the rebuild
+ * before the atomic DB swap, bypassing Python's exception machinery, so nothing
+ * reaches Sentry. The only trustworthy success signal is the serving-host graph
+ * freshness, which this check externally backstops:
+ *
+ *   - `graph_db_age_seconds` > 36 h → at least one scheduled 09:00 UTC sync
+ *     missed/failed (the silent-stale window).
+ *   - `artist_count` < 100,000 → a fresh-but-empty/truncated DB that would
+ *     otherwise read green.
+ *
+ * Infra/non-paging tier (`pagesOncall: false`): during the semantic-index#347
+ * off-host-rebuild window the OOM may recur nightly, so this check is expected
+ * to fire every day by design. Routing it to `InfraCheckFailure` /
+ * `wxyc-canary-infra-degraded` (not the page) avoids training on-call to swipe
+ * away a nightly page — the exact fatigue wxyc-canary#48 removed. Promote to
+ * `pagesOncall: true` once #347 lands and the graph is reliably fresh (ideally
+ * in the same PR that restores `semantic-index-search` to paging — see #50).
+ *
+ * Keys on serving-host freshness via `/health`, NOT on the build job, so it
+ * survives the #347 migration without rework. `graph_db_age_seconds` is added
+ * to `/health` by semantic-index#348; until that deploys, prod `/health` only
+ * carries `artist_count`, so the age half no-ops in production (the floor half
+ * is live today). Returns the age as a `GraphDbAgeSeconds` metric (emitted
+ * dimensioned + dimensionless per the org CloudWatch convention) for dashboard
+ * trend visibility; the alarm signal is the infra-tier failure aggregate, not
+ * a dedicated age alarm.
+ */
+const semanticIndexFreshness: Check = {
+  name: 'semantic-index-freshness',
+  description: 'GET /health on explore.wxyc.org — graph_db_age_seconds < 36h and artist_count >= 100k',
+  requiresAuth: false,
+  // Infra/non-paging tier (semantic-index#348 + wxyc-canary#48): a real
+  // production backstop, but it fires by design during the #347 build window,
+  // and a nightly OOM-stale graph is an operator concern, not a DJ-on-air
+  // outage. Failures route to `InfraCheckFailure` / `wxyc-canary-infra-degraded`
+  // (low-urgency), NOT the page. Promote to paging once #347 lands and the
+  // graph is reliably fresh — see README "What it checks".
+  pagesOncall: false,
+  run: async (ctx): Promise<CheckResult | void> => {
+    const r = await canaryFetch(`${ctx.semanticIndexUrl}/health`);
+    if (!r.ok) {
+      throw new Error(`expected 2xx, got ${r.status}: ${r.rawText.slice(0, 200)}`);
+    }
+    const body = r.body as { artist_count?: unknown; graph_db_age_seconds?: unknown };
+    if (!body || typeof body !== 'object') {
+      throw new Error(`expected a JSON object from /health, got: ${r.rawText.slice(0, 200)}`);
+    }
+
+    // Content floor (live today): a fresh-but-empty/truncated DB must not read
+    // green. `artist_count` has been on `/health` since before this check.
+    if (typeof body.artist_count !== 'number' || !Number.isFinite(body.artist_count)) {
+      throw new Error(`expected numeric artist_count on /health, got: ${r.rawText.slice(0, 200)}`);
+    }
+    if (body.artist_count < ARTIST_COUNT_FLOOR) {
+      throw new Error(
+        `artist_count ${body.artist_count} is below the ${ARTIST_COUNT_FLOOR} floor — graph DB is empty or truncated`
+      );
+    }
+
+    // Freshness (gated on semantic-index#348 landing): only assert on the age
+    // when `/health` actually carries the field. Until #348 deploys, the field
+    // is absent in production and we must NOT synthesize a false stale-graph
+    // failure from a missing value — the floor half above is the live signal in
+    // the meantime. Tests mock the field in, so the age path is fully covered.
+    const ageRaw = body.graph_db_age_seconds;
+    if (typeof ageRaw === 'number' && Number.isFinite(ageRaw)) {
+      if (ageRaw > GRAPH_DB_MAX_AGE_SECONDS) {
+        throw new Error(
+          `graph_db_age_seconds ${Math.round(ageRaw)} exceeds the ${GRAPH_DB_MAX_AGE_SECONDS}s (~36h) limit — the nightly sync has missed or failed (silent-stale window)`
+        );
+      }
+      // Fresh + above floor: surface the age for dashboard trend visibility.
+      return { metrics: { GraphDbAgeSeconds: ageRaw } };
+    }
+    // Floor passed and no age field (pre-#348 prod, or a non-numeric value):
+    // pass without an age metric rather than fabricate one.
+  },
+};
+
+/**
  * DJ-authenticated: the catalog-search endpoint dj-site uses for
  * autocomplete. This is the exact path that 503'd on 2026-04-30 because of
  * the cached `library.artist_name` precondition. Hitting it under a real
@@ -484,6 +587,7 @@ export const checks: readonly Check[] = [
   healthcheck,
   proxyLibrarySearch,
   semanticIndexSearch,
+  semanticIndexFreshness,
   djLibrarySearch,
   djFlowsheetRead,
   djRotation,

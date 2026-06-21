@@ -24,6 +24,7 @@ describe('checksForSuite', () => {
     // runs on; enrichment-quality writes + polls 45s.
     for (const name of [
       'semantic-index-search',
+      'semantic-index-freshness',
       'dj-rotation',
       'dj-rotation-picker',
       'gha-runner-online',
@@ -67,16 +68,20 @@ describe('VALID_SUITES', () => {
  * regression this test exists to catch.
  */
 describe('pagesOncall — paging-tier classification', () => {
-  it('only gha-runner-online and semantic-index-search opt out of paging', () => {
+  it('only the three infra probes opt out of paging', () => {
     // The infra/CI probes that flap on non-user-facing causes (runner
-    // offline; nightly explore.wxyc.org sync contention). Everything else
-    // pages. A new entry here is an intentional coverage reduction — it
-    // should arrive with a tracked follow-up, never silently.
+    // offline; nightly explore.wxyc.org sync contention; the silent-stale
+    // graph DB that fires by design during the semantic-index#347 build
+    // window). Everything else pages. A new entry here is an intentional
+    // coverage reduction — it should arrive with a tracked follow-up, never
+    // silently. `semantic-index-freshness` is non-paging for the #347 window
+    // and is slated to be promoted alongside semantic-index-search per
+    // wxyc-canary#50 once the graph is reliably fresh.
     const nonPaging = checks
       .filter((c) => c.pagesOncall === false)
       .map((c) => c.name)
       .sort();
-    expect(nonPaging).toEqual(['gha-runner-online', 'semantic-index-search']);
+    expect(nonPaging).toEqual(['gha-runner-online', 'semantic-index-freshness', 'semantic-index-search']);
   });
 
   it('every other check pages by default (pagesOncall !== false)', () => {
@@ -86,10 +91,11 @@ describe('pagesOncall — paging-tier classification', () => {
     expect(paging).toContain('dj-rotation');
     expect(paging).toContain('dj-rotation-picker');
     // The 7 user-facing checks + enrichment-quality (writes; pages by
-    // default though it skips in prod) all page; only the 2 infra checks
+    // default though it skips in prod) all page; only the 3 infra checks
     // are excluded.
-    expect(checks.length - paging.size).toBe(2);
+    expect(checks.length - paging.size).toBe(3);
     expect(paging.has('gha-runner-online')).toBe(false);
     expect(paging.has('semantic-index-search')).toBe(false);
+    expect(paging.has('semantic-index-freshness')).toBe(false);
   });
 });

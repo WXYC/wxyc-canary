@@ -76,6 +76,15 @@ describe('runCanary — anonymous-only configuration', () => {
       '/healthcheck': { status: 200, body: { ok: true } },
       '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
       '/graph/artists/search': { status: 200, body: { results: [{ id: 97426, canonical_name: 'stereolab' }] } },
+      // `semantic-index-freshness` polls `/health`; fresh + above-floor so it
+      // passes. Keyed on the host-qualified path (`explore.example.test/health`)
+      // so the substring match can't be shadowed by the backend `/healthcheck`
+      // mock — `setUpFetchMock` matches on `includes`, and `/healthcheck` does
+      // not contain `explore.example.test/health`.
+      'explore.example.test/health': {
+        status: 200,
+        body: { status: 'healthy', artist_count: 136_702, graph_db_age_seconds: 3_600 },
+      },
     });
   });
 
@@ -83,13 +92,14 @@ describe('runCanary — anonymous-only configuration', () => {
     vi.unstubAllGlobals();
   });
 
-  it('passes the 2 truly-anonymous checks and skips the 8 conditional checks when no credentials are configured', async () => {
+  it('passes the 3 truly-anonymous checks and skips the 8 conditional checks when no credentials are configured', async () => {
     const outcomes = await runCanary(baseConfig);
 
-    expect(outcomes).toHaveLength(10);
+    expect(outcomes).toHaveLength(11);
     const byName = Object.fromEntries(outcomes.map((o) => [o.name, o]));
     expect(byName['backend-healthcheck'].status).toBe('pass');
     expect(byName['semantic-index-search'].status).toBe('pass');
+    expect(byName['semantic-index-freshness'].status).toBe('pass');
     expect(byName['proxy-library-search'].status).toBe('skipped');
     expect(byName['dj-library-search'].status).toBe('skipped');
     expect(byName['dj-flowsheet-read'].status).toBe('skipped');
@@ -305,6 +315,130 @@ describe('runCanary — failure surfaces (regression coverage for the 2026-04-30
     expect(dj.status).toBe('fail');
     expect(dj.message).toMatch(/auth precondition failed/);
     expect(dj.message).toMatch(/token exchange/);
+  });
+});
+
+/**
+ * `semantic-index-freshness` (semantic-index#348 / wxyc-canary#53) is the
+ * external backstop for the silent nightly-sync failure: an OOM kills the
+ * rebuild before the atomic DB swap, so nothing reaches Sentry and the serving
+ * host keeps answering from a stale (or, in the truncated-build case, empty)
+ * graph. The check polls `GET /health` on explore.wxyc.org and fails when the
+ * graph is older than 36 h OR `artist_count` is below the 100k floor.
+ *
+ * These tests MOCK `/health`, so the `graph_db_age_seconds` age path is fully
+ * exercised here even though the field is not yet live in prod `/health`
+ * (semantic-index#348 adds it). The floor half is testable against the current
+ * endpoint, which already returns `artist_count`.
+ *
+ * The freshness check is `pagesOncall: false` (infra tier) — its tier routing
+ * is pinned in the `publishMetrics — tier split` block; here we pin the
+ * pass/fail/metric behaviour of the probe itself.
+ */
+describe('runCanary — semantic-index-freshness check (silent stale-graph backstop)', () => {
+  // The check hits `${semanticIndexUrl}/health`; baseConfig points
+  // semanticIndexUrl at explore.example.test. The other two anonymous checks
+  // need stubs so the run produces the full outcome shape without unrelated
+  // 599s shadowing the freshness result.
+  function setUpHealthMock(health: { status: number; body: unknown }) {
+    return setUpFetchMock({
+      '/healthcheck': { status: 200, body: { ok: true } },
+      '/graph/artists/search': { status: 200, body: { results: [{ id: 1, canonical_name: 'stereolab' }] } },
+      'explore.example.test/health': health,
+    });
+  }
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('passes when the graph is fresh and above the artist_count floor', async () => {
+    setUpHealthMock({
+      status: 200,
+      body: { status: 'healthy', artist_count: 136_702, graph_db_age_seconds: 7_200 },
+    });
+
+    const outcomes = await runCanary(baseConfig);
+    const fresh = outcomes.find((o) => o.name === 'semantic-index-freshness')!;
+
+    expect(fresh.status).toBe('pass');
+    // Fresh + above-floor surfaces the age as a metric for dashboard trend.
+    expect(fresh.metrics?.GraphDbAgeSeconds).toBe(7_200);
+  });
+
+  it('fails when graph_db_age_seconds exceeds the ~36h limit (silent-stale window)', async () => {
+    // 37 h — one missed 09:00 UTC sync. This is the headline failure mode: the
+    // 22-day undetected stale-graph window the check exists to surface.
+    setUpHealthMock({
+      status: 200,
+      body: { status: 'healthy', artist_count: 136_702, graph_db_age_seconds: 37 * 60 * 60 },
+    });
+
+    const outcomes = await runCanary(baseConfig);
+    const fresh = outcomes.find((o) => o.name === 'semantic-index-freshness')!;
+
+    expect(fresh.status).toBe('fail');
+    expect(fresh.message).toMatch(/graph_db_age_seconds/);
+    expect(fresh.message).toMatch(/36h|129600/);
+  });
+
+  it('fails when artist_count is below the 100k floor (empty/truncated build, even if fresh)', async () => {
+    // Fresh swap of an empty/truncated DB — the "fresh but green-yet-broken"
+    // case the absolute floor exists to catch.
+    setUpHealthMock({
+      status: 200,
+      body: { status: 'healthy', artist_count: 42, graph_db_age_seconds: 60 },
+    });
+
+    const outcomes = await runCanary(baseConfig);
+    const fresh = outcomes.find((o) => o.name === 'semantic-index-freshness')!;
+
+    expect(fresh.status).toBe('fail');
+    expect(fresh.message).toMatch(/artist_count/);
+    expect(fresh.message).toMatch(/100000|floor/);
+  });
+
+  it('fails when /health returns a non-2xx (semantic-index unhealthy/down)', async () => {
+    setUpHealthMock({
+      status: 503,
+      body: { status: 'unhealthy', detail: 'unable to open database file' },
+    });
+
+    const outcomes = await runCanary(baseConfig);
+    const fresh = outcomes.find((o) => o.name === 'semantic-index-freshness')!;
+
+    expect(fresh.status).toBe('fail');
+    expect(fresh.message).toMatch(/503/);
+  });
+
+  it('passes on the pre-#348 prod shape (artist_count present, graph_db_age_seconds absent) without an age metric', async () => {
+    // Until semantic-index#348 deploys, prod `/health` carries only
+    // `artist_count`. The check must NOT fabricate a stale-graph failure from a
+    // missing age field — the floor half is the live signal in the meantime.
+    setUpHealthMock({
+      status: 200,
+      body: { status: 'healthy', artist_count: 136_702 },
+    });
+
+    const outcomes = await runCanary(baseConfig);
+    const fresh = outcomes.find((o) => o.name === 'semantic-index-freshness')!;
+
+    expect(fresh.status).toBe('pass');
+    // No age field → no GraphDbAgeSeconds metric (don't publish a fabricated 0).
+    expect(fresh.metrics?.GraphDbAgeSeconds).toBeUndefined();
+  });
+
+  it('fails when artist_count is missing or non-numeric (shape regression)', async () => {
+    setUpHealthMock({
+      status: 200,
+      body: { status: 'healthy' },
+    });
+
+    const outcomes = await runCanary(baseConfig);
+    const fresh = outcomes.find((o) => o.name === 'semantic-index-freshness')!;
+
+    expect(fresh.status).toBe('fail');
+    expect(fresh.message).toMatch(/artist_count/);
   });
 });
 
@@ -1148,6 +1282,10 @@ describe('publishMetrics — dimensioned + dimensionless emit-twice', () => {
       '/healthcheck': { status: 200, body: { ok: true } },
       '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
       '/graph/artists/search': { status: 200, body: { results: [{ id: 97426, canonical_name: 'stereolab' }] } },
+      'explore.example.test/health': {
+        status: 200,
+        body: { status: 'healthy', artist_count: 136_702, graph_db_age_seconds: 3_600 },
+      },
     });
 
     await handler();
@@ -1156,9 +1294,9 @@ describe('publishMetrics — dimensioned + dimensionless emit-twice', () => {
     const dimensioned = checkFailureData.filter((d) => d.Dimensions && d.Dimensions.length > 0);
     const dimensionless = checkFailureData.filter((d) => !d.Dimensions || d.Dimensions.length === 0);
 
-    // Ten checks, each contributes one dimensioned and one dimensionless datapoint.
-    expect(dimensioned).toHaveLength(10);
-    expect(dimensionless).toHaveLength(10);
+    // Eleven checks, each contributes one dimensioned and one dimensionless datapoint.
+    expect(dimensioned).toHaveLength(11);
+    expect(dimensionless).toHaveLength(11);
     // Without an inducer, every value is 0 (passes + skips).
     expect(dimensioned.every((d) => d.Value === 0)).toBe(true);
     expect(dimensionless.every((d) => d.Value === 0)).toBe(true);
@@ -1176,6 +1314,10 @@ describe('publishMetrics — dimensioned + dimensionless emit-twice', () => {
       '/healthcheck': { status: 500, body: { error: 'oops' } },
       '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
       '/graph/artists/search': { status: 200, body: { results: [{ id: 1, canonical_name: 'stereolab' }] } },
+      'explore.example.test/health': {
+        status: 200,
+        body: { status: 'healthy', artist_count: 136_702, graph_db_age_seconds: 3_600 },
+      },
     });
 
     await expect(handler()).rejects.toThrow(/canary failed/);
@@ -1192,7 +1334,7 @@ describe('publishMetrics — dimensioned + dimensionless emit-twice', () => {
     // isn't enough — `Statistic: Maximum` on the alarm needs at least one
     // `1` in the window, so this asserts the count of 1s explicitly.
     expect(dimensionless.filter((d) => d.Value === 1)).toHaveLength(1);
-    expect(dimensionless.filter((d) => d.Value === 0)).toHaveLength(9);
+    expect(dimensionless.filter((d) => d.Value === 0)).toHaveLength(10);
   });
 
   // `CheckSkipped` and `CheckLatency` are dashboard data, not alarm inputs.
@@ -1204,6 +1346,10 @@ describe('publishMetrics — dimensioned + dimensionless emit-twice', () => {
       '/healthcheck': { status: 200, body: { ok: true } },
       '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
       '/graph/artists/search': { status: 200, body: { results: [{ id: 97426, canonical_name: 'stereolab' }] } },
+      'explore.example.test/health': {
+        status: 200,
+        body: { status: 'healthy', artist_count: 136_702, graph_db_age_seconds: 3_600 },
+      },
     });
 
     await handler();
@@ -1213,8 +1359,8 @@ describe('publishMetrics — dimensioned + dimensionless emit-twice', () => {
     expect(metricData.filter((d) => d.MetricName === 'CheckSkipped' && isDimensionless(d))).toHaveLength(0);
     expect(metricData.filter((d) => d.MetricName === 'CheckLatency' && isDimensionless(d))).toHaveLength(0);
     // Sanity: the dimensioned series for each is present (one per check).
-    expect(metricData.filter((d) => d.MetricName === 'CheckSkipped')).toHaveLength(10);
-    expect(metricData.filter((d) => d.MetricName === 'CheckLatency')).toHaveLength(10);
+    expect(metricData.filter((d) => d.MetricName === 'CheckSkipped')).toHaveLength(11);
+    expect(metricData.filter((d) => d.MetricName === 'CheckLatency')).toHaveLength(11);
   });
 });
 
@@ -1290,6 +1436,12 @@ describe('publishMetrics — tier split (UserFacingCheckFailure / InfraCheckFail
     setUpFetchMock({
       '/healthcheck': { status: 200, body: { ok: true } },
       '/graph/artists/search': { status: 200, body: { results: [{ id: 1, canonical_name: 'stereolab' }] } },
+      // semantic-index-freshness is also infra-tier; keep it passing so the
+      // infra series carries ONLY the runner's failure (the assertion below).
+      'explore.example.test/health': {
+        status: 200,
+        body: { status: 'healthy', artist_count: 136_702, graph_db_age_seconds: 3_600 },
+      },
       'gha.example.test/orgs/WXYC/actions/runners/250': {
         status: 200,
         body: { id: 250, name: 'wxyc-e2e-runner', status: 'offline' },
@@ -1315,12 +1467,41 @@ describe('publishMetrics — tier split (UserFacingCheckFailure / InfraCheckFail
       '/healthcheck': { status: 200, body: { ok: true } },
       // Missing `results` envelope — the shape regression the check catches.
       '/graph/artists/search': { status: 200, body: { something_else: [] } },
+      // Freshness (also infra) stays green so the infra series carries ONLY
+      // the search check's failure.
+      'explore.example.test/health': {
+        status: 200,
+        body: { status: 'healthy', artist_count: 136_702, graph_db_age_seconds: 3_600 },
+      },
     });
 
     await expect(handler()).rejects.toThrow(/canary failed/);
     const metrics = getPublishedMetrics();
 
     expect(dimensionedFailureValue(metrics, 'semantic-index-search')).toBe(1);
+    expect(tierMax(metrics, 'UserFacingCheckFailure')).toBe(0);
+    expect(tierMax(metrics, 'InfraCheckFailure')).toBe(1);
+    expect(tierValues(metrics, 'InfraCheckFailure').filter((v) => v === 1)).toHaveLength(1);
+  });
+
+  // The new silent-stale-graph backstop (semantic-index#348 / wxyc-canary#53)
+  // is infra-tier: a stale or empty graph DB must raise the low-urgency infra
+  // alarm, never the user-facing page.
+  it('does not page when only semantic-index-freshness fails (stale graph → InfraCheckFailure)', async () => {
+    setUpFetchMock({
+      '/healthcheck': { status: 200, body: { ok: true } },
+      '/graph/artists/search': { status: 200, body: { results: [{ id: 1, canonical_name: 'stereolab' }] } },
+      // 37 h stale — one missed nightly sync.
+      'explore.example.test/health': {
+        status: 200,
+        body: { status: 'healthy', artist_count: 136_702, graph_db_age_seconds: 37 * 60 * 60 },
+      },
+    });
+
+    await expect(handler()).rejects.toThrow(/canary failed/);
+    const metrics = getPublishedMetrics();
+
+    expect(dimensionedFailureValue(metrics, 'semantic-index-freshness')).toBe(1);
     expect(tierMax(metrics, 'UserFacingCheckFailure')).toBe(0);
     expect(tierMax(metrics, 'InfraCheckFailure')).toBe(1);
     expect(tierValues(metrics, 'InfraCheckFailure').filter((v) => v === 1)).toHaveLength(1);
@@ -1359,6 +1540,10 @@ describe('publishMetrics — tier split (UserFacingCheckFailure / InfraCheckFail
       '/healthcheck': { status: 200, body: { ok: true } },
       '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
       '/graph/artists/search': { status: 200, body: { results: [{ id: 1, canonical_name: 'stereolab' }] } },
+      'explore.example.test/health': {
+        status: 200,
+        body: { status: 'healthy', artist_count: 136_702, graph_db_age_seconds: 3_600 },
+      },
       '/sign-in/email': { status: 200, body: { token: 'fake-session-token', user: { id: 'u1' } } },
       '/token': { status: 200, body: { token: 'fake-jwt' } },
       ...mocks,
@@ -1387,6 +1572,12 @@ describe('publishMetrics — tier split (UserFacingCheckFailure / InfraCheckFail
     setUpFetchMock({
       '/healthcheck': { status: 500, body: { error: 'oops' } },
       '/graph/artists/search': { status: 200, body: { results: [{ id: 1, canonical_name: 'stereolab' }] } },
+      // Freshness passes so the infra series stays flat — only the user-facing
+      // backend check should trip a tier here.
+      'explore.example.test/health': {
+        status: 200,
+        body: { status: 'healthy', artist_count: 136_702, graph_db_age_seconds: 3_600 },
+      },
     });
 
     await expect(handler()).rejects.toThrow(/canary failed/);
@@ -1394,7 +1585,7 @@ describe('publishMetrics — tier split (UserFacingCheckFailure / InfraCheckFail
 
     expect(dimensionedFailureValue(metrics, 'backend-healthcheck')).toBe(1);
     expect(tierMax(metrics, 'UserFacingCheckFailure')).toBe(1);
-    // Infra series stays flat — semantic passes and the runner check skips.
+    // Infra series stays flat — semantic checks pass and the runner check skips.
     expect(tierMax(metrics, 'InfraCheckFailure')).toBe(0);
   });
 
@@ -1405,15 +1596,20 @@ describe('publishMetrics — tier split (UserFacingCheckFailure / InfraCheckFail
     setUpFetchMock({
       '/healthcheck': { status: 200, body: { ok: true } },
       '/graph/artists/search': { status: 200, body: { results: [{ id: 1, canonical_name: 'stereolab' }] } },
+      'explore.example.test/health': {
+        status: 200,
+        body: { status: 'healthy', artist_count: 136_702, graph_db_age_seconds: 3_600 },
+      },
     });
 
     await handler();
     const metrics = getPublishedMetrics();
 
-    // 8 paging checks (7 user-facing + enrichment-quality), 2 infra checks;
+    // 8 paging checks (7 user-facing + enrichment-quality), 3 infra checks
+    // (gha-runner-online, semantic-index-search, semantic-index-freshness);
     // every aggregate datum is dimensionless and 0.
     expect(tierValues(metrics, 'UserFacingCheckFailure')).toHaveLength(8);
-    expect(tierValues(metrics, 'InfraCheckFailure')).toHaveLength(2);
+    expect(tierValues(metrics, 'InfraCheckFailure')).toHaveLength(3);
     expect(tierMax(metrics, 'UserFacingCheckFailure')).toBe(0);
     expect(tierMax(metrics, 'InfraCheckFailure')).toBe(0);
     // The aggregates are dimensionless-only — no `Check`-dimensioned twin.
@@ -1643,8 +1839,15 @@ const ENRICHED_SENTINEL_ROW = {
  */
 function setUpEnrichmentHappyPathMock(): ReturnType<typeof setUpMethodAwareMock> {
   return setUpMethodAwareMock([
-    // Read-side checks (other 6 checks).
+    // Read-side checks (other anonymous + DJ checks).
     { method: 'GET', pattern: '/healthcheck', responses: [{ status: 200, body: { ok: true } }] },
+    // semantic-index-freshness — fresh + above-floor so it passes. Host-
+    // qualified pattern so it can't be shadowed by `/healthcheck`.
+    {
+      method: 'GET',
+      pattern: 'explore.example.test/health',
+      responses: [{ status: 200, body: { status: 'healthy', artist_count: 136_702, graph_db_age_seconds: 3_600 } }],
+    },
     { method: 'GET', pattern: '/proxy/library/search', responses: [{ status: 200, body: proxyLibrarySearchResponse }] },
     {
       method: 'GET',
@@ -2033,6 +2236,10 @@ describe('enrichment-quality write canary', () => {
         '/healthcheck': { status: 200, body: { ok: true } },
         '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
         '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
+        'explore.example.test/health': {
+          status: 200,
+          body: { status: 'healthy', artist_count: 136_702, graph_db_age_seconds: 3_600 },
+        },
       });
       await handler();
       const metricData = getPublishedMetrics();
@@ -2089,6 +2296,10 @@ describe('handler — GitHub issue reporting dispatch', () => {
       '/healthcheck': { status: 200, body: { ok: true } },
       '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
       '/graph/artists/search': { status: 200, body: { results: [{ id: 1, canonical_name: 'stereolab' }] } },
+      'explore.example.test/health': {
+        status: 200,
+        body: { status: 'healthy', artist_count: 136_702, graph_db_age_seconds: 3_600 },
+      },
     });
 
     await handler();
@@ -2113,6 +2324,10 @@ describe('handler — GitHub issue reporting dispatch', () => {
       '/healthcheck': { status: 200, body: { ok: true } },
       '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
       '/graph/artists/search': { status: 200, body: { results: [{ id: 1, canonical_name: 'stereolab' }] } },
+      'explore.example.test/health': {
+        status: 200,
+        body: { status: 'healthy', artist_count: 136_702, graph_db_age_seconds: 3_600 },
+      },
     });
 
     await handler();
