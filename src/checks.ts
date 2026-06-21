@@ -167,6 +167,20 @@ const semanticIndexFreshness: Check = {
     // failure from a missing value — the floor half above is the live signal in
     // the meantime. Tests mock the field in, so the age path is fully covered.
     const ageRaw = body.graph_db_age_seconds;
+    // semantic-index#348 emits `graph_db_age_seconds: null` as an explicit
+    // "serving graph DB file is absent" sentinel — deliberately distinct from
+    // the field being missing entirely (the pre-#348 production shape, handled
+    // as a no-op below). An explicit null means there is no graph to serve, so
+    // fail closed. Today #348 only emits null alongside a 503, which the `!r.ok`
+    // guard above already catches; encoding the contract here keeps the check
+    // fail-closed if that ever changes (e.g. null surfacing on a 200). Note
+    // `=== null` matches only JSON null, not `undefined`, so the pre-#348
+    // missing-field case still falls through to the no-op pass.
+    if (ageRaw === null) {
+      throw new Error(
+        'graph_db_age_seconds is null — the serving graph DB file is absent (semantic-index#348 sentinel)'
+      );
+    }
     if (typeof ageRaw === 'number' && Number.isFinite(ageRaw)) {
       if (ageRaw > GRAPH_DB_MAX_AGE_SECONDS) {
         throw new Error(
@@ -176,8 +190,8 @@ const semanticIndexFreshness: Check = {
       // Fresh + above floor: surface the age for dashboard trend visibility.
       return { metrics: { GraphDbAgeSeconds: ageRaw } };
     }
-    // Floor passed and no age field (pre-#348 prod, or a non-numeric value):
-    // pass without an age metric rather than fabricate one.
+    // Floor passed and the age field is absent (pre-#348 prod) or a non-numeric,
+    // non-null value: pass without an age metric rather than fabricate one.
   },
 };
 
