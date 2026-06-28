@@ -466,10 +466,15 @@ describe('runCanary — semantic-index-freshness check (silent stale-graph backs
 /**
  * `lml-auth` is the layer-1 mitigation for BS#1094 — silent
  * `LML_API_KEY` rotation drift. It POSTs `/api/v1/lookup` directly to
- * LML with the production bearer and asserts 200. 401/403 is the
- * rotation-drift signal (distinct error message so the operator
- * doesn't confuse it with LML being down); 5xx is the LML-down
- * signal. Missing bearer is operator gap → skipped, not failed.
+ * LML with the production bearer. It PAGES only on a definitive auth
+ * verdict: good-bearer 401/403 (rotation drift) or known-bad-bearer 200
+ * (LML_REQUIRE_AUTH disabled). Anything that leaves the auth state
+ * indeterminate — a timeout, a 5xx, a 429, any other non-2xx that isn't a
+ * clean auth rejection — returns `skipped`, NOT `fail`: LML
+ * availability/latency is already a paging surface via
+ * `proxy-library-search` and the dj-* checks, and the cold `/api/v1/lookup`
+ * can exceed the 8s budget (wxyc-canary alarm-noise, 2026-06-27). Missing
+ * bearer is operator gap → skipped.
  *
  * URL match patterns here use the production LML host suffix because
  * the `lml-auth` check hits LML directly, not via BS. `setUpFetchMock`
@@ -584,11 +589,11 @@ describe('runCanary — lml-auth check (BS#1094 layer 1)', () => {
     expect(lml.message).not.toMatch(/rotation drift/);
   });
 
-  it('fails with an "unexpected status" message when the known-bad bearer returns neither 200 nor 401/403 (e.g. 500)', async () => {
-    // A 5xx on the known-bad probe is ambiguous: not a clean "auth enabled"
-    // signal, not a clean "auth disabled" signal either. Surface it as its
-    // own class so the operator doesn't conflate it with the good-bearer
-    // 5xx path (which is the "LML down" message).
+  it('abstains (skipped) when the known-bad bearer returns neither 200 nor 401/403 (e.g. 500) — indeterminate, not page-worthy', async () => {
+    // A 5xx on the known-bad probe is not a clean "auth enabled" (401/403)
+    // signal and not the "auth disabled" (200) regression either. The auth
+    // verdict is indeterminate, so abstain rather than page — LML health is
+    // already covered by proxy-library-search and the dj-* checks.
     setUpLmlBearerAwareMock({
       lmlGoodBearer: { status: 200, body: { results: [], cache_stats: {} } },
       lmlBadBearer: { status: 500, body: { detail: 'Internal Server Error' } },
@@ -597,9 +602,10 @@ describe('runCanary — lml-auth check (BS#1094 layer 1)', () => {
     const outcomes = await runCanary(lmlAuthConfig);
     const lml = outcomes.find((o) => o.name === 'lml-auth')!;
 
-    expect(lml.status).toBe('fail');
-    expect(lml.message).toMatch(/known-bad bearer/);
+    expect(lml.status).toBe('skipped');
+    expect(lml.message).toMatch(/known-bad/);
     expect(lml.message).toMatch(/500/);
+    expect(lml.message).toMatch(/indeterminate/);
     expect(lml.message).not.toMatch(/rotation drift/);
     expect(lml.message).not.toMatch(/auth disabled/);
   });
@@ -637,7 +643,7 @@ describe('runCanary — lml-auth check (BS#1094 layer 1)', () => {
     expect(lml.message).toMatch(/403/);
   });
 
-  it('fails with a generic 5xx message when LML itself is down (not a rotation-drift signal)', async () => {
+  it('abstains (skipped) when LML itself is down (good-bearer 5xx) — availability is covered by other checks, not this auth probe', async () => {
     setUpLmlBearerAwareMock({
       lmlGoodBearer: { status: 503, body: { detail: 'Service Unavailable' } },
       lmlBadBearer: { status: 503, body: { detail: 'Service Unavailable' } },
@@ -646,12 +652,74 @@ describe('runCanary — lml-auth check (BS#1094 layer 1)', () => {
     const outcomes = await runCanary(lmlAuthConfig);
     const lml = outcomes.find((o) => o.name === 'lml-auth')!;
 
-    expect(lml.status).toBe('fail');
-    // No rotation-drift framing — the operator's diagnostic path
-    // (page rom, page LML on-call) is different from rotation drift.
+    // A 503 says nothing about the bearer — the auth verdict is indeterminate.
+    // LML being down is already a paging surface via proxy-library-search /
+    // dj-* checks, so this probe abstains rather than double-paging.
+    expect(lml.status).toBe('skipped');
     expect(lml.message).not.toMatch(/rotation drift/);
     expect(lml.message).not.toMatch(/auth disabled/);
     expect(lml.message).toMatch(/503/);
+    expect(lml.message).toMatch(/indeterminate/);
+  });
+
+  it('abstains (skipped) when the good-bearer probe times out — the 2026-06-27 cold-/lookup flap, NOT an auth verdict', async () => {
+    // The production incident: the cold `/api/v1/lookup` cascade (Apple Music /
+    // Spotify / Discogs fan-out) exceeded the 8s canaryFetch budget, so the
+    // good-bearer probe aborted. A timeout says nothing about the bearer, so the
+    // check must abstain — not page on-call every other 5-minute cycle.
+    const abortError = new Error('The operation was aborted');
+    abortError.name = 'AbortError';
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const urlString = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      if (urlString.includes('/healthcheck')) return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      if (urlString.includes('/proxy/library/search'))
+        return new Response(JSON.stringify(proxyLibrarySearchResponse), { status: 200 });
+      if (urlString.includes('/graph/artists/search'))
+        return new Response(JSON.stringify({ results: [{ id: 1 }] }), { status: 200 });
+      if (urlString.includes('lml.example.test/api/v1/lookup')) throw abortError;
+      return new Response(`unmatched mock for ${urlString}`, { status: 599 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const outcomes = await runCanary(lmlAuthConfig);
+    const lml = outcomes.find((o) => o.name === 'lml-auth')!;
+
+    expect(lml.status).toBe('skipped');
+    expect(lml.message).toMatch(/good-bearer/);
+    expect(lml.message).toMatch(/timed out/);
+    expect(lml.message).toMatch(/indeterminate/);
+    expect(lml.message).not.toMatch(/rotation drift/);
+  });
+
+  it('abstains (skipped) when the known-bad-bearer probe times out — also indeterminate', async () => {
+    // Good probe succeeds (2xx) but the second probe aborts. The try/catch on
+    // the bad-bearer fetch is a distinct branch from the good-bearer one; pin
+    // it so a future refactor can't drop the catch and re-introduce the flap.
+    const abortError = new Error('The operation was aborted');
+    abortError.name = 'AbortError';
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const urlString = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      if (urlString.includes('/healthcheck')) return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      if (urlString.includes('/proxy/library/search'))
+        return new Response(JSON.stringify(proxyLibrarySearchResponse), { status: 200 });
+      if (urlString.includes('/graph/artists/search'))
+        return new Response(JSON.stringify({ results: [{ id: 1 }] }), { status: 200 });
+      if (urlString.includes('lml.example.test/api/v1/lookup')) {
+        const headers = (init?.headers ?? {}) as Record<string, string>;
+        const auth = headers.Authorization ?? headers.authorization ?? '';
+        if (auth.includes('wxyc-canary-probe-not-a-real-key')) throw abortError;
+        return new Response(JSON.stringify({ results: [], cache_stats: {} }), { status: 200 });
+      }
+      return new Response(`unmatched mock for ${urlString}`, { status: 599 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const outcomes = await runCanary(lmlAuthConfig);
+    const lml = outcomes.find((o) => o.name === 'lml-auth')!;
+
+    expect(lml.status).toBe('skipped');
+    expect(lml.message).toMatch(/known-bad-bearer/);
+    expect(lml.message).toMatch(/indeterminate/);
   });
 
   it('sends the bearer as Authorization: Bearer and posts a structured artist/album/song body', async () => {
