@@ -1,4 +1,4 @@
-import { canaryFetch, type FetchResult } from './client.js';
+import { canaryFetch, CanaryFetchError, type FetchResult } from './client.js';
 import { runEnrichmentCheck } from './enrichment-check.js';
 import type { Check, CheckResult, Suite } from './types.js';
 
@@ -342,15 +342,27 @@ const LML_KNOWN_BAD_BEARER = 'wxyc-canary-probe-not-a-real-key';
  * alarm, predicate didn't know about auth).
  *
  * Two probes per tick:
- *   1. Known-good bearer (`ctx.lmlApiKey`) must return 2xx. 401/403 here
- *      is the rotation-drift signal; 5xx points at LML itself.
- *   2. Known-bad bearer (`wxyc-canary-probe-not-a-real-key`) must return
- *      401/403. A 200 means LML's auth flag was disabled or rolled back
- *      (LML_REQUIRE_AUTH=false) and the good-bearer probe alone can't
- *      detect that — the broader regression the parent BS#1094 was filed
- *      to catch. Distinct error message ("auth disabled") so operator
- *      routing differs from rotation drift (which is "re-coordinate
- *      consumer rotation", not "re-enable LML auth").
+ *   1. Known-good bearer (`ctx.lmlApiKey`): a 401/403 is the rotation-drift
+ *      signal and PAGES. A clean 2xx advances to probe 2.
+ *   2. Known-bad bearer (`wxyc-canary-probe-not-a-real-key`): a 200 means
+ *      LML's auth flag was disabled or rolled back (LML_REQUIRE_AUTH=false)
+ *      and the good-bearer probe alone can't detect that — the broader
+ *      regression the parent BS#1094 was filed to catch. It PAGES with a
+ *      distinct "auth disabled" message so operator routing differs from
+ *      rotation drift (which is "re-coordinate consumer rotation", not
+ *      "re-enable LML auth"). A clean 401/403 is the expected pass.
+ *
+ * This check PAGES ONLY on a definitive auth verdict (good-bearer 401/403,
+ * bad-bearer 200). Anything else — a timeout, a network error, a 5xx, a 429,
+ * or any other non-2xx that isn't a clean auth rejection — leaves the auth
+ * state INDETERMINATE (we can't tell whether the bearer is valid because LML
+ * never gave a verdict), so the check returns `skipped` rather than failing.
+ * Rationale: LML availability/latency is already a paging surface via
+ * `proxy-library-search` (BS→LML) and the dj-* checks, and the cold
+ * `/api/v1/lookup` path can exceed the 8s `canaryFetch` budget under load
+ * (Apple Music / Spotify / Discogs fan-out; see WXYC/library-metadata-lookup
+ * cold-path latency). A timeout there says nothing about the bearer, so this
+ * auth probe must not flap the page on it (wxyc-canary alarm-noise, 2026-06-27).
  *
  * Skips when no LML bearer is configured (operator gap, mirrors the
  * DJ-credentials pattern). The probe payload uses a canonical
@@ -377,15 +389,30 @@ const lmlAuth: Check = {
       raw_message: 'Juana Molina - la paradoja (DOGA)',
     });
 
-    // Probe 1: known-good bearer must succeed.
-    const good = await canaryFetch(`${ctx.lmlUrl}/api/v1/lookup`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${ctx.lmlApiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body,
-    });
+    // Probe 1: known-good bearer. A timeout/network error means LML never
+    // answered — auth state is indeterminate, not drifted — so abstain
+    // (skipped) rather than page. LML being slow/down is already a paging
+    // surface elsewhere; this auth probe must not flap the page on the cold
+    // `/api/v1/lookup` exceeding the 8s budget.
+    let good: FetchResult;
+    try {
+      good = await canaryFetch(`${ctx.lmlUrl}/api/v1/lookup`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${ctx.lmlApiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body,
+      });
+    } catch (err) {
+      if (err instanceof CanaryFetchError) {
+        return {
+          skipped: true,
+          skipReason: `LML did not answer the good-bearer probe (${err.message}); auth state indeterminate`,
+        };
+      }
+      throw err;
+    }
     if (good.status === 401 || good.status === 403) {
       // Distinct message so the operator sees "rotation drift" not "LML
       // down". The bearer is rolled across BS + rom + tubafrenzy + canary;
@@ -395,20 +422,37 @@ const lmlAuth: Check = {
       );
     }
     if (!good.ok) {
-      throw new Error(`expected 2xx, got ${good.status}: ${good.rawText.slice(0, 200)}`);
+      // Not a clean 2xx and not a clean auth rejection (5xx, 429, 400, ...).
+      // That tells us LML is unhealthy, not that the bearer drifted, so the
+      // auth verdict is indeterminate — abstain rather than page.
+      return {
+        skipped: true,
+        skipReason: `LML good-bearer probe got ${good.status} (not 2xx, not 401/403); auth state indeterminate: ${good.rawText.slice(0, 200)}`,
+      };
     }
 
     // Probe 2: known-bad bearer must be rejected. Catches LML_REQUIRE_AUTH
     // being flipped off or rolled back — the silent regression the
-    // good-bearer probe alone can't see.
-    const bad = await canaryFetch(`${ctx.lmlUrl}/api/v1/lookup`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${LML_KNOWN_BAD_BEARER}`,
-        'Content-Type': 'application/json',
-      },
-      body,
-    });
+    // good-bearer probe alone can't see. Same abstain-on-indeterminate rule.
+    let bad: FetchResult;
+    try {
+      bad = await canaryFetch(`${ctx.lmlUrl}/api/v1/lookup`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${LML_KNOWN_BAD_BEARER}`,
+          'Content-Type': 'application/json',
+        },
+        body,
+      });
+    } catch (err) {
+      if (err instanceof CanaryFetchError) {
+        return {
+          skipped: true,
+          skipReason: `LML did not answer the known-bad-bearer probe (${err.message}); auth state indeterminate`,
+        };
+      }
+      throw err;
+    }
     if (bad.status === 200) {
       // LML accepted a deliberately-bad bearer — auth is disabled upstream.
       // Operator routing differs from rotation drift: this is "re-enable
@@ -418,12 +462,13 @@ const lmlAuth: Check = {
       );
     }
     if (bad.status !== 401 && bad.status !== 403) {
-      // Ambiguous: not a clean "auth enabled" (401/403) and not a clean
-      // "auth disabled" (200). 5xx falls here. Surface as its own class so
-      // it doesn't get conflated with the good-bearer 5xx ("LML down") path.
-      throw new Error(
-        `LML returned ${bad.status} for known-bad bearer (expected 401/403): ${bad.rawText.slice(0, 200)}`
-      );
+      // Neither a clean "auth enabled" (401/403) nor the "auth disabled"
+      // (200) signal — a 5xx/429/etc. The auth verdict is indeterminate, so
+      // abstain rather than page (LML health is covered by other checks).
+      return {
+        skipped: true,
+        skipReason: `LML known-bad-bearer probe got ${bad.status} (expected 401/403); auth state indeterminate: ${bad.rawText.slice(0, 200)}`,
+      };
     }
   },
 };
