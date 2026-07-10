@@ -96,10 +96,13 @@ function setUpFetchMock(responses: Record<string, StubEntry>) {
     for (const [pattern, resp] of Object.entries(responses)) {
       if (urlString.includes(pattern)) {
         const materialized = 'dynamic' in resp ? resp.dynamic(urlString) : resp;
-        return new Response(typeof materialized.body === 'string' ? materialized.body : JSON.stringify(materialized.body), {
-          status: materialized.status,
-          headers: { 'Content-Type': 'application/json', ...(materialized.headers ?? {}) },
-        });
+        return new Response(
+          typeof materialized.body === 'string' ? materialized.body : JSON.stringify(materialized.body),
+          {
+            status: materialized.status,
+            headers: { 'Content-Type': 'application/json', ...(materialized.headers ?? {}) },
+          }
+        );
       }
     }
     // Explicit fail for the OIDC probe endpoint. Historically a silent
