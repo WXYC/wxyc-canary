@@ -134,8 +134,8 @@ Parameters:
       (WXYC/Backend-Service#1576) — a mismatch fails the probe with
       `authorize expected 302, got 400: invalid client_id`. Overridable so
       a future rev of the trusted client's id doesn't require a code
-      change here; empty-string picks up the handler default (same rule
-      as the runner-liveness fields).
+      change here; empty-string picks up the handler default (`||`, not
+      `??`, in src/handler.ts).
   OidcProbeRedirectUri:
     Type: String
     Default: https://canary.wxyc.org/authorize-echo

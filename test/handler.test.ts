@@ -3104,16 +3104,8 @@ describe('runCanary — oidc-authorize check (wxyc-canary#60)', () => {
     // via either 302 or 303. better-auth currently returns 302, but a future
     // rev could switch to 303 without breaking the protocol. The check must
     // not flap on that rev.
-    setUpAuthorizeMock({
-      status: 303,
-      body: '',
-      headers: {
-        // Any state — mock echoes what the check sent. But setUpAuthorizeMock
-        // returns a static Location that doesn't echo state, so this test
-        // uses a helper that DOES echo state. Fall through to raw fetch.
-      },
-    });
-    // The static helper doesn't echo state; build a bespoke fetch that does.
+    // The static `setUpAuthorizeMock` helper doesn't echo state (returns a
+    // static Location); build a bespoke fetch that does.
     const fetchMock = vi.fn(async (input: string | URL | Request) => {
       const urlString = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
       if (urlString.includes('/oauth2/authorize')) {
