@@ -251,10 +251,14 @@ export const oidcAuthorize: Check = {
       throw new Error(`authorize expected 302, got ${r.status}: ${redactCodeAndState(r.rawText).slice(0, 200)}`);
     }
 
-    const location = r.headers?.location;
+    const location = r.location;
     if (!location) {
-      // 3xx without a Location header is malformed. `canaryFetch` lowercases
-      // header names, so this covers `Location:` too.
+      // 3xx without a Location header is malformed. `FetchResult.location`
+      // is the typed accessor over `headers.location` (canaryFetch
+      // lowercases on the way out), so this covers `Location:` too.
+      // Reading through the accessor instead of `headers?.location` means
+      // a call-site can't type `headers?.Location` (title-case) and
+      // silently read `undefined` — see wxyc-canary#64.
       throw new Error(`authorize returned ${r.status} with no Location header`);
     }
 
