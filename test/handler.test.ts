@@ -1259,6 +1259,27 @@ describe('runCanary — sign-in 429 retry carve-out', () => {
           });
         }
       }
+      // R3-4: explicit fail-loud for `/oauth2/authorize`, mirroring the
+      // discipline `setUpFetchMock` gained in R2-F2. The 5 tests in this
+      // block are DJ-credentialed sign-in retry probes and don't own the
+      // oidc-authorize outcome. Without an explicit stub, a future
+      // regression in the check (dropped `redirect: manual`, broken URL
+      // construction, throw in `run`) is absorbed by the generic 599
+      // fallback below. That's fine today because none of those tests
+      // assert on the oidc-authorize outcome — but if this helper ever
+      // grows a synthesized happy-path fallback (the same convenience
+      // that lived in `setUpFetchMock` pre-R2-F2), every regression to
+      // the check gets silently masked. The distinct message makes the
+      // "you forgot to stub /oauth2/authorize" case grep-friendly in
+      // test output.
+      if (urlString.includes('/oauth2/authorize')) {
+        return new Response(
+          `unmatched mock for /oauth2/authorize — stitch AUTHORIZE_ECHO_STATE_STUB or own the fail outcome (R3-4)`,
+          {
+            status: 599,
+          }
+        );
+      }
       return new Response(`unmatched mock for ${urlString}`, { status: 599 });
     });
     vi.stubGlobal('fetch', fetchMock);
@@ -1379,6 +1400,48 @@ describe('runCanary — sign-in 429 retry carve-out', () => {
 
     const tokenCalls = fetchMock.mock.calls.filter(([url]) => String(url).endsWith('/token'));
     expect(tokenCalls).toHaveLength(1);
+  });
+
+  // R3-4: mirrors the R2-F2 regression test at the top of the oidc-authorize
+  // describe block, but for `setUpSequentialFetchMock`. R2-F2 hardened
+  // `setUpFetchMock` against a silent 302 fallback; the parallel dispatcher
+  // used by these retry tests never had that fallback either, but the fail-
+  // loud discipline was only pinned for `setUpFetchMock`. Pin it here too
+  // so if this helper ever grows a convenience 302 fallback (the same
+  // shape that masked oidc-authorize regressions in DJ-credentialed
+  // `setUpFetchMock` tests for the R2 window), a re-introduction
+  // regresses THIS test rather than silently making all 5 sign-in-retry
+  // tests pass on a synthesized happy authorize outcome.
+  it('setUpSequentialFetchMock fails loudly on an unstubbed /oauth2/authorize (R3-4 regression)', async () => {
+    // Successful sign-in so the check reaches the authorize step and the
+    // 599 fallback is exercised (not skipped by the auth-precondition guard).
+    setUpSequentialFetchMock({
+      '/healthcheck': [{ status: 200, body: { ok: true } }],
+      '/proxy/library/search': [{ status: 200, body: proxyLibrarySearchResponse }],
+      '/graph/artists/search': [{ status: 200, body: { results: [{ id: 1, canonical_name: 'stereolab' }] } }],
+      'explore.example.test/health': [
+        {
+          status: 200,
+          body: { status: 'healthy', artist_count: 136_702, graph_db_age_seconds: 3_600 },
+        },
+      ],
+      '/sign-in/email': [{ status: 200, body: { token: 'fake-session-token', user: { id: 'u1' } } }],
+      '/token': [{ status: 200, body: { token: 'fake-jwt' } }],
+      '/library/?artist_name=': [{ status: 200, body: stereolabSearchResults }],
+      '/flowsheet': [{ status: 200, body: [] }],
+      '/library/rotation': [{ status: 200, body: [] }],
+      // Deliberately no `/oauth2/authorize` stub.
+    });
+
+    const outcomes = await runCanary({ ...baseConfig, djEmail: 'canary@wxyc.org', djPassword: 'pw' });
+    const oidc = outcomes.find((o) => o.name === 'oidc-authorize')!;
+
+    // The check MUST fail — no silent-pass fallback in the parallel
+    // dispatcher.
+    expect(oidc.status).toBe('fail');
+    // The 599 fallback body carries the R3-4 sentinel so future test
+    // output makes the misconfiguration obvious.
+    expect(oidc.message).toMatch(/599|R3-4|unmatched mock/);
   });
 });
 
