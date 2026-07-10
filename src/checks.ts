@@ -733,6 +733,29 @@ const redactCodeAndState = (s: string): string =>
     .replace(/("state"\s*:\s*")[^"]+"/gi, '$1<redacted>"');
 
 /**
+ * Normalize a URL pathname so `/authorize-echo`, `/authorize-echo/`, and
+ * `/authorize-echo//` all compare equal. RFC 3986 §6.2.3 (Scheme-Based
+ * Normalization) allows treating trailing-slash variants of a hierarchical
+ * path as equivalent — and if the trusted-client registration and the CFN
+ * `OidcProbeRedirectUri` param drift by any slash count, the check would
+ * page on-call every tick for a no-actual-regression cause. The subdomain
+ * / prefix-bypass guard is unaffected because it lives on `origin`, not
+ * pathname.
+ *
+ * Strips ALL trailing slashes rather than one so a `base + '/' + path`
+ * concatenation bug on either side that produces `//` still compares
+ * equal. The `|| '/'` fallback preserves the root path so an
+ * `/`-only-configured redirect URI doesn't collapse to empty and start
+ * accidentally matching every other Location.
+ *
+ * Hoisted to module scope for the same reason as `redactCodeAndState`
+ * (see its docstring): a per-tick arrow function inside `run` re-creates
+ * on every tick and drifts silently if a future error branch grows its
+ * own inline normalizer.
+ */
+const normalizePath = (p: string): string => p.replace(/\/+$/, '') || '/';
+
+/**
  * OIDC code + PKCE authorize probe. The load-bearing check that would have
  * caught WXYC/Backend-Service#1571 — the `oauthConsent` schema-drift 500 —
  * before the flowsheet-digitization verifier tripped over it in production.
@@ -869,15 +892,10 @@ const oidcAuthorize: Check = {
         `oidcProbeRedirectUri is not a valid URL — configuration error: ${ctx.oidcProbeRedirectUri.slice(0, 200)}`
       );
     }
-    // Normalize a single trailing slash on both sides before compare — RFC
-    // 3986 §6.2.2.3 considers `/authorize-echo` and `/authorize-echo/` the
-    // same resource, and if the trusted-client registration and the CFN
-    // param drift by a single slash every tick pages on-call for a
-    // no-actual-regression cause. Normalize root ("/") to itself, otherwise
-    // strip a single trailing "/" so `.../authorize-echo` and
-    // `.../authorize-echo/` compare equal. The subdomain-injection guard
-    // still holds because origin includes the host.
-    const normalizePath = (p: string): string => (p.length > 1 && p.endsWith('/') ? p.slice(0, -1) : p);
+    // Normalize trailing slashes on both sides before compare — see
+    // `normalizePath` for the RFC citation + why we strip ALL of them
+    // instead of one. Origin still contains the host, so the
+    // subdomain-injection guard is untouched.
     if (parsed.origin !== expected.origin || normalizePath(parsed.pathname) !== normalizePath(expected.pathname)) {
       throw new Error(
         `authorize 302 Location does not match the probe redirect URI origin+path (session invalidated, trusted client missing, or redirect regression): ${redactCodeAndState(location).slice(0, 200)}`
