@@ -87,4 +87,5 @@ jobs:
               LmlApiKeySecretArn=${{ secrets.LML_API_KEY_SECRET_ARN }} \
               DjCredentialsSecretArn=${{ secrets.DJ_CREDENTIALS_SECRET_ARN }} \
               AlertEmail=${{ vars.ALERT_EMAIL }} \
+              OidcProbeRedirectUri=${{ vars.OIDC_PROBE_REDIRECT_URI || 'https://canary.wxyc.invalid/authorize-echo' }} \
               "${OPTIONAL_ARGS[@]}"
