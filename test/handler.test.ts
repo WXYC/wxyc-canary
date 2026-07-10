@@ -53,34 +53,64 @@ const stereolabSearchResults = [
 
 const proxyLibrarySearchResponse = { results: stereolabSearchResults, total: 1, query: 'Stereolab' };
 
-function setUpFetchMock(responses: Record<string, { status: number; body: unknown }>) {
+/**
+ * A single stub entry: either a static `{status, body, headers?}` (the
+ * historic shape) OR a `dynamic` function that receives the request URL
+ * and returns the response shape. The dynamic form is what
+ * `AUTHORIZE_ECHO_STATE_STUB` uses — the `state=` query param is per-tick
+ * random, so a static Location can't echo it.
+ */
+type StubEntry =
+  | { status: number; body: unknown; headers?: Record<string, string> }
+  | {
+      dynamic: (url: string) => { status: number; body: unknown; headers?: Record<string, string> };
+    };
+
+/**
+ * Reusable stub for the OIDC `/oauth2/authorize` endpoint that mimics a
+ * happy 302: echoes the per-tick random `state` back in the Location
+ * header and stubs a `code=canned-code` so the check's post-check
+ * parity assertion holds. Every DJ-credentialed test that doesn't
+ * explicitly care about oidc-authorize's outcome should stitch this
+ * into its `setUpFetchMock` responses under the `/oauth2/authorize`
+ * key — the fallback used to synthesize this silently, which masked
+ * every oidc-authorize regression in the DJ-credentialed test suite
+ * (R2-F2). The stub lives here so tests share ONE dispatcher shape.
+ */
+const AUTHORIZE_ECHO_STATE_STUB: StubEntry = {
+  dynamic: (url: string) => {
+    const state = new URL(url).searchParams.get('state') ?? '';
+    return {
+      status: 302,
+      body: '',
+      headers: {
+        Location: `https://canary.wxyc.org/authorize-echo?code=canned-code&state=${encodeURIComponent(state)}`,
+      },
+    };
+  },
+};
+
+function setUpFetchMock(responses: Record<string, StubEntry>) {
   const fetchMock = vi.fn(async (input: string | URL | Request) => {
     const urlString = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
     for (const [pattern, resp] of Object.entries(responses)) {
       if (urlString.includes(pattern)) {
-        return new Response(typeof resp.body === 'string' ? resp.body : JSON.stringify(resp.body), {
-          status: resp.status,
-          headers: { 'Content-Type': 'application/json' },
+        const materialized = 'dynamic' in resp ? resp.dynamic(urlString) : resp;
+        return new Response(typeof materialized.body === 'string' ? materialized.body : JSON.stringify(materialized.body), {
+          status: materialized.status,
+          headers: { 'Content-Type': 'application/json', ...(materialized.headers ?? {}) },
         });
       }
     }
-    // Default `/oauth2/authorize` fallback so DJ-credentialed tests that
-    // don't explicitly stub the OIDC probe get a canned pass instead of
-    // the 599 fallback (which makes `oidc-authorize` a spurious `fail`
-    // shape in unrelated tests' outcome lists). Explicit stubs still win —
-    // the `responses` loop above runs first. Only fires for the OIDC
-    // authorize endpoint; every other unstubbed URL still 599s so a real
-    // missing stub is not silently absorbed.
-    if (urlString.includes('/oauth2/authorize')) {
-      const url = new URL(urlString);
-      const state = url.searchParams.get('state') ?? '';
-      return new Response(null, {
-        status: 302,
-        headers: {
-          Location: `https://canary.wxyc.org/authorize-echo?code=canned-code&state=${encodeURIComponent(state)}`,
-        },
-      });
-    }
+    // Explicit fail for the OIDC probe endpoint. Historically a silent
+    // canned 302 fallback lived here (R2-F2), which meant DJ-credentialed
+    // tests that never explicitly stubbed `/oauth2/authorize` synthesized
+    // a happy pass — masking any future oidc-authorize regression
+    // (dropped `redirect: manual`, broken URL construction, throw in
+    // `run`) in those tests' outcome lists. Every DJ-credentialed test
+    // must now either stitch `AUTHORIZE_ECHO_STATE_STUB` into its
+    // responses or explicitly own the `fail` outcome. Every other
+    // unstubbed URL still returns 599 for the same reason.
     return new Response(`unmatched mock for ${urlString}`, { status: 599 });
   });
   vi.stubGlobal('fetch', fetchMock);
@@ -158,6 +188,7 @@ describe('runCanary — failure surfaces (regression coverage for the 2026-04-30
       },
       '/flowsheet': { status: 200, body: [] },
       '/library/rotation': { status: 200, body: [] },
+      '/oauth2/authorize': AUTHORIZE_ECHO_STATE_STUB,
     });
 
     const outcomes = await runCanary({ ...baseConfig, djEmail: 'canary@wxyc.org', djPassword: 'pw' });
@@ -192,6 +223,7 @@ describe('runCanary — failure surfaces (regression coverage for the 2026-04-30
       '/library/?artist_name=': { status: 200, body: stereolabSearchResults },
       '/flowsheet': { status: 200, body: [] },
       '/library/rotation': { status: 200, body: [] },
+      '/oauth2/authorize': AUTHORIZE_ECHO_STATE_STUB,
     });
 
     const outcomes = await runCanary({ ...baseConfig, djEmail: 'canary@wxyc.org', djPassword: 'pw' });
@@ -211,6 +243,7 @@ describe('runCanary — failure surfaces (regression coverage for the 2026-04-30
       '/library/?artist_name=': { status: 200, body: [] },
       '/flowsheet': { status: 200, body: [] },
       '/library/rotation': { status: 200, body: [] },
+      '/oauth2/authorize': AUTHORIZE_ECHO_STATE_STUB,
     });
 
     const outcomes = await runCanary({ ...baseConfig, djEmail: 'canary@wxyc.org', djPassword: 'pw' });
@@ -239,6 +272,7 @@ describe('runCanary — failure surfaces (regression coverage for the 2026-04-30
       '/flowsheet': { status: 200, body: [] },
       '/library/rotation/21522/tracks': { status: 502, body: { message: 'lookupReleaseId: LML cascade timed out' } },
       '/library/rotation': { status: 200, body: [{ id: 21522 }] },
+      '/oauth2/authorize': AUTHORIZE_ECHO_STATE_STUB,
     });
 
     const outcomes = await runCanary({ ...baseConfig, djEmail: 'canary@wxyc.org', djPassword: 'pw' });
@@ -259,6 +293,7 @@ describe('runCanary — failure surfaces (regression coverage for the 2026-04-30
       '/flowsheet': { status: 200, body: [] },
       '/library/rotation/4242/tracks': { status: 200, body: [{ id: 1, title: 'la paradoja' }] },
       '/library/rotation': { status: 200, body: [{ id: 4242 }] },
+      '/oauth2/authorize': AUTHORIZE_ECHO_STATE_STUB,
     });
 
     const outcomes = await runCanary({ ...baseConfig, djEmail: 'canary@wxyc.org', djPassword: 'pw' });
@@ -277,6 +312,7 @@ describe('runCanary — failure surfaces (regression coverage for the 2026-04-30
       '/library/?artist_name=': { status: 200, body: stereolabSearchResults },
       '/flowsheet': { status: 200, body: [] },
       '/library/rotation': { status: 200, body: [] },
+      '/oauth2/authorize': AUTHORIZE_ECHO_STATE_STUB,
     });
 
     const outcomes = await runCanary({ ...baseConfig, djEmail: 'canary@wxyc.org', djPassword: 'pw' });
@@ -296,6 +332,7 @@ describe('runCanary — failure surfaces (regression coverage for the 2026-04-30
       '/library/?artist_name=': { status: 200, body: stereolabSearchResults },
       '/flowsheet': { status: 200, body: [] },
       '/library/rotation': { status: 200, body: [] },
+      '/oauth2/authorize': AUTHORIZE_ECHO_STATE_STUB,
     });
 
     const outcomes = await runCanary({ ...baseConfig, djEmail: 'canary@wxyc.org', djPassword: 'pw' });
@@ -1631,7 +1668,7 @@ describe('publishMetrics — tier split (UserFacingCheckFailure / InfraCheckFail
         '/library/?artist_name=': { status: 200, body: stereolabSearchResults },
         '/flowsheet': { status: 200, body: [] },
         '/library/rotation': { status: 200, body: { not: 'an array' } },
-      } as Record<string, { status: number; body: unknown }>,
+      } as Record<string, StubEntry>,
     },
     {
       name: 'dj-rotation-picker',
@@ -1643,7 +1680,7 @@ describe('publishMetrics — tier split (UserFacingCheckFailure / InfraCheckFail
         '/flowsheet': { status: 200, body: [] },
         '/library/rotation/4242/tracks': { status: 502, body: { message: 'LML cascade timed out' } },
         '/library/rotation': { status: 200, body: [{ id: 4242 }] },
-      } as Record<string, { status: number; body: unknown }>,
+      } as Record<string, StubEntry>,
     },
   ])('pages when only $name fails (untagged but user-facing)', async ({ name, mocks }) => {
     process.env.CANARY_DJ_EMAIL = 'canary@wxyc.org';
@@ -1658,6 +1695,7 @@ describe('publishMetrics — tier split (UserFacingCheckFailure / InfraCheckFail
       },
       '/sign-in/email': { status: 200, body: { token: 'fake-session-token', user: { id: 'u1' } } },
       '/token': { status: 200, body: { token: 'fake-jwt' } },
+      '/oauth2/authorize': AUTHORIZE_ECHO_STATE_STUB,
       ...mocks,
     });
 
@@ -2479,6 +2517,46 @@ describe('runCanary — oidc-authorize check (wxyc-canary#60)', () => {
 
   afterEach(() => {
     vi.unstubAllGlobals();
+  });
+
+  // R2-F2: the historical `setUpFetchMock` fallback synthesized a canned
+  // happy 302 for `/oauth2/authorize` so DJ-credentialed tests that didn't
+  // explicitly stub it got a silent pass. That masked oidc-authorize
+  // regressions (throw in `run`, dropped `redirect: manual`, broken URL
+  // construction) in every DJ-credentialed test that didn't own the check
+  // outcome. The fallback is gone — an unstubbed `/oauth2/authorize` now
+  // hits the generic 599 branch, which forces the check to fail loudly.
+  // This test pins that shape so a future re-introduction of a silent
+  // fallback in `setUpFetchMock` regresses this test rather than silently
+  // masking every DJ-credentialed test's oidc-authorize outcome.
+  it('fails loudly (not silently passes) when a DJ-credentialed test forgets to stub /oauth2/authorize (R2-F2 regression)', async () => {
+    // A minimal DJ-credentialed setup that stubs everything BUT
+    // `/oauth2/authorize`. The check runs (sign-in succeeds, session token
+    // is available) and hits the 599 fallback.
+    setUpFetchMock({
+      '/healthcheck': { status: 200, body: { ok: true } },
+      '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+      '/graph/artists/search': { status: 200, body: { results: [{ id: 1, canonical_name: 'stereolab' }] } },
+      'explore.example.test/health': {
+        status: 200,
+        body: { status: 'healthy', artist_count: 136_702, graph_db_age_seconds: 3_600 },
+      },
+      '/sign-in/email': { status: 200, body: { token: 'fake-session-token', user: { id: 'u1' } } },
+      '/token': { status: 200, body: { token: 'fake-jwt' } },
+      '/library/?artist_name=': { status: 200, body: stereolabSearchResults },
+      '/flowsheet': { status: 200, body: [] },
+      '/library/rotation': { status: 200, body: [] },
+      // Deliberately no `/oauth2/authorize` stub.
+    });
+
+    const outcomes = await runCanary({ ...baseConfig, djEmail: 'canary@wxyc.org', djPassword: 'pw' });
+    const oidc = outcomes.find((o) => o.name === 'oidc-authorize')!;
+
+    // The check MUST fail — no silent-pass fallback in the mock harness.
+    expect(oidc.status).toBe('fail');
+    // The failure message reflects the 599 branch (unmatched mock), which is
+    // how the harness makes forgotten stubs visible.
+    expect(oidc.message).toMatch(/599|unmatched mock/);
   });
 
   // `setUpFetchMock` matches by URL substring only; the check needs to
