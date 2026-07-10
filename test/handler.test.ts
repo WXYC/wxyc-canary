@@ -2759,6 +2759,51 @@ describe('runCanary — oidc-authorize check (wxyc-canary#60)', () => {
     expect((oidc.message ?? '').length).toBeLessThan(500);
   });
 
+  // R2-F3: the original redactor was URL-shape only (`/code=[^&\s"']+/g`).
+  // Better-auth 5xx envelopes are JSON — a future error envelope that
+  // included a minted code as a JSON key would slip through the URL-shape
+  // filter. Pin the JSON-shape redaction so the invariant survives that
+  // envelope change.
+  it('does not leak a code carried as a JSON key on a 5xx response body (R2-F3 regression)', async () => {
+    setUpAuthorizeMock({
+      status: 500,
+      body: { error: 'internal server error', code: 'SUPER-SECRET-JSON' },
+    });
+
+    const outcomes = await runCanary({ ...baseConfig, djEmail: 'canary@wxyc.org', djPassword: 'pw' });
+    const oidc = outcomes.find((o) => o.name === 'oidc-authorize')!;
+
+    expect(oidc.status).toBe('fail');
+    expect(oidc.message).not.toMatch(/SUPER-SECRET-JSON/);
+    // Sanity: the 500 status still lands (redaction must not blank the whole
+    // body — only the sensitive value).
+    expect(oidc.message).toMatch(/500/);
+  });
+
+  // R2-F3: `state` gets the same treatment. Line 823 ("state does not match")
+  // deliberately prints only the mismatch fact, never the returned value.
+  // The sibling error branches (5xx, non-3xx, invalid URL, wrong redirect)
+  // must not silently leak state via the raw-body slice — the URL and JSON
+  // forms both get redacted.
+  it('does not leak state carried in the raw body slice on a 5xx (URL and JSON forms) (R2-F3 regression)', async () => {
+    setUpAuthorizeMock({
+      status: 500,
+      body: {
+        error: 'internal server error',
+        state: 'SUPER-SECRET-STATE-JSON',
+        detail: 'redirected from state=SUPER-SECRET-STATE-URL previously',
+      },
+    });
+
+    const outcomes = await runCanary({ ...baseConfig, djEmail: 'canary@wxyc.org', djPassword: 'pw' });
+    const oidc = outcomes.find((o) => o.name === 'oidc-authorize')!;
+
+    expect(oidc.status).toBe('fail');
+    // Neither URL-form nor JSON-form state values must appear in the alert.
+    expect(oidc.message).not.toMatch(/SUPER-SECRET-STATE-JSON/);
+    expect(oidc.message).not.toMatch(/SUPER-SECRET-STATE-URL/);
+  });
+
   it('fails on a crafted Location that starts-with the redirect URI but is a different origin+path (prefix bypass regression)', async () => {
     // An attacker (or a betterauth regression) that echoes a Location whose
     // string starts with the probe redirect URI but does NOT actually match
