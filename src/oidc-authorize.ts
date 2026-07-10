@@ -197,7 +197,8 @@ const normalizePath = (p: string): string => p.replace(/\/+$/, '') || '/';
  * alarm rather than N.
  *
  * Contract (each tick, per probe):
- *   1. Reuse the session token from `signInDj` (already in `ctx.djSessionToken`).
+ *   1. Reuse the session token from `signInDj` (available on the `signed-in`
+ *      narrowing of `ctx.djAuth` as `ctx.djAuth.sessionToken` — wxyc-canary#65).
  *   2. GET `/auth/oauth2/authorize?response_type=code&client_id=<probe>
  *      &redirect_uri=<probe-callback>&scope=openid+profile+email
  *      &state=<random>&code_challenge=<S256(v)>&code_challenge_method=S256`
