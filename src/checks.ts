@@ -711,20 +711,6 @@ export function checksForSuite(suite: Suite): readonly Check[] {
 }
 
 /**
- * Parse a `Retry-After` header in seconds form (the date form is rare on
- * better-auth and not handled). Returns milliseconds, or undefined when
- * the header is missing/unparseable. Negative or non-finite values are
- * treated as missing.
- */
-function parseRetryAfterMs(result: FetchResult): number | undefined {
-  const raw = result.headers?.['retry-after'];
-  if (!raw) return undefined;
-  const seconds = Number(raw);
-  if (!Number.isFinite(seconds) || seconds < 0) return undefined;
-  return Math.round(seconds * 1000);
-}
-
-/**
  * Sign in to better-auth as a DJ and return a JWT suitable for the
  * `Authorization: Bearer ...` header on Backend-Service routes. Throws on
  * any failure — caller is responsible for downgrading DJ-auth checks to
@@ -781,7 +767,7 @@ export async function signInDj(
 
   let signIn = await postSignIn();
   if (signIn.status === 429) {
-    const delayMs = Math.min(parseRetryAfterMs(signIn) ?? 2000, 5000);
+    const delayMs = Math.min(signIn.retryAfterMs ?? 2000, 5000);
     await new Promise((resolve) => setTimeout(resolve, delayMs));
     signIn = await postSignIn();
   }

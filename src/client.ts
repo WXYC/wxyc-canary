@@ -14,6 +14,27 @@ export type FetchResult = {
   rawText: string;
   /** Lowercased response headers. Used for things like `Retry-After`. */
   headers: Record<string, string>;
+  /**
+   * The `Location` response header, or `undefined` when absent. Read
+   * through this instead of `headers?.location`: `canaryFetch` lowercases
+   * on the way out, so the string works today, but a call-site that types
+   * `Location` (title-case) silently reads `undefined` and fails the
+   * check with a misleading "no Location header" instead of the actual
+   * regression. The typed accessor enforces the lowercasing in one place,
+   * hides the `?.` chain, and gives TypeScript a discoverable field for
+   * every future 3xx-inspection call site. See wxyc-canary#64.
+   */
+  location: string | undefined;
+  /**
+   * The `Retry-After` header parsed as milliseconds (seconds form only —
+   * the date form is rare on better-auth and not handled). Returns
+   * `undefined` when the header is missing/unparseable/negative. Same
+   * rationale as `location`: the lowercasing + parsing happens in one
+   * place so a call-site can't type `Retry-After` (title-case) or skip
+   * the negative-check and silently do the wrong thing. See
+   * wxyc-canary#64.
+   */
+  retryAfterMs: number | undefined;
 };
 
 export class CanaryFetchError extends Error {
@@ -76,6 +97,19 @@ export async function canaryFetch(
       headers[key.toLowerCase()] = value;
     });
 
+    // Retry-After: seconds form only (the date form is rare on
+    // better-auth and not handled). Negative / non-finite / missing all
+    // collapse to `undefined` so a call-site can pattern-match on
+    // "known-good delay" vs "no signal" without duplicating the parse.
+    let retryAfterMs: number | undefined;
+    const retryAfterRaw = headers['retry-after'];
+    if (retryAfterRaw) {
+      const seconds = Number(retryAfterRaw);
+      if (Number.isFinite(seconds) && seconds >= 0) {
+        retryAfterMs = Math.round(seconds * 1000);
+      }
+    }
+
     return {
       status: response.status,
       ok: response.ok,
@@ -83,6 +117,8 @@ export async function canaryFetch(
       latencyMs,
       rawText,
       headers,
+      location: headers.location,
+      retryAfterMs,
     };
   } catch (err) {
     const latencyMs = Math.round(performance.now() - startedAt);
