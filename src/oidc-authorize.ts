@@ -173,7 +173,14 @@ const normalizePath = (p: string): string => p.replace(/\/+$/, '') || '/';
  *      (strict URL parse — never a `startsWith` on the raw string, which
  *      accepts `https://canary.wxyc.org/authorize-echo-attacker.example.com`
  *      as valid), has a non-empty `code` query param, and echoes the
- *      `state` we sent.
+ *      `state` we sent. A relative Location (RFC 7231 §7.1.2) is
+ *      resolved against the request URL before the compare — better-auth
+ *      does not emit relative Locations today, but a future rev or a
+ *      fronting proxy that rewrites them would otherwise fail with a
+ *      misleading "not a valid URL" against a spec-compliant response
+ *      (see wxyc-canary#66). Origin+pathname compare downstream still
+ *      enforces the exact match, so RFC compliance does not weaken the
+ *      anti-prefix-bypass guard.
  *
  * Fails on: non-302/303, missing/mismatched state, missing code, Location
  * pointing at a login page or crafted redirect (session invalidated), 5xx,
@@ -264,7 +271,17 @@ export const oidcAuthorize: Check = {
 
     let parsed: URL;
     try {
-      parsed = new URL(location);
+      // RFC 7231 §7.1.2 permits a relative `Location`; the client MUST
+      // resolve it against the request URL. Passing `url` (the
+      // authorize-endpoint request URL) as the base makes both
+      // `/authorize-echo?code=…` (relative) and
+      // `https://canary.wxyc.org/authorize-echo?code=…` (absolute) parse
+      // through this single call — an absolute URL ignores the base, a
+      // relative one resolves. The origin+pathname compare downstream
+      // still enforces the exact match against `ctx.oidcProbeRedirectUri`,
+      // so RFC compliance does not weaken the anti-prefix-bypass guard.
+      // See wxyc-canary#66.
+      parsed = new URL(location, url);
     } catch {
       throw new Error(`authorize 302 Location is not a valid URL: ${redactCodeAndState(location).slice(0, 200)}`);
     }

@@ -3734,6 +3734,205 @@ describe('runCanary — oidc-authorize check (wxyc-canary#60)', () => {
     expect(signInCalls).toBe(2);
     expect(oidc.status).toBe('pass');
   });
+
+  // wxyc-canary#66: RFC 7231 §7.1.2 permits a relative Location; the client
+  // MUST resolve it against the request URL. better-auth does not emit a
+  // relative Location today, but a future rev or a fronting proxy that
+  // rewrites Location would otherwise fail the check with the deliberately-
+  // loud "authorize 302 Location is not a valid URL" against a spec-compliant
+  // response. Pin: a relative Location parses cleanly and routes through the
+  // same origin+pathname compare an absolute Location does. Because the
+  // request URL is the AUTH server (`auth.example.test`) and the probe
+  // redirect URI is a DIFFERENT origin (`canary.wxyc.org`), the resolved
+  // absolute lands on the auth origin — so the check correctly fails the
+  // origin match. That failure shape is the guarantee: the check MUST NOT
+  // silently pass on a relative Location that resolves off-origin, AND it
+  // MUST NOT die with the "not a valid URL" message on RFC-legal input.
+  it('accepts a relative Location per RFC 7231 §7.1.2 and routes through the same origin+path compare as absolute (wxyc-canary#66)', async () => {
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const urlString = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      if (urlString.includes('/oauth2/authorize')) {
+        const url = new URL(urlString);
+        const state = url.searchParams.get('state') ?? '';
+        return new Response(null, {
+          status: 302,
+          // Relative Location — the shape a future better-auth rev or a
+          // fronting proxy that rewrites Location could emit. `new URL()`
+          // without a base throws on this input; the fix resolves against
+          // the request URL.
+          headers: {
+            Location: `/authorize-echo?code=abcd1234&state=${encodeURIComponent(state)}`,
+          },
+        });
+      }
+      const stubs: Record<string, { status: number; body: unknown }> = {
+        '/healthcheck': { status: 200, body: { ok: true } },
+        '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+        '/graph/artists/search': { status: 200, body: { results: [{ id: 1, canonical_name: 'stereolab' }] } },
+        'explore.example.test/health': {
+          status: 200,
+          body: { status: 'healthy', artist_count: 136_702, graph_db_age_seconds: 3_600 },
+        },
+        '/sign-in/email': { status: 200, body: { token: 'fake-session-token', user: { id: 'canary-user-id' } } },
+        '/token': { status: 200, body: { token: 'fake-jwt' } },
+        '/library/?artist_name=': { status: 200, body: stereolabSearchResults },
+        '/flowsheet': { status: 200, body: [] },
+        '/library/rotation': { status: 200, body: [] },
+      };
+      for (const [pattern, resp] of Object.entries(stubs)) {
+        if (urlString.includes(pattern)) {
+          return new Response(typeof resp.body === 'string' ? resp.body : JSON.stringify(resp.body), {
+            status: resp.status,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+      }
+      return new Response(`unmatched mock for ${urlString}`, { status: 599 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const outcomes = await runCanary({ ...baseConfig, djEmail: 'canary@wxyc.org', djPassword: 'pw' });
+    const oidc = outcomes.find((o) => o.name === 'oidc-authorize')!;
+
+    // The relative Location resolves against the AUTH request URL
+    // (`https://auth.example.test/oauth2/authorize`), which gives
+    // `https://auth.example.test/authorize-echo?…` — a different origin
+    // than the probe redirect URI (`canary.wxyc.org`). The check MUST
+    // fail on origin+pathname mismatch, NOT on unparseable-URL. That
+    // proves both (a) the URL parse succeeded (RFC compliance) and
+    // (b) the anti-prefix-bypass guard still holds.
+    expect(oidc.status).toBe('fail');
+    // The exact failure branch: origin+path mismatch, not "not a valid URL".
+    expect(oidc.message).toMatch(/redirect|Location/i);
+    expect(oidc.message).not.toMatch(/not a valid URL/);
+  });
+
+  it('accepts an on-origin relative Location and passes when it echoes code+state (wxyc-canary#66)', async () => {
+    // Companion to the previous test: when the auth server AND the
+    // trusted-client redirect share an origin (production has them on
+    // different subdomains — `api.wxyc.org/auth` vs
+    // `canary.wxyc.org/authorize-echo` — but a future consolidated deploy
+    // could put them on one host), a relative Location resolves cleanly
+    // and the check passes. Pin the positive branch too so a re-tightening
+    // of the resolver to absolute-only regresses this test.
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const urlString = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      if (urlString.includes('/oauth2/authorize')) {
+        const url = new URL(urlString);
+        const state = url.searchParams.get('state') ?? '';
+        return new Response(null, {
+          status: 302,
+          headers: {
+            Location: `/authorize-echo?code=abcd1234&state=${encodeURIComponent(state)}`,
+          },
+        });
+      }
+      const stubs: Record<string, { status: number; body: unknown }> = {
+        '/healthcheck': { status: 200, body: { ok: true } },
+        '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+        '/graph/artists/search': { status: 200, body: { results: [{ id: 1, canonical_name: 'stereolab' }] } },
+        'explore.example.test/health': {
+          status: 200,
+          body: { status: 'healthy', artist_count: 136_702, graph_db_age_seconds: 3_600 },
+        },
+        '/sign-in/email': { status: 200, body: { token: 'fake-session-token', user: { id: 'canary-user-id' } } },
+        '/token': { status: 200, body: { token: 'fake-jwt' } },
+        '/library/?artist_name=': { status: 200, body: stereolabSearchResults },
+        '/flowsheet': { status: 200, body: [] },
+        '/library/rotation': { status: 200, body: [] },
+      };
+      for (const [pattern, resp] of Object.entries(stubs)) {
+        if (urlString.includes(pattern)) {
+          return new Response(typeof resp.body === 'string' ? resp.body : JSON.stringify(resp.body), {
+            status: resp.status,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+      }
+      return new Response(`unmatched mock for ${urlString}`, { status: 599 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    // Configure the redirect URI to share the auth origin. The relative
+    // Location resolves against the request URL
+    // (`https://auth.example.test/oauth2/authorize`) → the resolved
+    // absolute becomes `https://auth.example.test/authorize-echo?…`,
+    // which matches the configured redirect URI on origin+path.
+    const outcomes = await runCanary({
+      ...baseConfig,
+      djEmail: 'canary@wxyc.org',
+      djPassword: 'pw',
+      oidcProbeRedirectUri: 'https://auth.example.test/authorize-echo',
+    });
+    const oidc = outcomes.find((o) => o.name === 'oidc-authorize')!;
+
+    expect(oidc.status).toBe('pass');
+  });
+
+  // wxyc-canary#66 regression sentinel: the anti-prefix-bypass guard MUST
+  // still fire on a crafted relative Location that resolves to a
+  // prefix-crafted origin+path. Belt-and-suspenders — the pin above
+  // already covers the origin mismatch path, but this one exercises the
+  // specific attack shape from R2-F1 (the `authorize-echo-attacker.example.com`
+  // sibling test) rewritten as a relative Location.
+  it('rejects a relative Location that resolves to a prefix-crafted path (wxyc-canary#66 regression)', async () => {
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const urlString = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      if (urlString.includes('/oauth2/authorize')) {
+        const url = new URL(urlString);
+        const state = url.searchParams.get('state') ?? '';
+        // Configure the redirect URI to share the auth origin (as above),
+        // then have the server issue a relative Location whose PATH is a
+        // prefix-crafted variant of the registered redirect URI's path.
+        return new Response(null, {
+          status: 302,
+          headers: {
+            Location: `/authorize-echo-attacker.example.com/?code=abcd1234&state=${encodeURIComponent(state)}`,
+          },
+        });
+      }
+      const stubs: Record<string, { status: number; body: unknown }> = {
+        '/healthcheck': { status: 200, body: { ok: true } },
+        '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+        '/graph/artists/search': { status: 200, body: { results: [{ id: 1, canonical_name: 'stereolab' }] } },
+        'explore.example.test/health': {
+          status: 200,
+          body: { status: 'healthy', artist_count: 136_702, graph_db_age_seconds: 3_600 },
+        },
+        '/sign-in/email': { status: 200, body: { token: 'fake-session-token', user: { id: 'canary-user-id' } } },
+        '/token': { status: 200, body: { token: 'fake-jwt' } },
+        '/library/?artist_name=': { status: 200, body: stereolabSearchResults },
+        '/flowsheet': { status: 200, body: [] },
+        '/library/rotation': { status: 200, body: [] },
+      };
+      for (const [pattern, resp] of Object.entries(stubs)) {
+        if (urlString.includes(pattern)) {
+          return new Response(typeof resp.body === 'string' ? resp.body : JSON.stringify(resp.body), {
+            status: resp.status,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+      }
+      return new Response(`unmatched mock for ${urlString}`, { status: 599 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const outcomes = await runCanary({
+      ...baseConfig,
+      djEmail: 'canary@wxyc.org',
+      djPassword: 'pw',
+      oidcProbeRedirectUri: 'https://auth.example.test/authorize-echo',
+    });
+    const oidc = outcomes.find((o) => o.name === 'oidc-authorize')!;
+
+    // Same failure shape as the R2-F1 absolute-URL prefix-bypass test —
+    // the check catches the path-mismatch on the pathname compare after
+    // the URL parse succeeds. Pin so a future relaxation of the
+    // origin+pathname compare to a `startsWith` regresses BOTH the R2-F1
+    // sibling test and this one.
+    expect(oidc.status).toBe('fail');
+    expect(oidc.message).toMatch(/redirect|Location/i);
+  });
 });
 
 /**
