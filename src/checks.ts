@@ -670,23 +670,45 @@ function generatePkcePair(): { challenge: string } {
 
 /**
  * Redact the two OIDC secret-adjacent tokens (`code` and `state`) from a
- * string that's about to land in an operator-visible alert.
+ * string that's about to land in an operator-visible alert. Applied to
+ * every diagnostic-carrying string this check emits — 5xx body slices,
+ * unexpected-status body slices, `Location` values on the mismatch and
+ * missing-code branches, unparseable-Location slices. Both `code` and
+ * `state` are covered: `code` is a short-lived but real single-use OAuth
+ * credential; `state` is the CSRF barrier — the mismatch branch prints
+ * only the mismatch fact, never the returned value, and every sibling
+ * error branch must uphold that invariant even when the raw body carries
+ * the value.
  *
  * Two shapes are covered because the same value can appear in either a URL
  * query string OR a JSON envelope (better-auth 5xx bodies are JSON):
  *
  *   URL form:  `code=abcd1234`, `state=xyz`
- *              (also matches URL fragments — `#code=abcd1234` — because the
- *              `=` separator is identical to a query-string parameter)
- *   JSON form: `"code":"abcd1234"`, `code: "abcd1234"`, `"state":"xyz"`
+ *              (also matches URL fragments — `#code=abcd1234` — because
+ *              the `=` separator is identical to a query-string parameter)
+ *   JSON form: strictly quoted-key form only — `"code":"abcd1234"`,
+ *              `"state":"xyz"`. Structurally rules out identifier-adjacent
+ *              substrings (`errorCode`, `statusCode`, `session_state`,
+ *              `oauthConsent`) since those don't have the closing quote
+ *              right after `code`/`state`. Ruling those out matters: the
+ *              5xx branch's docstring explicitly promises to preserve
+ *              `oauthConsent` for BS#1571 routing. Requiring a quoted key
+ *              also structurally can't match URL-shape input (which never
+ *              has quoted keys), so the URL pass and JSON pass never
+ *              double-fire on the same substring.
  *
- * The regexes are ordered URL-first so a URL-shape match wins and doesn't
- * get double-replaced. `code` MUST be redacted because it's a short-lived
- * but real single-use credential; `state` MUST be redacted because the
- * mismatch branch (line 823 below) prints "state does not match" only —
- * never the returned value — and the sibling error branches must not
- * silently leak it via the raw-body slice. See the docstring on
- * `oidcAuthorize` for the "never logs the code" invariant this enforces.
+ * URL-form regexes carry two guards not obvious at a glance:
+ *
+ *  - Terminator class `[^&\s"'<>]+` includes `&` so the greedy match stops
+ *    at the next URL param (without `&`, `code=<redacted>&scope=openid&…`
+ *    would swallow the whole tail after the URL pass placeholder,
+ *    destroying every downstream OIDC routing signal like `error=…`); and
+ *    includes `<`/`>` so HTML-ish 5xx envelopes (`<b>code=REAL</b>`) can't
+ *    hide the value behind a tag.
+ *  - Negative lookbehind `(?<![A-Za-z0-9_])` prevents substring matches on
+ *    identifiers whose tail happens to be `code`/`state` (`errorcode=`,
+ *    `session_state=`). Same rationale as the quoted-key JSON form:
+ *    preserve identifier-shaped breadcrumbs for on-call routing.
  *
  * Hoisted to module scope so every branch that formats an error message
  * uses the same redaction — a per-call arrow function inside `run` would
@@ -695,18 +717,20 @@ function generatePkcePair(): { challenge: string } {
  */
 const redactCodeAndState = (s: string): string =>
   s
-    // URL-shape: `code=<value>` / `state=<value>` — the value runs until an
-    // ampersand, whitespace, quote, or apostrophe. Also catches fragment
-    // form (`#code=…`) since `=` is the separator we key on.
-    .replace(/code=[^&\s"']+/g, 'code=<redacted>')
-    .replace(/state=[^&\s"']+/g, 'state=<redacted>')
-    // JSON-shape: `"code":"<value>"` / `code: "<value>"` / bare `code:<value>`.
-    // Terminators for the value are whitespace, quote, apostrophe, comma,
-    // closing brace, or closing bracket — the boundary characters that end
-    // a JSON string or object entry. Case-insensitive because JSON keys are
-    // conventionally lowercase but nothing forbids `Code` or `State`.
-    .replace(/(["']?code["']?\s*[:=]\s*["']?)[^\s"',}\]]+/gi, '$1<redacted>')
-    .replace(/(["']?state["']?\s*[:=]\s*["']?)[^\s"',}\]]+/gi, '$1<redacted>');
+    // URL-shape: `code=<value>` / `state=<value>`. See the docstring above
+    // for the terminator + lookbehind rationale.
+    .replace(/(?<![A-Za-z0-9_])code=[^&\s"'<>]+/g, 'code=<redacted>')
+    .replace(/(?<![A-Za-z0-9_])state=[^&\s"'<>]+/g, 'state=<redacted>')
+    // JSON-shape: strictly `"code":"<value>"` / `"state":"<value>"`. The
+    // closing quote after `code`/`state` structurally rules out matches on
+    // `"errorCode":`, `"statusCode":`, `"session_state":`, `"oauthConsent":`
+    // — which is load-bearing: the BS#1571 5xx branch promises to preserve
+    // `oauthConsent` as a routing breadcrumb. Case-insensitive because
+    // JSON keys are conventionally lowercase but nothing forbids `Code`
+    // or `State`. Whitespace tolerance around `:` matches pretty-printed
+    // envelopes.
+    .replace(/("code"\s*:\s*")[^"]+"/gi, '$1<redacted>"')
+    .replace(/("state"\s*:\s*")[^"]+"/gi, '$1<redacted>"');
 
 /**
  * OIDC code + PKCE authorize probe. The load-bearing check that would have
@@ -740,10 +764,14 @@ const redactCodeAndState = (s: string): string =>
  * Fails on: non-302/303, missing/mismatched state, missing code, Location
  * pointing at a login page or crafted redirect (session invalidated), 5xx,
  * or the exact BS#1571 500 shape. Message truncates to the first 200 chars
- * of body per `healthcheck`'s convention, redacts any `code=<value>` from
- * the truncated slice (belt-and-suspenders — the 5xx branch could carry
- * a code minted just before the substrate write failed), and never logs
- * Set-Cookie (session-material for the canary DJ).
+ * of body per `healthcheck`'s convention, and runs `redactCodeAndState`
+ * against every diagnostic string it emits (5xx and non-3xx body slices,
+ * `Location` values on the mismatch and missing-code branches, the
+ * unparseable-Location slice). That helper covers both URL-shape
+ * (`code=…&state=…`) and JSON-shape (`"code":"…"` / `"state":"…"`)
+ * because better-auth 5xx bodies are JSON envelopes; see its own
+ * docstring for the exact matching rules. The Set-Cookie header is
+ * session-material for the canary DJ and is likewise never logged.
  */
 const oidcAuthorize: Check = {
   name: 'oidc-authorize',
