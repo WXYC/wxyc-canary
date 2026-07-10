@@ -91,34 +91,50 @@ const AUTHORIZE_ECHO_STATE_STUB: StubEntry = {
 };
 
 /**
+ * Test fixtures for the OIDC probe wire format. Hoisted so
+ * `assertAuthorizeRequestShape` and the sibling test bodies share ONE
+ * copy of each literal — wxyc-canary#68 R4-11 pointed out that
+ * `assertAuthorizeRequestShape` was hardcoding these while
+ * `src/handler.ts` had its own copies, so a change to the canary redirect
+ * URI or client id would have to be echoed in every file. Import path
+ * for the src-side defaults stays in handler.ts / oidc-authorize.ts to
+ * avoid a test-file import from src into a runtime path.
+ */
+const OIDC_TEST_FIXTURES = {
+  probeClientId: 'wxyc-canary',
+  probeRedirectUri: 'https://canary.wxyc.invalid/authorize-echo',
+  sessionBearer: 'Bearer fake-session-token',
+} as const;
+
+/**
  * Assert the request-side wire format of an outgoing `/oauth2/authorize`
- * call. Used by every test that stitches its own bespoke fetch mock for
- * `/oauth2/authorize` (the happy-path test, the R2-F4 trailing-slash
- * pair, the R3-3 doubled-slash tests, the prefix-bypass test, the
- * `redirect: 'manual'` test). The happy-path test pins these assertions
- * inline for context; the shape-normalization tests below defer to this
- * helper so a future refactor that corrupts the outgoing `redirect_uri`
- * search param, drops `redirect: 'manual'`, or breaks the S256 challenge
- * shape regresses every test that runs the check — not just the
- * happy-path.
+ * call. Used by four tests today (the R2-F4 trailing-slash pair and the
+ * R3-3 doubled-slash pair — wxyc-canary#68 R4-10 flagged that an earlier
+ * version of this docstring overclaimed the coverage). The other
+ * `/oauth2/authorize` tests (happy-path, prefix-bypass, redirect-manual
+ * pin, 303-acceptance, retry-not-tapped, sign-in-retry) still inline the
+ * shape assertions because they either PIN the shape as context or test
+ * a different invariant (e.g. call count, request-init capture). The
+ * helper exists specifically for tests where the shape isn't the
+ * primary invariant but a regression there would be silently absorbed
+ * by the happy-302 that follows.
  *
  * Callers pass the request URL string and the request init the mock
- * captured; the helper walks the same invariants the happy-path test
- * inlines: response_type, client_id, redirect_uri (which
- * `runCanary` overrides may customize — the helper accepts it as a
- * parameter for that reason), scope, S256 challenge shape, non-empty
+ * captured; the helper walks: response_type, client_id, redirect_uri
+ * (which `runCanary` overrides may customize — the helper accepts it as
+ * a parameter for that reason), scope, S256 challenge shape, non-empty
  * state, `Bearer <session-token>` auth header, `redirect: 'manual'`.
  */
 function assertAuthorizeRequestShape(
   urlString: string,
   init: RequestInit | undefined,
   { expectedRedirectUri }: { expectedRedirectUri: string } = {
-    expectedRedirectUri: 'https://canary.wxyc.invalid/authorize-echo',
+    expectedRedirectUri: OIDC_TEST_FIXTURES.probeRedirectUri,
   }
 ) {
   const url = new URL(urlString);
   expect(url.searchParams.get('response_type')).toBe('code');
-  expect(url.searchParams.get('client_id')).toBe('wxyc-canary');
+  expect(url.searchParams.get('client_id')).toBe(OIDC_TEST_FIXTURES.probeClientId);
   expect(url.searchParams.get('redirect_uri')).toBe(expectedRedirectUri);
   const scope = url.searchParams.get('scope') ?? '';
   expect(scope).toMatch(/openid/);
@@ -131,7 +147,7 @@ function assertAuthorizeRequestShape(
   expect(state.length).toBeGreaterThan(0);
   const headers = (init?.headers ?? {}) as Record<string, string>;
   const auth = headers.Authorization ?? headers.authorization ?? '';
-  expect(auth).toBe('Bearer fake-session-token');
+  expect(auth).toBe(OIDC_TEST_FIXTURES.sessionBearer);
   expect(init?.redirect).toBe('manual');
 }
 
@@ -1484,9 +1500,14 @@ describe('runCanary — sign-in 429 retry carve-out', () => {
     // The check MUST fail — no silent-pass fallback in the parallel
     // dispatcher.
     expect(oidc.status).toBe('fail');
-    // The 599 fallback body carries the R3-4 sentinel so future test
-    // output makes the misconfiguration obvious.
-    expect(oidc.message).toMatch(/599|R3-4|unmatched mock/);
+    // wxyc-canary#68 R4-9: the assertion MUST require the R3-4 sentinel
+    // specifically — the previous `/599|R3-4|unmatched mock/` also
+    // matched the generic 599 fallback ("unmatched mock" is emitted by
+    // BOTH the /oauth2/authorize-specific R3-4 branch AND the generic
+    // fallback below it), so removing the /oauth2/authorize-specific
+    // branch (the entire fix for R3-4) wouldn't fail this test. Require
+    // the R3-4 sentinel token to catch that regression.
+    expect(oidc.message).toMatch(/R3-4/);
   });
 });
 
@@ -3066,6 +3087,86 @@ describe('runCanary — oidc-authorize check (wxyc-canary#60)', () => {
     // fails — and the on-call runbook explicitly greps for
     // `oauthConsent` to route the alert.
     expect(oidc.message).toMatch(/oauthConsent/);
+    // wxyc-canary#68 R4-8: pin that `session_state`'s VALUE survives too.
+    // The R3-2 fix is about identifier-adjacent values (not just keys) —
+    // if the regex re-widens to substring-match, the mock's
+    // `session_state: 'SHOULD-STAY-VISIBLE'` value would be redacted. The
+    // key-only assertion above passes silently against that regression;
+    // pinning the value catches it.
+    expect(oidc.message).toContain('SHOULD-STAY-VISIBLE');
+  });
+
+  // wxyc-canary#68 R4-1: hyphen-prefix lookbehind gap. `oauth-code=REAL`
+  // previously had its value redacted because `-` was not in the
+  // `[A-Za-z0-9_]` word-boundary class of the negative lookbehind.
+  // The fix extends the class to `[-A-Za-z0-9_]` so hyphen-prefixed
+  // identifiers are treated the same as underscore-prefixed ones.
+  it('does not redact hyphen-prefixed identifiers whose tail is code/state (R4-1 regression)', async () => {
+    setUpAuthorizeMock({
+      status: 500,
+      body: {
+        message: 'transient error at oauth-code=PLEASE-STAY-VISIBLE and login-state=ALSO-STAY-VISIBLE',
+      },
+    });
+
+    const outcomes = await runCanary({ ...baseConfig, djEmail: 'canary@wxyc.org', djPassword: 'pw' });
+    const oidc = outcomes.find((o) => o.name === 'oidc-authorize')!;
+
+    expect(oidc.status).toBe('fail');
+    // Hyphen-prefixed identifier values must survive the redactor —
+    // they are shape-legitimate breadcrumbs (`oauth-code` is common in
+    // OIDC error envelopes; `login-state` is a plausible future one).
+    expect(oidc.message).toContain('PLEASE-STAY-VISIBLE');
+    expect(oidc.message).toContain('ALSO-STAY-VISIBLE');
+  });
+
+  // wxyc-canary#68 R4-2: JSON escaped-quote termination gap. A body like
+  // `{"code":"abc\"def"}` previously terminated the match at the first
+  // escaped `\"`, leaving `def"` exposed. The fix uses `(?:\\.|[^"])+`
+  // as the value class so escaped chars (including `\"`) are consumed.
+  it('redacts JSON code values that contain an escaped quote (R4-2 regression)', async () => {
+    // Route through the 5xx branch. The body is a raw JSON string so the
+    // JSON-shape redactor matches the `"code":"..."` value literally.
+    setUpAuthorizeMock({
+      status: 500,
+      body: '{"code":"abc\\"SUPER-SECRET-ESCAPED\\"def","error":"boom"}',
+    });
+
+    const outcomes = await runCanary({ ...baseConfig, djEmail: 'canary@wxyc.org', djPassword: 'pw' });
+    const oidc = outcomes.find((o) => o.name === 'oidc-authorize')!;
+
+    expect(oidc.status).toBe('fail');
+    // The sensitive value AND the escaped-quote suffix must not appear.
+    expect(oidc.message).not.toContain('SUPER-SECRET-ESCAPED');
+    // Downstream `error=boom` diagnostic must survive.
+    expect(oidc.message).toMatch(/error/);
+  });
+
+  // wxyc-canary#68 R4-3: URL-form terminator missing `,`, `;`, `#`. A body
+  // like `code=REAL,retry=true` or `code=REAL#error=access_denied` would
+  // swallow the tail into the redacted match, losing the routing signal.
+  // The fix extends the terminator to `[^&\s"'<>,;#]+`.
+  it('preserves downstream diagnostics after a comma, semicolon, or fragment terminator (R4-3 regression)', async () => {
+    setUpAuthorizeMock({
+      status: 500,
+      body: 'code=REAL-CODE-1,retry=true;path=/callback#error=access_denied&detail=user_denied',
+    });
+
+    const outcomes = await runCanary({ ...baseConfig, djEmail: 'canary@wxyc.org', djPassword: 'pw' });
+    const oidc = outcomes.find((o) => o.name === 'oidc-authorize')!;
+
+    expect(oidc.status).toBe('fail');
+    // The sensitive value MUST be redacted.
+    expect(oidc.message).not.toContain('REAL-CODE-1');
+    // Every downstream diagnostic MUST survive — the comma-separated
+    // `retry=true`, the semicolon-separated `path=/callback`, and the
+    // OIDC fragment `error=access_denied` are all routing-critical.
+    expect(oidc.message).toMatch(/retry=true/);
+    expect(oidc.message).toMatch(/path=\/callback/);
+    // The `error=access_denied` fragment is the load-bearing signal —
+    // R4-3 called out that this specific case would previously lose the
+    // routing breadcrumb behind a greedy match.
+    expect(oidc.message).toMatch(/error=access_denied/);
   });
 
   it('fails on a crafted Location that starts-with the redirect URI but is a different origin+path (prefix bypass regression)', async () => {
@@ -3123,12 +3224,15 @@ describe('runCanary — oidc-authorize check (wxyc-canary#60)', () => {
     expect(oidc.message).toMatch(/redirect|Location/i);
   });
 
-  // R2-F4: RFC 3986 §6.2.2.3 treats `/authorize-echo` and `/authorize-echo/`
-  // as equivalent. Without normalization, a single-slash drift between the
-  // trusted-client registration (server side) and the CFN
+  // R2-F4: RFC 3986 §6.2.3 (Scheme-Based Normalization) treats
+  // `/authorize-echo` and `/authorize-echo/` as equivalent for
+  // trailing-slash purposes. Without normalization, a single-slash drift
+  // between the trusted-client registration (server side) and the CFN
   // `OidcProbeRedirectUri` param (canary side) would page on-call every
   // tick despite no actual regression. Pin both directions of drift so a
   // future revert of the `normalizePath` helper regresses these tests.
+  // (wxyc-canary#68 R4-6: R3-5 fixed the same citation in src/ and template.yaml
+  // but missed this comment.)
   it('accepts a Location with a trailing slash when the configured redirect URI has none (R2-F4 trailing-slash normalization)', async () => {
     // Configured redirect URI: no trailing slash. Location: trailing slash.
     // Historically this failed the pathname compare; the fix normalizes.
@@ -3316,10 +3420,13 @@ describe('runCanary — oidc-authorize check (wxyc-canary#60)', () => {
         return new Response(null, {
           status: 302,
           headers: {
-            // Root path with a stray double slash. `new URL()` collapses
-            // this back to `/` on parse, so this test primarily pins the
-            // normalizePath contract rather than the pathological shape;
-            // the important guarantee is that the strip doesn't collapse
+            // Root path with a stray double slash. `new URL()` PRESERVES
+            // the double slash on parse (a common misconception, corrected
+            // by wxyc-canary#68 R4-7 — the previous version of this comment
+            // claimed `new URL` collapsed it, which was factually wrong).
+            // The test passes because `normalizePath('//')` strips both
+            // slashes and the `|| '/'` fallback keeps the root path.
+            // The important guarantee is that the strip doesn't collapse
             // `/` to empty and cause a non-root Location to match.
             Location: `https://canary.wxyc.invalid//?code=abcd1234&state=${encodeURIComponent(state)}`,
           },
@@ -3810,8 +3917,8 @@ describe('runCanary — oidc-authorize check (wxyc-canary#60)', () => {
   it('accepts an on-origin relative Location and passes when it echoes code+state (wxyc-canary#66)', async () => {
     // Companion to the previous test: when the auth server AND the
     // trusted-client redirect share an origin (production has them on
-    // different subdomains — `api.wxyc.org/auth` vs
-    // `canary.wxyc.org/authorize-echo` — but a future consolidated deploy
+    // different origins — `api.wxyc.org/auth` vs
+    // `canary.wxyc.invalid/authorize-echo` — but a future consolidated deploy
     // could put them on one host), a relative Location resolves cleanly
     // and the check passes. Pin the positive branch too so a re-tightening
     // of the resolver to absolute-only regresses this test.

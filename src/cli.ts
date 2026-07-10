@@ -43,6 +43,19 @@ Required flags:
   --lml-url=<url>             library-metadata-lookup base URL
   --suite=<name>              one of: ${VALID_SUITES.join(', ')}
 
+Optional flags (per-environment OIDC probe overrides — wxyc-canary#68 R4-12):
+  --oidc-probe-client-id=<id>       trusted-client id sent as \`client_id\`
+                                    on /oauth2/authorize. Defaults to
+                                    \`wxyc-canary\` when unset. Override when
+                                    the staging gate targets a BS whose
+                                    trusted-client registration differs
+                                    from prod (e.g. a per-branch client).
+  --oidc-probe-redirect-uri=<url>   trusted-client redirect URI. Defaults to
+                                    \`https://canary.wxyc.org/authorize-echo\`
+                                    when unset. Override in tandem with the
+                                    client id when the two must match a
+                                    staging registration.
+
 Environment variables (credentials — flags would leak into shell history):
   CANARY_DJ_EMAIL             DJ login email. Pairs with CANARY_DJ_PASSWORD;
                               both must be set together or both unset
@@ -71,6 +84,11 @@ const parseConfig = {
     'auth-url': { type: 'string' },
     'lml-url': { type: 'string' },
     suite: { type: 'string' },
+    // wxyc-canary#68 R4-12: staging-gate needs per-env OIDC probe
+    // overrides. Both flags are optional — omitted means "use the
+    // handler-side defaults" (wxyc-canary + canary.wxyc.org/authorize-echo).
+    'oidc-probe-client-id': { type: 'string' },
+    'oidc-probe-redirect-uri': { type: 'string' },
     help: { type: 'boolean', short: 'h' },
   },
   // Reject unknown flags rather than silently ignoring them — operator
@@ -183,6 +201,12 @@ export async function runCli(argv: string[], env: NodeJS.ProcessEnv, io: CliStre
   const authUrl = trim('auth-url');
   const lmlUrl = trim('lml-url');
   const suiteRaw = trim('suite');
+  // wxyc-canary#68 R4-12: staging-gate OIDC overrides. `trim` returns
+  // `undefined` when the flag isn't set OR is whitespace-only — the
+  // handler's `||` fallback then picks up the default, matching the CFN
+  // parameter's empty-string behavior.
+  const oidcProbeClientId = trim('oidc-probe-client-id');
+  const oidcProbeRedirectUri = trim('oidc-probe-redirect-uri');
 
   const missing: string[] = [];
   if (!baseUrl) missing.push('--base-url');
@@ -255,6 +279,11 @@ export async function runCli(argv: string[], env: NodeJS.ProcessEnv, io: CliStre
     // flag is unreachable by the CLI today. Set explicitly to harden
     // against a future suite addition.
     enableWriteProbe: false,
+    // wxyc-canary#68 R4-12: per-env OIDC probe overrides for staging-gate.
+    // Both `undefined` when the flag is omitted — the handler's `||`
+    // fallback resolves to the prod defaults.
+    oidcProbeClientId,
+    oidcProbeRedirectUri,
   };
 
   // Pass a sanitized env to runCanary so its resolver helpers

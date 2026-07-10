@@ -150,15 +150,19 @@ Parameters:
       The check asserts the returned Location matches this value on
       `origin` (strict compare — rejects prefix-crafted attacker URLs
       like `https://canary.wxyc.invalid/authorize-echo-attacker.example.com`)
-      and on `pathname` after normalization: RFC 3986 §6.2.3 equivalence
-      strips trailing slashes on both sides so `/authorize-echo`,
+      and on `pathname` after trailing-slash normalization: strips ALL
+      trailing slashes on both sides so `/authorize-echo`,
       `/authorize-echo/`, and `/authorize-echo//` all compare equal (a
       single-slash drift between server registration and this param
-      would otherwise flap the alarm every tick). Empty-string picks up
-      the handler default (`||`, not `??`, in src/handler.ts).
-      `AllowedPattern` requires an `http://` or `https://` prefix as
-      cheap boot-time validation so a malformed value fails at deploy
-      rather than paging every tick from the runtime check.
+      would otherwise flap the alarm every tick). Narrower than full
+      RFC 3986 §6.2.3 — see `src/oidc-authorize.ts`'s `normalizePath`
+      docstring for what's deliberately out of scope. `AllowedPattern`
+      requires an `http://` or `https://` prefix as cheap boot-time
+      validation so a malformed value fails at deploy rather than paging
+      every tick from the runtime check. Because the pattern also
+      rejects empty strings, an operator cannot rely on the handler-side
+      `||` default here (wxyc-canary#68 R4-5); pass a real URL or omit
+      the parameter to accept the CFN default above.
   GhaRunnerId:
     Type: Number
     Default: 0
