@@ -53,6 +53,14 @@ function loadConfigFromEnv(): CanaryConfig {
     // skipped check with a precise reason rather than a misrouted 404.
     ghaRunnerId: process.env.CANARY_GHA_RUNNER_ID ? Number(process.env.CANARY_GHA_RUNNER_ID) : undefined,
     ghaRunnerToken: process.env.CANARY_GHA_RUNNER_TOKEN,
+    // OIDC authorize probe (wxyc-canary#60). Defaults match the trusted
+    // client registered in WXYC/Backend-Service#1576 — the placeholder
+    // redirect URI never resolves; the check reads the 302 Location with
+    // `redirect: 'manual'` and never follows it. Overridable so a
+    // future rev of the trusted client's shape (rename, second redirect)
+    // doesn't require a code change here.
+    oidcProbeClientId: process.env.CANARY_OIDC_PROBE_CLIENT_ID,
+    oidcProbeRedirectUri: process.env.CANARY_OIDC_PROBE_REDIRECT_URI,
   };
 }
 
@@ -215,6 +223,7 @@ export async function runCanary(
   }
 
   let djBearerToken: string | undefined;
+  let djSessionToken: string | undefined;
   let djUserId: string | undefined;
   if (djCreds) {
     try {
@@ -225,6 +234,7 @@ export async function runCanary(
         config.originUrl ?? 'https://dj.wxyc.org'
       );
       djBearerToken = signIn.jwt;
+      djSessionToken = signIn.sessionToken;
       djUserId = signIn.userId;
     } catch (err) {
       djAuthError = (err as Error).message;
@@ -242,6 +252,7 @@ export async function runCanary(
     lmlUrl: config.lmlUrl ?? 'https://library-metadata-lookup-production.up.railway.app',
     lmlApiKey,
     djBearerToken,
+    djSessionToken,
     djUserId,
     enrichmentPollTimeoutMs: config.enrichmentPollTimeoutMs ?? DEFAULT_ENRICHMENT_POLL_TIMEOUT_MS,
     enrichmentPollIntervalMs: config.enrichmentPollIntervalMs ?? DEFAULT_ENRICHMENT_POLL_INTERVAL_MS,
@@ -256,6 +267,13 @@ export async function runCanary(
     ghaRunnerOrg: config.ghaRunnerOrg || 'WXYC',
     ghaRunnerId: config.ghaRunnerId,
     ghaRunnerToken,
+    // `||` (not `??`) so an empty-string env value picks up the default —
+    // an operator who accidentally sets `CANARY_OIDC_PROBE_CLIENT_ID=` in
+    // `.env` should still get the WXYC-registered probe client, not an
+    // empty `client_id` query param that better-auth rejects with
+    // `invalid_client`. Same rule the runner-liveness fields use above.
+    oidcProbeClientId: config.oidcProbeClientId || 'wxyc-canary',
+    oidcProbeRedirectUri: config.oidcProbeRedirectUri || 'https://canary.wxyc.org/authorize-echo',
   };
 
   const outcomes = await Promise.all(

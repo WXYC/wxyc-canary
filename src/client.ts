@@ -28,7 +28,23 @@ export class CanaryFetchError extends Error {
 
 export async function canaryFetch(
   url: string,
-  options: { headers?: Record<string, string>; timeoutMs?: number; method?: string; body?: string } = {}
+  options: {
+    headers?: Record<string, string>;
+    timeoutMs?: number;
+    method?: string;
+    body?: string;
+    /**
+     * Redirect handling. Defaults to platform default (follow). Set to
+     * `'manual'` when the check needs to inspect the 3xx `Location` header
+     * without following it — the OIDC authorize probe (wxyc-canary#60) is
+     * the sole consumer today: it reads the 302 back to the trusted
+     * client's `redirect_uri` with a `code=` query param and stops there.
+     * Never `'error'` — the canary already has structured failure handling
+     * for non-2xx responses; converting a 3xx into a thrown network error
+     * would lose the status + Location context.
+     */
+    redirect?: 'follow' | 'manual';
+  } = {}
 ): Promise<FetchResult> {
   const timeoutMs = options.timeoutMs ?? 8000;
   const controller = new AbortController();
@@ -40,6 +56,7 @@ export async function canaryFetch(
       method: options.method ?? 'GET',
       headers: options.headers,
       body: options.body,
+      redirect: options.redirect,
       signal: controller.signal,
     });
     const rawText = await response.text();

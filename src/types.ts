@@ -101,11 +101,36 @@ export type CheckContext = {
   /** Bearer token if the canary has logged in as a DJ; undefined for anonymous-only runs. */
   djBearerToken: string | undefined;
   /**
+   * Raw better-auth session token returned by `/sign-in/email` — the
+   * OIDC authorize probe (wxyc-canary#60) sends it as
+   * `Authorization: Bearer ...` on `/oauth2/authorize`. The better-auth
+   * `bearer` plugin translates it into the session cookie the authorize
+   * endpoint reads. Distinct from `djBearerToken`: that one is the JWT
+   * from `/token`, which is what BS routes accept but `/oauth2/authorize`
+   * rejects (different audience). Undefined when sign-in failed.
+   */
+  djSessionToken: string | undefined;
+  /**
    * Auth user id of the canary DJ. Write-canary checks send this as the
    * `dj_id` in `/flowsheet/join` and `/flowsheet/end` request bodies.
    * Undefined when sign-in failed or no credentials were configured.
    */
   djUserId: string | undefined;
+  /**
+   * OIDC probe trusted-client id (wxyc-canary#60). The `oidc-authorize`
+   * check sends this as the `client_id` query param on `/oauth2/authorize`
+   * and expects the auth server to have a matching public trustedClient
+   * registered (WXYC/Backend-Service#1576). Defaults to `'wxyc-canary'`.
+   */
+  oidcProbeClientId: string;
+  /**
+   * OIDC probe redirect URI — the placeholder the trusted client is
+   * registered with. The check sends it verbatim as `redirect_uri` on
+   * `/oauth2/authorize` and asserts the returned 302 `Location` starts
+   * with it. The URL never has to resolve — the check reads the Location
+   * header with `redirect: 'manual'` and never follows the redirect.
+   */
+  oidcProbeRedirectUri: string;
   /**
    * Wall-clock budget the enrichment-quality check spends polling its
    * sentinel row. Default 45_000 leaves 15s of headroom under the 60s
@@ -209,4 +234,8 @@ export type CanaryConfig = {
    * `gha-runner-online` check downgrades to skipped.
    */
   ghaRunnerToken?: string;
+  /** See CheckContext.oidcProbeClientId. Defaults to `'wxyc-canary'` in the handler. */
+  oidcProbeClientId?: string;
+  /** See CheckContext.oidcProbeRedirectUri. Defaults to `'https://canary.wxyc.org/authorize-echo'` in the handler. */
+  oidcProbeRedirectUri?: string;
 };

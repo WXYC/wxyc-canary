@@ -92,10 +92,10 @@ describe('runCanary — anonymous-only configuration', () => {
     vi.unstubAllGlobals();
   });
 
-  it('passes the 3 truly-anonymous checks and skips the 8 conditional checks when no credentials are configured', async () => {
+  it('passes the 3 truly-anonymous checks and skips the 9 conditional checks when no credentials are configured', async () => {
     const outcomes = await runCanary(baseConfig);
 
-    expect(outcomes).toHaveLength(11);
+    expect(outcomes).toHaveLength(12);
     const byName = Object.fromEntries(outcomes.map((o) => [o.name, o]));
     expect(byName['backend-healthcheck'].status).toBe('pass');
     expect(byName['semantic-index-search'].status).toBe('pass');
@@ -106,6 +106,9 @@ describe('runCanary — anonymous-only configuration', () => {
     expect(byName['dj-rotation'].status).toBe('skipped');
     expect(byName['dj-rotation-picker'].status).toBe('skipped');
     expect(byName['enrichment-quality'].status).toBe('skipped');
+    // `oidc-authorize` requiresAuth: true. Skips with the standard no-DJ-
+    // credentials message so it matches the other DJ-authed checks.
+    expect(byName['oidc-authorize'].status).toBe('skipped');
     // `lml-auth` skips on missing LML_API_KEY (operator gap) — same
     // semantics as DJ credentials but a separate config switch. The
     // `baseConfig` fixture leaves `lmlApiKey` undefined.
@@ -1383,9 +1386,9 @@ describe('publishMetrics — dimensioned + dimensionless emit-twice', () => {
     const dimensioned = checkFailureData.filter((d) => d.Dimensions && d.Dimensions.length > 0);
     const dimensionless = checkFailureData.filter((d) => !d.Dimensions || d.Dimensions.length === 0);
 
-    // Eleven checks, each contributes one dimensioned and one dimensionless datapoint.
-    expect(dimensioned).toHaveLength(11);
-    expect(dimensionless).toHaveLength(11);
+    // Twelve checks, each contributes one dimensioned and one dimensionless datapoint.
+    expect(dimensioned).toHaveLength(12);
+    expect(dimensionless).toHaveLength(12);
     // Without an inducer, every value is 0 (passes + skips).
     expect(dimensioned.every((d) => d.Value === 0)).toBe(true);
     expect(dimensionless.every((d) => d.Value === 0)).toBe(true);
@@ -1423,7 +1426,7 @@ describe('publishMetrics — dimensioned + dimensionless emit-twice', () => {
     // isn't enough — `Statistic: Maximum` on the alarm needs at least one
     // `1` in the window, so this asserts the count of 1s explicitly.
     expect(dimensionless.filter((d) => d.Value === 1)).toHaveLength(1);
-    expect(dimensionless.filter((d) => d.Value === 0)).toHaveLength(10);
+    expect(dimensionless.filter((d) => d.Value === 0)).toHaveLength(11);
   });
 
   // `CheckSkipped` and `CheckLatency` are dashboard data, not alarm inputs.
@@ -1448,8 +1451,8 @@ describe('publishMetrics — dimensioned + dimensionless emit-twice', () => {
     expect(metricData.filter((d) => d.MetricName === 'CheckSkipped' && isDimensionless(d))).toHaveLength(0);
     expect(metricData.filter((d) => d.MetricName === 'CheckLatency' && isDimensionless(d))).toHaveLength(0);
     // Sanity: the dimensioned series for each is present (one per check).
-    expect(metricData.filter((d) => d.MetricName === 'CheckSkipped')).toHaveLength(11);
-    expect(metricData.filter((d) => d.MetricName === 'CheckLatency')).toHaveLength(11);
+    expect(metricData.filter((d) => d.MetricName === 'CheckSkipped')).toHaveLength(12);
+    expect(metricData.filter((d) => d.MetricName === 'CheckLatency')).toHaveLength(12);
   });
 });
 
@@ -1697,10 +1700,10 @@ describe('publishMetrics — tier split (UserFacingCheckFailure / InfraCheckFail
     await handler();
     const metrics = getPublishedMetrics();
 
-    // 9 paging checks (8 user-facing + enrichment-quality), 2 infra checks
+    // 10 paging checks (9 user-facing + enrichment-quality), 2 infra checks
     // (gha-runner-online, semantic-index-freshness); every aggregate datum is
     // dimensionless and 0.
-    expect(tierValues(metrics, 'UserFacingCheckFailure')).toHaveLength(9);
+    expect(tierValues(metrics, 'UserFacingCheckFailure')).toHaveLength(10);
     expect(tierValues(metrics, 'InfraCheckFailure')).toHaveLength(2);
     expect(tierMax(metrics, 'UserFacingCheckFailure')).toBe(0);
     expect(tierMax(metrics, 'InfraCheckFailure')).toBe(0);
@@ -1884,8 +1887,17 @@ describe('template.yaml ↔ publishMetrics contract', () => {
  * row." Returns `{ fetchMock, calls }` so a test can verify e.g. that
  * cleanup-DELETE was called even when polling timed out.
  */
-type RouteResponse = { status: number; body: unknown };
-type Route = { method: string; pattern: string; responses: RouteResponse[] };
+type RouteResponse = { status: number; body: unknown; headers?: Record<string, string> };
+// `dynamic` lets a route inspect the incoming URL to build the response —
+// needed for the OIDC authorize probe (wxyc-canary#60), whose state-parity
+// assertion requires the mock to echo back the state the check just sent.
+// A static `responses` queue can't know that state in advance.
+type Route = {
+  method: string;
+  pattern: string;
+  responses?: RouteResponse[];
+  dynamic?: (url: string, init?: RequestInit) => RouteResponse;
+};
 
 function setUpMethodAwareMock(routes: Route[]): {
   fetchMock: ReturnType<typeof vi.fn>;
@@ -1900,10 +1912,13 @@ function setUpMethodAwareMock(routes: Route[]): {
         const key = `${route.method.toUpperCase()} ${route.pattern}`;
         const idx = calls[key] ?? 0;
         calls[key] = idx + 1;
-        const resp = route.responses[Math.min(idx, route.responses.length - 1)];
+        const resp = route.dynamic
+          ? route.dynamic(url, init)
+          : (route.responses ?? [])[Math.min(idx, (route.responses ?? []).length - 1)];
+        if (!resp) return new Response(`route without responses/dynamic for ${route.pattern}`, { status: 599 });
         return new Response(typeof resp.body === 'string' ? resp.body : JSON.stringify(resp.body), {
           status: resp.status,
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', ...(resp.headers ?? {}) },
         });
       }
     }
@@ -1987,6 +2002,32 @@ function setUpEnrichmentHappyPathMock(): ReturnType<typeof setUpMethodAwareMock>
     // Fallback for any other bare-`/flowsheet` GET that might appear.
     { method: 'GET', pattern: '/flowsheet', responses: [{ status: 200, body: [] }] },
     { method: 'DELETE', pattern: '/flowsheet', responses: [{ status: 200, body: ENRICHED_SENTINEL_ROW }] },
+    // oidc-authorize (wxyc-canary#60). Happy-path 302 back to the probe
+    // redirect URI with a fabricated code + the state the check just sent.
+    // The check's state-parity assertion requires an echoed state; a static
+    // response can't know a per-tick random value in advance, so this
+    // route uses a dynamic handler that reads `state=` off the incoming
+    // URL and echoes it into the Location header. The dedicated
+    // `oidc-authorize` describe block above pins the check's own value-
+    // matrix; this stub is what keeps the contract + enrichment tests
+    // (which need `UserFacingCheckFailure = 0` from every check to satisfy
+    // "canary passed") green now that oidc-authorize joined the checks
+    // array.
+    {
+      method: 'GET',
+      pattern: '/oauth2/authorize',
+      dynamic: (url) => {
+        const parsedUrl = new URL(url);
+        const echoedState = parsedUrl.searchParams.get('state') ?? '';
+        return {
+          status: 302,
+          body: '',
+          headers: {
+            Location: `https://canary.wxyc.org/authorize-echo?code=abcd1234&state=${encodeURIComponent(echoedState)}`,
+          },
+        };
+      },
+    },
   ]);
 }
 
@@ -2342,6 +2383,317 @@ describe('enrichment-quality write canary', () => {
       delete process.env.CANARY_SEMANTIC_INDEX_URL;
       delete process.env.CANARY_PUBLISH_METRICS;
     }
+  });
+});
+
+/**
+ * `oidc-authorize` (wxyc-canary#60) — end-to-end probe of the OIDC code +
+ * PKCE dance the flowsheet-digitization verifier (and every future OIDC
+ * client) rides on. The check exists because WXYC/Backend-Service#1571 —
+ * the `oauthConsent` schema-drift 500 — went undetected for months: the
+ * initial `/auth/oauth2/authorize` redirect was green, but the return trip
+ * (post-login) 500'd on the consent write and only surfaced when the
+ * flowsheet verifier tried a real login. The existing canary suite covered
+ * healthcheck, DJ bearer, semantic-index, and enrichment writes; nothing
+ * walked authorize + code-issue.
+ *
+ * The probe uses a dedicated `wxyc-canary` PUBLIC trusted client (registered
+ * in WXYC/Backend-Service#1576 — this canary check is blocked-by that
+ * ticket and MUST NOT deploy before the client exists). Public client +
+ * PKCE, so no client secret lives in the canary env. The probe stops at
+ * the /authorize 302 without exchanging the code — inspecting the Location
+ * header for `code=<non-empty>` + matching `state` is sufficient to prove
+ * the whole authorize + consent path executed.
+ *
+ * These tests MOCK `/oauth2/authorize` to return the exact 500 shape from
+ * BS#1571 (asserted to `fail` the check with a message pointing at
+ * `oauthConsent` or `authorize`), and separately a valid 302 (asserted to
+ * `pass`). The sign-in-429 precondition path is already covered by the
+ * generic auth-precondition tests above (the check is `requiresAuth: true`,
+ * so any sign-in failure propagates the same way as dj-library-search).
+ */
+describe('runCanary — oidc-authorize check (wxyc-canary#60)', () => {
+  // Helper: build a fetch mock that returns the given `/oauth2/authorize`
+  // response (including its raw response headers, notably `Location`) while
+  // stubbing every other endpoint enough to let the check reach the
+  // authorize call. All other checks pass; only the authorize probe's
+  // outcome is under test. The stock `setUpFetchMock` only threads status
+  // + body — we need `Location` to flow through so the 302-inspection path
+  // is exercised. This helper duplicates enough of `setUpFetchMock`'s
+  // dispatch logic to handle that, and defers to the standard stub set
+  // for every non-authorize URL.
+  function setUpAuthorizeMock(authorize: { status: number; body: unknown; headers?: Record<string, string> }) {
+    const stubs: Record<string, { status: number; body: unknown }> = {
+      '/healthcheck': { status: 200, body: { ok: true } },
+      '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+      '/graph/artists/search': { status: 200, body: { results: [{ id: 1, canonical_name: 'stereolab' }] } },
+      'explore.example.test/health': {
+        status: 200,
+        body: { status: 'healthy', artist_count: 136_702, graph_db_age_seconds: 3_600 },
+      },
+      '/sign-in/email': { status: 200, body: { token: 'fake-session-token', user: { id: 'canary-user-id' } } },
+      '/token': { status: 200, body: { token: 'fake-jwt' } },
+      '/library/?artist_name=': { status: 200, body: stereolabSearchResults },
+      '/flowsheet': { status: 200, body: [] },
+      '/library/rotation': { status: 200, body: [] },
+    };
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const urlString = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      if (urlString.includes('/oauth2/authorize')) {
+        const bodyText = typeof authorize.body === 'string' ? authorize.body : JSON.stringify(authorize.body);
+        return new Response(bodyText, {
+          status: authorize.status,
+          headers: { 'Content-Type': 'application/json', ...(authorize.headers ?? {}) },
+        });
+      }
+      for (const [pattern, resp] of Object.entries(stubs)) {
+        if (urlString.includes(pattern)) {
+          return new Response(typeof resp.body === 'string' ? resp.body : JSON.stringify(resp.body), {
+            status: resp.status,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+      }
+      return new Response(`unmatched mock for ${urlString}`, { status: 599 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    return fetchMock;
+  }
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  // `setUpFetchMock` matches by URL substring only; the check needs to
+  // consult the `Location` response header. `Response` accepts a `headers`
+  // second arg — we thread the Location through the same shape the fetch
+  // mock already handles for `Retry-After`.
+  it('passes on a valid 302 with code= and matching state on the Location header', async () => {
+    // The Location parameter values (`__CODE__` / `__STATE__`) are placeholders
+    // the test replaces at call time. Real better-auth-issued codes are a
+    // 32-char [a-zA-Z0-9] string (see `generateRandomString(32, ...)` in
+    // `oidc-provider/authorize.mjs:104`); anything non-empty proves the
+    // check accepted a real code.
+    // The check generates a per-tick random `state`; we can't know it here.
+    // The mock inspects the outgoing URL and echoes the `state` back in
+    // `Location`, so the check's post-check parity assertion holds.
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const urlString = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      if (urlString.includes('/oauth2/authorize')) {
+        // Pin the request shape the check MUST send: response_type=code,
+        // client_id=<probe>, scope with openid+profile+email, S256 challenge,
+        // Bearer <session-token>. Anything less catches a check-side regression
+        // that silently drifts the probe payload.
+        const url = new URL(urlString);
+        expect(url.searchParams.get('response_type')).toBe('code');
+        expect(url.searchParams.get('client_id')).toBe('wxyc-canary');
+        expect(url.searchParams.get('redirect_uri')).toBe('https://canary.wxyc.org/authorize-echo');
+        const scope = url.searchParams.get('scope') ?? '';
+        expect(scope).toMatch(/openid/);
+        expect(scope).toMatch(/profile/);
+        expect(scope).toMatch(/email/);
+        expect(url.searchParams.get('code_challenge_method')).toBe('S256');
+        const codeChallenge = url.searchParams.get('code_challenge') ?? '';
+        // Base64url alphabet, no padding, 43 chars for a SHA-256 challenge.
+        expect(codeChallenge).toMatch(/^[A-Za-z0-9_-]{43}$/);
+        const state = url.searchParams.get('state') ?? '';
+        expect(state.length).toBeGreaterThan(0);
+        // The session token flows through as a bearer — the better-auth
+        // `bearer` plugin translates it into the session cookie internally.
+        // Never as the DJ JWT (which fails on /oauth2/authorize since JWTs
+        // aren't session tokens).
+        const headers = (init?.headers ?? {}) as Record<string, string>;
+        const auth = headers.Authorization ?? headers.authorization ?? '';
+        expect(auth).toBe('Bearer fake-session-token');
+        // Echo the state back to prove the state-parity check works.
+        const location = `https://canary.wxyc.org/authorize-echo?code=abcd1234&state=${encodeURIComponent(state)}`;
+        return new Response(null, {
+          status: 302,
+          headers: { Location: location },
+        });
+      }
+      // Delegate the other URLs to the standard stubs.
+      const stubs: Record<string, { status: number; body: unknown }> = {
+        '/healthcheck': { status: 200, body: { ok: true } },
+        '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+        '/graph/artists/search': { status: 200, body: { results: [{ id: 1, canonical_name: 'stereolab' }] } },
+        'explore.example.test/health': {
+          status: 200,
+          body: { status: 'healthy', artist_count: 136_702, graph_db_age_seconds: 3_600 },
+        },
+        '/sign-in/email': { status: 200, body: { token: 'fake-session-token', user: { id: 'canary-user-id' } } },
+        '/token': { status: 200, body: { token: 'fake-jwt' } },
+        '/library/?artist_name=': { status: 200, body: stereolabSearchResults },
+        '/flowsheet': { status: 200, body: [] },
+        '/library/rotation': { status: 200, body: [] },
+      };
+      for (const [pattern, resp] of Object.entries(stubs)) {
+        if (urlString.includes(pattern)) {
+          return new Response(typeof resp.body === 'string' ? resp.body : JSON.stringify(resp.body), {
+            status: resp.status,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+      }
+      return new Response(`unmatched mock for ${urlString}`, { status: 599 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const outcomes = await runCanary({ ...baseConfig, djEmail: 'canary@wxyc.org', djPassword: 'pw' });
+    const oidc = outcomes.find((o) => o.name === 'oidc-authorize')!;
+
+    expect(oidc.status).toBe('pass');
+  });
+
+  it('fails on the exact BS#1571 shape — 500 with oauthConsent-not-in-schema BetterAuthError body', async () => {
+    // Replay the ticket's failure surface as faithfully as we can:
+    // BetterAuthError text mentioning the `oauthConsent` model missing from
+    // the schema map. Body shape mirrors better-auth's default 500 JSON.
+    setUpAuthorizeMock({
+      status: 500,
+      body: {
+        message:
+          'BetterAuthError: [# Drizzle Adapter]: The model "oauthConsent" was not found in the schema object. Please pass the schema directly to the adapter options.',
+        code: 'INTERNAL_SERVER_ERROR',
+      },
+    });
+
+    const outcomes = await runCanary({ ...baseConfig, djEmail: 'canary@wxyc.org', djPassword: 'pw' });
+    const oidc = outcomes.find((o) => o.name === 'oidc-authorize')!;
+
+    expect(oidc.status).toBe('fail');
+    // The message must include a substring the on-call can grep — either the
+    // model name that regressed OR the endpoint that returned it. Both give
+    // PagerDuty an actionable pointer without the on-call reading the raw
+    // 500 body first.
+    expect(oidc.message).toMatch(/oauthConsent|authorize/);
+    // Status code MUST land in the message — otherwise the runbook can't
+    // disambiguate "500 on authorize" from "302 to a login page" (session
+    // rot) at a glance.
+    expect(oidc.message).toMatch(/500/);
+  });
+
+  it('fails when the auth server 302s back to a login page (session invalidated)', async () => {
+    // Sign-in succeeded so /oauth2/authorize was called with a session
+    // token, but the auth server treats the session as invalid and bounces
+    // to the login page instead of issuing a code. This is the failure mode
+    // where the session cookie was accepted by /sign-in but rejected at
+    // /oauth2/authorize — real production shape when a session was
+    // invalidated between calls or the trusted client is unregistered.
+    setUpAuthorizeMock({
+      status: 302,
+      body: '',
+      headers: {
+        // The auth server's default login redirect. The check must NOT
+        // treat this as a pass just because it's a 302 — the Location must
+        // start with the probe's registered redirect URI.
+        Location: 'https://dj.wxyc.org/login?client_id=wxyc-canary&code=&state=some-state',
+      },
+    });
+
+    const outcomes = await runCanary({ ...baseConfig, djEmail: 'canary@wxyc.org', djPassword: 'pw' });
+    const oidc = outcomes.find((o) => o.name === 'oidc-authorize')!;
+
+    expect(oidc.status).toBe('fail');
+    // Message must point at the login-redirect shape so the on-call routes
+    // to session/auth investigation rather than "the trusted client is
+    // gone" (they overlap; the message should hint at the bounce).
+    expect(oidc.message).toMatch(/login|redirect|Location/i);
+  });
+
+  it('fails on a 302 whose Location has no code parameter', async () => {
+    setUpAuthorizeMock({
+      status: 302,
+      body: '',
+      headers: { Location: 'https://canary.wxyc.org/authorize-echo?state=some-state' },
+    });
+
+    const outcomes = await runCanary({ ...baseConfig, djEmail: 'canary@wxyc.org', djPassword: 'pw' });
+    const oidc = outcomes.find((o) => o.name === 'oidc-authorize')!;
+
+    expect(oidc.status).toBe('fail');
+    expect(oidc.message).toMatch(/code/i);
+  });
+
+  it('fails when the returned state does not match the state the check sent', async () => {
+    // State parity is the CSRF barrier. If the server issues a code but the
+    // `state` echo differs, either an attacker fixed the state or the
+    // authorize handler regressed — both are page-worthy.
+    setUpAuthorizeMock({
+      status: 302,
+      body: '',
+      headers: {
+        Location: 'https://canary.wxyc.org/authorize-echo?code=abcd1234&state=NOT-THE-STATE-WE-SENT',
+      },
+    });
+
+    const outcomes = await runCanary({ ...baseConfig, djEmail: 'canary@wxyc.org', djPassword: 'pw' });
+    const oidc = outcomes.find((o) => o.name === 'oidc-authorize')!;
+
+    expect(oidc.status).toBe('fail');
+    expect(oidc.message).toMatch(/state/i);
+  });
+
+  it('fails on a non-302 status even when the body is empty', async () => {
+    // Rare but possible: the auth server returns 200 (a JSON body) instead
+    // of 302. That's not a valid authorize response for `response_type=code`
+    // and must fail. Distinct from the 500 case above (different remediation
+    // routing).
+    setUpAuthorizeMock({
+      status: 200,
+      body: '',
+    });
+
+    const outcomes = await runCanary({ ...baseConfig, djEmail: 'canary@wxyc.org', djPassword: 'pw' });
+    const oidc = outcomes.find((o) => o.name === 'oidc-authorize')!;
+
+    expect(oidc.status).toBe('fail');
+    expect(oidc.message).toMatch(/302|200/);
+  });
+
+  it('propagates the sign-in 429 precondition — check reports fail with the auth precondition message (single 429 → no retry consumes 4 outcomes)', async () => {
+    // The check is `requiresAuth: true`, so a broken sign-in cascades into
+    // the standard auth-precondition-failed path. Distinct from the check-
+    // level probe: a sign-in outage shouldn't page as an OIDC regression.
+    setUpFetchMock({
+      '/healthcheck': { status: 200, body: { ok: true } },
+      '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+      '/graph/artists/search': { status: 200, body: { results: [{ id: 1, canonical_name: 'stereolab' }] } },
+      'explore.example.test/health': {
+        status: 200,
+        body: { status: 'healthy', artist_count: 136_702, graph_db_age_seconds: 3_600 },
+      },
+      '/sign-in/email': { status: 401, body: { error: 'invalid credentials' } },
+    });
+
+    const outcomes = await runCanary({ ...baseConfig, djEmail: 'canary@wxyc.org', djPassword: 'wrong' });
+    const oidc = outcomes.find((o) => o.name === 'oidc-authorize')!;
+
+    expect(oidc.status).toBe('fail');
+    expect(oidc.message).toMatch(/auth precondition failed/);
+  });
+
+  it('never logs the code or the Set-Cookie header on failure — only status + first 200 chars of body', async () => {
+    // The failure message goes straight into the CloudWatch/PagerDuty alert
+    // and the GitHub-issue reporter. Leaking a real authorization code is
+    // a mid-severity credential exposure (short-lived, single-use, but real);
+    // Set-Cookie leaks the session token outright. Pin the redaction.
+    setUpAuthorizeMock({
+      status: 500,
+      body: 'sensitive body prefix, do not leak past 200 chars, code=SUPER-SECRET, and then '.repeat(20),
+      headers: { 'Set-Cookie': 'better-auth.session_token=leaked-cookie-value; Path=/; HttpOnly' },
+    });
+
+    const outcomes = await runCanary({ ...baseConfig, djEmail: 'canary@wxyc.org', djPassword: 'pw' });
+    const oidc = outcomes.find((o) => o.name === 'oidc-authorize')!;
+
+    expect(oidc.status).toBe('fail');
+    expect(oidc.message).not.toMatch(/leaked-cookie-value/);
+    expect(oidc.message).not.toMatch(/Set-Cookie/i);
+    // The status suffix is short; 200 chars from a repeated body is capped.
+    // The whole "sensitive body" content past the first 200 chars must not
+    // land in the alert message.
+    expect((oidc.message ?? '').length).toBeLessThan(500);
   });
 });
 

@@ -13,6 +13,7 @@ describe('checksForSuite', () => {
       'dj-library-search',
       'dj-flowsheet-read',
       'lml-auth',
+      'oidc-authorize',
     ]);
   });
 
@@ -92,9 +93,10 @@ describe('pagesOncall — paging-tier classification', () => {
     expect(paging).toContain('dj-rotation-picker');
     // semantic-index-search pages again post-#347 (wxyc-canary#50).
     expect(paging).toContain('semantic-index-search');
-    // The 8 user-facing checks + enrichment-quality (writes; pages by
+    // The 9 user-facing checks + enrichment-quality (writes; pages by
     // default though it skips in prod) all page; only the 2 infra checks
-    // are excluded.
+    // are excluded. `oidc-authorize` (wxyc-canary#60) is user-facing —
+    // login is the DJ-on-air gate for every OIDC client.
     expect(checks.length - paging.size).toBe(2);
     expect(paging.has('gha-runner-online')).toBe(false);
     expect(paging.has('semantic-index-freshness')).toBe(false);
