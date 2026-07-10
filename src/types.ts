@@ -78,6 +78,21 @@ export type CheckResult = {
   metrics?: Record<string, number>;
 };
 
+/**
+ * One OIDC probe target — `clientId` + `redirectUri` + human-readable
+ * `label`. The label is what shows up in an alert message when this
+ * specific probe fails; it lets the runbook route (e.g. "WikiJS registration
+ * missing" vs "canary trusted client misconfigured") without the on-call
+ * reading Location headers. Today the env loader always produces exactly
+ * one probe with label `'wxyc-canary'`; the array shape exists so a second
+ * consumer registers with a pure config change. See wxyc-canary#63.
+ */
+export type OidcProbe = {
+  clientId: string;
+  redirectUri: string;
+  label: string;
+};
+
 export type CheckContext = {
   backendUrl: string;
   authUrl: string;
@@ -117,20 +132,24 @@ export type CheckContext = {
    */
   djUserId: string | undefined;
   /**
-   * OIDC probe trusted-client id (wxyc-canary#60). The `oidc-authorize`
-   * check sends this as the `client_id` query param on `/oauth2/authorize`
-   * and expects the auth server to have a matching public trustedClient
-   * registered (WXYC/Backend-Service#1576). Defaults to `'wxyc-canary'`.
+   * OIDC probes to exercise on `/oauth2/authorize`. Array-shape so a
+   * second consumer (WikiJS, additional in-house tools) can register a
+   * per-client probe and any per-client trusted-client misregistration
+   * surfaces with the failing probe's `label` in the alert — routing to
+   * the right owner rather than the generic "OIDC is broken." The runtime
+   * check iterates every probe on a single tick; each failing probe
+   * contributes its `label`-prefixed message to the combined error so a
+   * multi-client regression lands in one alarm, not N.
+   *
+   * Non-empty by construction: the env loader always produces at least
+   * one probe (the `wxyc-canary` trusted client from
+   * WXYC/Backend-Service#1576) — the tuple type expresses that so the
+   * runtime code never has to defend against an empty array. Today the
+   * env vars still produce exactly one probe; wiring a second is a
+   * pure configuration change once a second client registers, no code
+   * changes needed. See wxyc-canary#63.
    */
-  oidcProbeClientId: string;
-  /**
-   * OIDC probe redirect URI — the placeholder the trusted client is
-   * registered with. The check sends it verbatim as `redirect_uri` on
-   * `/oauth2/authorize` and asserts the returned 302 `Location` starts
-   * with it. The URL never has to resolve — the check reads the Location
-   * header with `redirect: 'manual'` and never follows the redirect.
-   */
-  oidcProbeRedirectUri: string;
+  oidcProbes: readonly [OidcProbe, ...OidcProbe[]];
   /**
    * Wall-clock budget the enrichment-quality check spends polling its
    * sentinel row. Default 45_000 leaves 15s of headroom under the 60s
@@ -234,8 +253,19 @@ export type CanaryConfig = {
    * `gha-runner-online` check downgrades to skipped.
    */
   ghaRunnerToken?: string;
-  /** See CheckContext.oidcProbeClientId. Defaults to `'wxyc-canary'` in the handler. */
+  /**
+   * OIDC probe trusted-client id. Sent as `client_id` on `/oauth2/authorize`.
+   * The handler folds this + `oidcProbeRedirectUri` into a single-entry
+   * `CheckContext.oidcProbes` array (wxyc-canary#63) — today the env loader
+   * always produces exactly one probe, and this pair is the wire. Defaults
+   * to `'wxyc-canary'` in the handler.
+   */
   oidcProbeClientId?: string;
-  /** See CheckContext.oidcProbeRedirectUri. Defaults to `'https://canary.wxyc.invalid/authorize-echo'` in the handler. */
+  /**
+   * OIDC probe redirect URI paired with `oidcProbeClientId`. See the
+   * `oidcProbeClientId` doc for the array-fold contract. Defaults to
+   * `'https://canary.wxyc.invalid/authorize-echo'` in the handler
+   * (RFC 2606 `.invalid` TLD — BS#1584).
+   */
   oidcProbeRedirectUri?: string;
 };
