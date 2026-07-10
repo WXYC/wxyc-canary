@@ -291,7 +291,14 @@ async function runOneProbe(authUrl: string, probe: OidcProbe, sessionToken: stri
   // collision within a single tick is astronomical; short enough not to
   // stuff the query string.
   const state = randomBytes(16).toString('base64url');
-  const url = new URL(`${authUrl}/oauth2/authorize`);
+  // Strip trailing slashes on `authUrl` before path concat so an operator who
+  // sets `CANARY_AUTH_URL=https://api.wxyc.org/auth/` (trailing slash from a
+  // browser copy-paste) doesn't compose `//oauth2/authorize`. better-auth's
+  // router treats the double-slash as a distinct route → 404 → the canary
+  // pages on-call for a config typo instead of a real regression. Uses the
+  // same regex + `|| '/'` shape as `normalizePath` above so a same-file
+  // consumer can't drift.
+  const url = new URL(`${authUrl.replace(/\/+$/, '')}/oauth2/authorize`);
   url.searchParams.set('response_type', 'code');
   url.searchParams.set('client_id', probe.clientId);
   url.searchParams.set('redirect_uri', probe.redirectUri);

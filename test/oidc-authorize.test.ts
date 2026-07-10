@@ -201,3 +201,38 @@ describe('oidc-authorize — multi-probe fan-out (wxyc-canary#63)', () => {
     await expect(oidcAuthorize.run(baseCtx({ oidcProbes: probes }))).resolves.toBeUndefined();
   });
 });
+
+describe('oidc-authorize — authUrl trailing-slash normalization', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('handles a trailing-slash authUrl without composing `//oauth2/authorize`', async () => {
+    // An operator supplies `CANARY_AUTH_URL=https://auth.example.test/`
+    // (trailing slash — an easy copy-paste from a browser). Without
+    // normalization, `${authUrl}/oauth2/authorize` composes as
+    // `https://auth.example.test//oauth2/authorize`, and better-auth's
+    // router treats `//oauth2/authorize` as a distinct route from
+    // `/oauth2/authorize` → 404 → the canary pages on-call for a config
+    // typo instead of a real regression. Assert the URL under the hood
+    // hits the single-slash path.
+    let observedPath: string | undefined;
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const urlString = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      const url = new URL(urlString);
+      observedPath = url.pathname;
+      const state = url.searchParams.get('state') ?? '';
+      return new Response(null, {
+        status: 302,
+        headers: {
+          Location: `https://canary.wxyc.org/authorize-echo?code=abcd1234&state=${encodeURIComponent(state)}`,
+        },
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await oidcAuthorize.run(baseCtx({ authUrl: 'https://auth.example.test/' }));
+
+    expect(observedPath).toBe('/oauth2/authorize');
+  });
+});
