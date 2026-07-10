@@ -84,7 +84,7 @@ const AUTHORIZE_ECHO_STATE_STUB: StubEntry = {
       status: 302,
       body: '',
       headers: {
-        Location: `https://canary.wxyc.org/authorize-echo?code=canned-code&state=${encodeURIComponent(state)}`,
+        Location: `https://canary.wxyc.invalid/authorize-echo?code=canned-code&state=${encodeURIComponent(state)}`,
       },
     };
   },
@@ -113,7 +113,7 @@ function assertAuthorizeRequestShape(
   urlString: string,
   init: RequestInit | undefined,
   { expectedRedirectUri }: { expectedRedirectUri: string } = {
-    expectedRedirectUri: 'https://canary.wxyc.org/authorize-echo',
+    expectedRedirectUri: 'https://canary.wxyc.invalid/authorize-echo',
   }
 ) {
   const url = new URL(urlString);
@@ -2189,7 +2189,7 @@ function setUpEnrichmentHappyPathMock(): ReturnType<typeof setUpMethodAwareMock>
           status: 302,
           body: '',
           headers: {
-            Location: `https://canary.wxyc.org/authorize-echo?code=abcd1234&state=${encodeURIComponent(echoedState)}`,
+            Location: `https://canary.wxyc.invalid/authorize-echo?code=abcd1234&state=${encodeURIComponent(echoedState)}`,
           },
         };
       },
@@ -2693,7 +2693,7 @@ describe('runCanary — oidc-authorize check (wxyc-canary#60)', () => {
         const url = new URL(urlString);
         expect(url.searchParams.get('response_type')).toBe('code');
         expect(url.searchParams.get('client_id')).toBe('wxyc-canary');
-        expect(url.searchParams.get('redirect_uri')).toBe('https://canary.wxyc.org/authorize-echo');
+        expect(url.searchParams.get('redirect_uri')).toBe('https://canary.wxyc.invalid/authorize-echo');
         const scope = url.searchParams.get('scope') ?? '';
         expect(scope).toMatch(/openid/);
         expect(scope).toMatch(/profile/);
@@ -2717,7 +2717,7 @@ describe('runCanary — oidc-authorize check (wxyc-canary#60)', () => {
         // this test rather than silently masking every 302-shape failure.
         expect(init?.redirect).toBe('manual');
         // Echo the state back to prove the state-parity check works.
-        const location = `https://canary.wxyc.org/authorize-echo?code=abcd1234&state=${encodeURIComponent(state)}`;
+        const location = `https://canary.wxyc.invalid/authorize-echo?code=abcd1234&state=${encodeURIComponent(state)}`;
         return new Response(null, {
           status: 302,
           headers: { Location: location },
@@ -2816,7 +2816,7 @@ describe('runCanary — oidc-authorize check (wxyc-canary#60)', () => {
     setUpAuthorizeMock({
       status: 302,
       body: '',
-      headers: { Location: 'https://canary.wxyc.org/authorize-echo?state=some-state' },
+      headers: { Location: 'https://canary.wxyc.invalid/authorize-echo?state=some-state' },
     });
 
     const outcomes = await runCanary({ ...baseConfig, djEmail: 'canary@wxyc.org', djPassword: 'pw' });
@@ -2840,7 +2840,7 @@ describe('runCanary — oidc-authorize check (wxyc-canary#60)', () => {
       status: 302,
       body: '',
       headers: {
-        Location: 'https://canary.wxyc.org/authorize-echo#code=REAL-CODE-FRAG&state=X',
+        Location: 'https://canary.wxyc.invalid/authorize-echo#code=REAL-CODE-FRAG&state=X',
       },
     });
 
@@ -2862,7 +2862,7 @@ describe('runCanary — oidc-authorize check (wxyc-canary#60)', () => {
       status: 302,
       body: '',
       headers: {
-        Location: 'https://canary.wxyc.org/authorize-echo?code=abcd1234&state=NOT-THE-STATE-WE-SENT',
+        Location: 'https://canary.wxyc.invalid/authorize-echo?code=abcd1234&state=NOT-THE-STATE-WE-SENT',
       },
     });
 
@@ -3073,7 +3073,7 @@ describe('runCanary — oidc-authorize check (wxyc-canary#60)', () => {
     // string starts with the probe redirect URI but does NOT actually match
     // the registered client callback origin+path must fail. A naive
     // `startsWith` guard accepts:
-    //   https://canary.wxyc.org/authorize-echo-attacker.example.com/?code=X
+    //   https://canary.wxyc.invalid/authorize-echo-attacker.example.com/?code=X
     // as valid because the string prefix matches; strict URL parsing
     // (origin+pathname compare) rejects it. The mock echoes the state so
     // the state-mismatch guard doesn't shadow the URL check we're pinning.
@@ -3083,7 +3083,7 @@ describe('runCanary — oidc-authorize check (wxyc-canary#60)', () => {
         const url = new URL(urlString);
         const state = url.searchParams.get('state') ?? '';
         // Echo the state so this test isolates the URL check.
-        const location = `https://canary.wxyc.org/authorize-echo-attacker.example.com/?code=abcd1234&state=${encodeURIComponent(state)}`;
+        const location = `https://canary.wxyc.invalid/authorize-echo-attacker.example.com/?code=abcd1234&state=${encodeURIComponent(state)}`;
         return new Response(null, {
           status: 302,
           headers: { Location: location },
@@ -3145,7 +3145,7 @@ describe('runCanary — oidc-authorize check (wxyc-canary#60)', () => {
         return new Response(null, {
           status: 302,
           headers: {
-            Location: `https://canary.wxyc.org/authorize-echo/?code=abcd1234&state=${encodeURIComponent(state)}`,
+            Location: `https://canary.wxyc.invalid/authorize-echo/?code=abcd1234&state=${encodeURIComponent(state)}`,
           },
         });
       }
@@ -3191,14 +3191,14 @@ describe('runCanary — oidc-authorize check (wxyc-canary#60)', () => {
         // R3-12: pin the outgoing request shape. The `redirect_uri` here
         // is the trailing-slash form the test configures below.
         assertAuthorizeRequestShape(urlString, init, {
-          expectedRedirectUri: 'https://canary.wxyc.org/authorize-echo/',
+          expectedRedirectUri: 'https://canary.wxyc.invalid/authorize-echo/',
         });
         const url = new URL(urlString);
         const state = url.searchParams.get('state') ?? '';
         return new Response(null, {
           status: 302,
           headers: {
-            Location: `https://canary.wxyc.org/authorize-echo?code=abcd1234&state=${encodeURIComponent(state)}`,
+            Location: `https://canary.wxyc.invalid/authorize-echo?code=abcd1234&state=${encodeURIComponent(state)}`,
           },
         });
       }
@@ -3235,7 +3235,7 @@ describe('runCanary — oidc-authorize check (wxyc-canary#60)', () => {
       ...baseConfig,
       djEmail: 'canary@wxyc.org',
       djPassword: 'pw',
-      oidcProbeRedirectUri: 'https://canary.wxyc.org/authorize-echo/',
+      oidcProbeRedirectUri: 'https://canary.wxyc.invalid/authorize-echo/',
     });
     const oidc = outcomes.find((o) => o.name === 'oidc-authorize')!;
 
@@ -3263,7 +3263,7 @@ describe('runCanary — oidc-authorize check (wxyc-canary#60)', () => {
           headers: {
             // Doubled trailing slash — the shape a `base + '/' + path`
             // concatenation bug with a `/`-terminated base would emit.
-            Location: `https://canary.wxyc.org/authorize-echo//?code=abcd1234&state=${encodeURIComponent(state)}`,
+            Location: `https://canary.wxyc.invalid/authorize-echo//?code=abcd1234&state=${encodeURIComponent(state)}`,
           },
         });
       }
@@ -3378,7 +3378,7 @@ describe('runCanary — oidc-authorize check (wxyc-canary#60)', () => {
         return new Response(null, {
           status: 302,
           headers: {
-            Location: `https://canary.wxyc.org/authorize-echo?code=abcd1234&state=${encodeURIComponent(state)}`,
+            Location: `https://canary.wxyc.invalid/authorize-echo?code=abcd1234&state=${encodeURIComponent(state)}`,
           },
         });
       }
@@ -3430,7 +3430,7 @@ describe('runCanary — oidc-authorize check (wxyc-canary#60)', () => {
         return new Response(null, {
           status: 303,
           headers: {
-            Location: `https://canary.wxyc.org/authorize-echo?code=abcd1234&state=${encodeURIComponent(state)}`,
+            Location: `https://canary.wxyc.invalid/authorize-echo?code=abcd1234&state=${encodeURIComponent(state)}`,
           },
         });
       }
@@ -3543,7 +3543,7 @@ describe('runCanary — oidc-authorize check (wxyc-canary#60)', () => {
         return new Response(null, {
           status: 302,
           headers: {
-            Location: `https://canary.wxyc.org/authorize-echo?code=abcd1234&state=${encodeURIComponent(state)}`,
+            Location: `https://canary.wxyc.invalid/authorize-echo?code=abcd1234&state=${encodeURIComponent(state)}`,
           },
         });
       }

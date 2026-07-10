@@ -138,15 +138,18 @@ Parameters:
       `??`, in src/handler.ts).
   OidcProbeRedirectUri:
     Type: String
-    Default: https://canary.wxyc.org/authorize-echo
+    Default: https://canary.wxyc.invalid/authorize-echo
     AllowedPattern: '^https?://.+'
     Description: >
       Redirect URI the `oidc-authorize` probe's trusted client is
       registered with. The URL never has to resolve — the check reads the
-      3xx `Location` with `redirect: 'manual'` and never follows it.
+      3xx `Location` with `redirect: 'manual'` and never follows it. Uses
+      the RFC 2606 `.invalid` TLD so a routing accident can never
+      exfiltrate authorization codes to a real host, and so the URL is
+      unambiguously non-resolving to future readers (BS#1584).
       The check asserts the returned Location matches this value on
       `origin` (strict compare — rejects prefix-crafted attacker URLs
-      like `https://canary.wxyc.org/authorize-echo-attacker.example.com`)
+      like `https://canary.wxyc.invalid/authorize-echo-attacker.example.com`)
       and on `pathname` after normalization: RFC 3986 §6.2.3 equivalence
       strips trailing slashes on both sides so `/authorize-echo`,
       `/authorize-echo/`, and `/authorize-echo//` all compare equal (a

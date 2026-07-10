@@ -236,6 +236,6 @@ export type CanaryConfig = {
   ghaRunnerToken?: string;
   /** See CheckContext.oidcProbeClientId. Defaults to `'wxyc-canary'` in the handler. */
   oidcProbeClientId?: string;
-  /** See CheckContext.oidcProbeRedirectUri. Defaults to `'https://canary.wxyc.org/authorize-echo'` in the handler. */
+  /** See CheckContext.oidcProbeRedirectUri. Defaults to `'https://canary.wxyc.invalid/authorize-echo'` in the handler. */
   oidcProbeRedirectUri?: string;
 };
