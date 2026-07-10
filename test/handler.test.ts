@@ -3309,7 +3309,7 @@ describe('runCanary — oidc-authorize check (wxyc-canary#60)', () => {
         // R3-12: pin the outgoing request shape. The redirect URI here
         // is the bare-host form the test configures below.
         assertAuthorizeRequestShape(urlString, init, {
-          expectedRedirectUri: 'https://canary.wxyc.org/',
+          expectedRedirectUri: 'https://canary.wxyc.invalid/',
         });
         const url = new URL(urlString);
         const state = url.searchParams.get('state') ?? '';
@@ -3321,7 +3321,7 @@ describe('runCanary — oidc-authorize check (wxyc-canary#60)', () => {
             // normalizePath contract rather than the pathological shape;
             // the important guarantee is that the strip doesn't collapse
             // `/` to empty and cause a non-root Location to match.
-            Location: `https://canary.wxyc.org//?code=abcd1234&state=${encodeURIComponent(state)}`,
+            Location: `https://canary.wxyc.invalid//?code=abcd1234&state=${encodeURIComponent(state)}`,
           },
         });
       }
@@ -3355,7 +3355,7 @@ describe('runCanary — oidc-authorize check (wxyc-canary#60)', () => {
       ...baseConfig,
       djEmail: 'canary@wxyc.org',
       djPassword: 'pw',
-      oidcProbeRedirectUri: 'https://canary.wxyc.org/',
+      oidcProbeRedirectUri: 'https://canary.wxyc.invalid/',
     });
     const oidc = outcomes.find((o) => o.name === 'oidc-authorize')!;
 
@@ -3367,7 +3367,7 @@ describe('runCanary — oidc-authorize check (wxyc-canary#60)', () => {
     // the whole point of the probe (code + state parity live there). Node's
     // default fetch follows redirects, which would swallow the Location and
     // deliver whatever the redirect target returns (typically an ECONNREFUSED
-    // against the canary.wxyc.org placeholder callback). Pin the request-init.
+    // against the canary.wxyc.invalid placeholder callback). Pin the request-init.
     let capturedRedirect: RequestInit['redirect'] | undefined;
     const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const urlString = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
