@@ -645,18 +645,27 @@ const enrichmentQuality: Check = {
 };
 
 /**
- * Generate a fresh PKCE `code_verifier` / `code_challenge` pair per RFC
- * 7636 §4. The verifier is 32 random bytes rendered as urlsafe base64 (43
- * chars with the padding stripped). The challenge is
- * `base64url(sha256(verifier))`. Node's `randomBytes` is a CSPRNG; the
- * verifier lives for the duration of a single `oidc-authorize` tick and
- * never leaves the process, so any weaker source would already be over-
- * engineered for a canary that doesn't exchange the code.
+ * Generate a fresh PKCE `code_challenge` per RFC 7636 §4. The verifier is
+ * 32 random bytes rendered as urlsafe base64 (43 chars with the padding
+ * stripped); the challenge is `base64url(sha256(verifier))`. Node's
+ * `randomBytes` is a CSPRNG; the verifier lives for the duration of a
+ * single `oidc-authorize` tick and never leaves the process, so any
+ * weaker source would already be over-engineered for a canary that
+ * doesn't exchange the code.
+ *
+ * The verifier itself is intentionally NOT returned — the check stops at
+ * the /authorize 302 and never exchanges the code, so the verifier's
+ * only role is as sha256 input. Returning it would create a call-site
+ * temptation to log or reuse it, both of which would defeat the point of
+ * PKCE. If a future rev grows a second-tier probe that exchanges the code
+ * with a WRONG verifier (to prove the exchange rejects it), that probe
+ * should generate its own pair rather than get one leaked back through
+ * this helper's return type.
  */
-function generatePkcePair(): { verifier: string; challenge: string } {
+function generatePkcePair(): { challenge: string } {
   const verifier = randomBytes(32).toString('base64url');
   const challenge = createHash('sha256').update(verifier).digest('base64url');
-  return { verifier, challenge };
+  return { challenge };
 }
 
 /**
@@ -680,15 +689,21 @@ function generatePkcePair(): { verifier: string; challenge: string } {
  *      &state=<random>&code_challenge=<S256(v)>&code_challenge_method=S256`
  *      with `Authorization: Bearer <session-token>` (the better-auth
  *      `bearer` plugin translates it to a session cookie) and
- *      `redirect: 'manual'` (so we can inspect the 302 Location).
- *   3. Assert 302, Location starts with the probe redirect URI, has a
- *      non-empty `code` query param, and echoes the `state` we sent.
+ *      `redirect: 'manual'` (so we can inspect the 3xx Location).
+ *   3. Assert 302 or 303 (OAuth 2.0 §4.1.2 does not pin the code), Location
+ *      matches the probe redirect URI on both `origin` and `pathname`
+ *      (strict URL parse — never a `startsWith` on the raw string, which
+ *      accepts `https://canary.wxyc.org/authorize-echo-attacker.example.com`
+ *      as valid), has a non-empty `code` query param, and echoes the
+ *      `state` we sent.
  *
- * Fails on: non-302, missing/mismatched state, missing code, Location
- * pointing at a login page (session invalidated), 5xx, or the exact
- * BS#1571 500 shape. Message truncates to the first 200 chars of body per
- * `healthcheck`'s convention — never logs the code, never logs Set-Cookie
- * (both are session-material for the canary DJ).
+ * Fails on: non-302/303, missing/mismatched state, missing code, Location
+ * pointing at a login page or crafted redirect (session invalidated), 5xx,
+ * or the exact BS#1571 500 shape. Message truncates to the first 200 chars
+ * of body per `healthcheck`'s convention, redacts any `code=<value>` from
+ * the truncated slice (belt-and-suspenders — the 5xx branch could carry
+ * a code minted just before the substrate write failed), and never logs
+ * Set-Cookie (session-material for the canary DJ).
  */
 const oidcAuthorize: Check = {
   name: 'oidc-authorize',
@@ -708,11 +723,10 @@ const oidcAuthorize: Check = {
       // confusing "cannot read properties of undefined."
       throw new Error('DJ session token missing (signInDj did not return sessionToken)');
     }
-    const { verifier: _verifier, challenge } = generatePkcePair();
+    const { challenge } = generatePkcePair();
     // 16 random bytes → 22-char urlsafe base64. Long enough that a
     // collision within a single tick is astronomical; short enough not to
-    // stuff the query string. `_verifier` is discarded — the check never
-    // exchanges the code, so the verifier only exists to be hashed.
+    // stuff the query string.
     const state = randomBytes(16).toString('base64url');
     const url = new URL(`${ctx.authUrl}/oauth2/authorize`);
     url.searchParams.set('response_type', 'code');
@@ -733,38 +747,63 @@ const oidcAuthorize: Check = {
     // the 302-but-wrong-Location cases below (that's a login-page bounce,
     // not a substrate-missing error). Include the response body truncation
     // per healthcheck's convention.
+    //
+    // Redact `code=<value>` before slicing — a 5xx body from a
+    // partially-executed authorize handler could contain the code the
+    // handler minted just before the 5xx (better-auth today doesn't, but
+    // a future rev might, and the docstring promises "never logs the
+    // code" without qualification). The redaction is body-first + slice
+    // so the token can't survive at a truncation boundary.
+    const redactCode = (s: string): string => s.replace(/code=[^&\s"']+/g, 'code=<redacted>');
     if (r.status >= 500) {
       throw new Error(
-        `authorize expected 302, got ${r.status} (BS#1571 replay class if body mentions oauthConsent): ${r.rawText.slice(0, 200)}`
+        `authorize expected 302, got ${r.status} (BS#1571 replay class if body mentions oauthConsent): ${redactCode(r.rawText).slice(0, 200)}`
       );
     }
-    if (r.status !== 302) {
-      throw new Error(`authorize expected 302, got ${r.status}: ${r.rawText.slice(0, 200)}`);
+    // OAuth 2.0 (RFC 6749 §4.1.2) allows either 302 Found or 303 See Other
+    // on the authorization response. better-auth returns 302 today, but the
+    // spec doesn't pin it — a future rev switching to 303 would be a
+    // legitimate change we must not flap on.
+    if (r.status !== 302 && r.status !== 303) {
+      throw new Error(`authorize expected 302, got ${r.status}: ${redactCode(r.rawText).slice(0, 200)}`);
     }
 
     const location = r.headers?.location;
     if (!location) {
-      // 302 without a Location header is malformed. `canaryFetch` lowercases
+      // 3xx without a Location header is malformed. `canaryFetch` lowercases
       // header names, so this covers `Location:` too.
-      throw new Error('authorize returned 302 with no Location header');
-    }
-
-    // Login-page bounce: the auth server accepted the session as far as
-    // /sign-in/email, but rejected it on /oauth2/authorize (invalidated
-    // between calls, trusted client missing, etc.). The Location won't
-    // start with the registered probe redirect URI. Distinct message so
-    // the on-call routes to session/auth investigation.
-    if (!location.startsWith(ctx.oidcProbeRedirectUri)) {
-      throw new Error(
-        `authorize 302 Location does not start with the probe redirect URI (session invalidated or trusted client missing): ${location.slice(0, 200)}`
-      );
+      throw new Error(`authorize returned ${r.status} with no Location header`);
     }
 
     let parsed: URL;
     try {
       parsed = new URL(location);
     } catch {
-      throw new Error(`authorize 302 Location is not a valid URL: ${location.slice(0, 200)}`);
+      throw new Error(`authorize 302 Location is not a valid URL: ${redactCode(location).slice(0, 200)}`);
+    }
+    // Login-page bounce or crafted-redirect regression: strict origin +
+    // pathname comparison rejects both a login-page URL AND the class of
+    // prefix-bypass Locations like
+    //   https://canary.wxyc.org/authorize-echo-attacker.example.com/?code=X
+    // that a naive `location.startsWith(ctx.oidcProbeRedirectUri)` would
+    // accept. Parse both sides — origin + pathname compare — so the guard
+    // holds regardless of how the Location is stringified (trailing slash,
+    // extra path segment, subdomain injection). Distinct message so the
+    // on-call routes to session/auth investigation.
+    let expected: URL;
+    try {
+      expected = new URL(ctx.oidcProbeRedirectUri);
+    } catch {
+      // Should never fire — config-time validation of the redirect URI
+      // is out of scope for the runtime check. Fail loudly if it happens.
+      throw new Error(
+        `oidcProbeRedirectUri is not a valid URL — configuration error: ${ctx.oidcProbeRedirectUri.slice(0, 200)}`
+      );
+    }
+    if (parsed.origin !== expected.origin || parsed.pathname !== expected.pathname) {
+      throw new Error(
+        `authorize 302 Location does not match the probe redirect URI origin+path (session invalidated, trusted client missing, or redirect regression): ${redactCode(location).slice(0, 200)}`
+      );
     }
     const returnedCode = parsed.searchParams.get('code');
     if (!returnedCode) {
