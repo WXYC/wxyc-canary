@@ -215,14 +215,17 @@ export const oidcAuthorize: Check = {
   // (flowsheet verifier today, WikiJS + others planned) breaks when this
   // path breaks.
   run: async (ctx) => {
-    if (!ctx.djSessionToken) {
+    if (ctx.djAuth.kind !== 'signed-in') {
       // Belt-and-suspenders: the auth-precondition layer already downgrades
       // the check to `fail` when sign-in errored. This branch fires only if
-      // `signInDj`'s contract changes and starts returning a result without
-      // a session token — a shape rev we want a clear message on, not a
-      // confusing "cannot read properties of undefined."
+      // the runner dispatches a `requiresAuth: true` check with a
+      // non-signed-in `djAuth` — a shape rev we want a clear message on,
+      // not a confusing "cannot read properties of undefined." Same string
+      // shape as the pre-#65 `if (!ctx.djSessionToken)` guard emitted so
+      // alert-message regexes in downstream tests continue to match.
       throw new Error('DJ session token missing (signInDj did not return sessionToken)');
     }
+    const sessionToken = ctx.djAuth.sessionToken;
     // Multi-probe loop (wxyc-canary#63). `ctx.oidcProbes` is a non-empty
     // tuple; run every probe and collect its failure. Multi-client damage
     // (one client's trusted-client registration missing while others
@@ -233,7 +236,7 @@ export const oidcAuthorize: Check = {
     const failures: string[] = [];
     for (const probe of ctx.oidcProbes) {
       try {
-        await runOneProbe(ctx.authUrl, probe, ctx.djSessionToken);
+        await runOneProbe(ctx.authUrl, probe, sessionToken);
       } catch (err) {
         failures.push(`[${probe.label}] ${(err as Error).message}`);
       }

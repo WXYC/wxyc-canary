@@ -47,10 +47,19 @@ type V2FlowsheetTrackEntry = {
  * `{ skipped: true, skipReason }` on the other-DJ case.
  */
 export async function runEnrichmentCheck(ctx: CheckContext): Promise<CheckResult> {
-  if (!ctx.djBearerToken) throw new Error('DJ bearer token missing');
-  if (!ctx.djUserId) throw new Error('DJ user id missing');
+  // Narrow via the discriminated `djAuth` union (wxyc-canary#65). The
+  // runner already downgrades a non-signed-in dispatch to `fail` before
+  // reaching here; the throw preserves the pre-#65 belt-and-suspenders
+  // safety so future refactors can't silently bypass the auth check.
+  if (ctx.djAuth.kind !== 'signed-in') throw new Error('DJ bearer token missing');
+  const { jwt, userId } = ctx.djAuth;
+  // `userId` is the one field the write canary can't tolerate absent —
+  // the /flowsheet/join and /flowsheet/end endpoints both require it in
+  // the request body. Read-only DJ-auth checks tolerate a missing userId
+  // (better-auth response-shape drift), but this write path fails loud.
+  if (!userId) throw new Error('DJ user id missing');
 
-  const auth = { Authorization: `Bearer ${ctx.djBearerToken}` };
+  const auth = { Authorization: `Bearer ${jwt}` };
   const jsonAuth = { ...auth, 'Content-Type': 'application/json' };
   const sentinelTs = Date.now();
   const artistName = `${SENTINEL_PREFIX}-${sentinelTs}`;
@@ -62,7 +71,7 @@ export async function runEnrichmentCheck(ctx: CheckContext): Promise<CheckResult
     throw new Error(`djs-on-air precondition failed with ${djsOnAir.status}: ${djsOnAir.rawText.slice(0, 200)}`);
   }
   const djs = Array.isArray(djsOnAir.body) ? (djsOnAir.body as Array<{ id: string | null }>) : [];
-  const otherDjActive = djs.length > 0 && !djs.some((d) => d.id === ctx.djUserId);
+  const otherDjActive = djs.length > 0 && !djs.some((d) => d.id === userId);
   if (otherDjActive) {
     const otherIds = djs.map((d) => d.id ?? '<null>').join(',');
     return { skipped: true, skipReason: `other DJ on-air (ids=${otherIds}); not writing sentinel` };
@@ -74,7 +83,7 @@ export async function runEnrichmentCheck(ctx: CheckContext): Promise<CheckResult
   const joinResp = await canaryFetch(`${ctx.backendUrl}/flowsheet/join`, {
     method: 'POST',
     headers: jsonAuth,
-    body: JSON.stringify({ dj_id: ctx.djUserId, show_name: 'WXYC Canary Probe' }),
+    body: JSON.stringify({ dj_id: userId, show_name: 'WXYC Canary Probe' }),
   });
   if (!joinResp.ok) {
     throw new Error(`flowsheet/join failed with ${joinResp.status}: ${joinResp.rawText.slice(0, 200)}`);
@@ -174,7 +183,7 @@ export async function runEnrichmentCheck(ctx: CheckContext): Promise<CheckResult
       const endResp = await canaryFetch(`${ctx.backendUrl}/flowsheet/end`, {
         method: 'POST',
         headers: jsonAuth,
-        body: JSON.stringify({ dj_id: ctx.djUserId }),
+        body: JSON.stringify({ dj_id: userId }),
       });
       if (!endResp.ok) {
         console.warn(`[enrichment-check] cleanup end-show failed: ${endResp.status} ${endResp.rawText.slice(0, 200)}`);
