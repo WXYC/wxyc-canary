@@ -90,16 +90,30 @@ function generatePkcePair(): { challenge: string } {
  *
  * URL-form regexes carry two guards not obvious at a glance:
  *
- *  - Terminator class `[^&\s"'<>]+` includes `&` so the greedy match stops
- *    at the next URL param (without `&`, `code=<redacted>&scope=openid&…`
- *    would swallow the whole tail after the URL pass placeholder,
- *    destroying every downstream OIDC routing signal like `error=…`); and
- *    includes `<`/`>` so HTML-ish 5xx envelopes (`<b>code=REAL</b>`) can't
- *    hide the value behind a tag.
- *  - Negative lookbehind `(?<![A-Za-z0-9_])` prevents substring matches on
- *    identifiers whose tail happens to be `code`/`state` (`errorcode=`,
- *    `session_state=`). Same rationale as the quoted-key JSON form:
- *    preserve identifier-shaped breadcrumbs for on-call routing.
+ *  - Terminator class `[^&\s"'<>,;#]+` includes `&` so the greedy match
+ *    stops at the next URL param (without `&`,
+ *    `code=<redacted>&scope=openid&…` would swallow the whole tail after
+ *    the URL pass placeholder, destroying every downstream OIDC routing
+ *    signal like `error=…`); includes `<`/`>` so HTML-ish 5xx envelopes
+ *    (`<b>code=REAL</b>`) can't hide the value behind a tag; and includes
+ *    `,` / `;` / `#` (wxyc-canary#68 R4-3) so a comma / semicolon / URL
+ *    fragment terminator preserves downstream diagnostics. `#` is the
+ *    most load-bearing of the three: an OIDC error response like
+ *    `#code=X&error=access_denied` MUST not lose the `error=access_denied`
+ *    routing signal to a greedy match.
+ *  - Negative lookbehind `(?<![-A-Za-z0-9_])` prevents substring matches
+ *    on identifiers whose tail happens to be `code`/`state` (`errorcode=`,
+ *    `session_state=`, `oauth-code=` — the hyphen-prefixed form is
+ *    covered by wxyc-canary#68 R4-1). Same rationale as the quoted-key
+ *    JSON form: preserve identifier-shaped breadcrumbs for on-call
+ *    routing.
+ *
+ * JSON-form value class `(?:\\.|[^"])+` (wxyc-canary#68 R4-2) handles
+ * escaped quotes inside the value — a body like `{"code":"abc\"def"}`
+ * previously terminated the match at the first `\"`, leaving `def"`
+ * exposed. The `\\.` alternative consumes any escaped char (including a
+ * literal backslash) and `[^"]` consumes any non-quote — together they
+ * span the whole JSON-string value without stopping at an escaped quote.
  *
  * Hoisted to module scope so every branch that formats an error message
  * uses the same redaction — a per-call arrow function inside `run` would
@@ -109,9 +123,13 @@ function generatePkcePair(): { challenge: string } {
 const redactCodeAndState = (s: string): string =>
   s
     // URL-shape: `code=<value>` / `state=<value>`. See the docstring above
-    // for the terminator + lookbehind rationale.
-    .replace(/(?<![A-Za-z0-9_])code=[^&\s"'<>]+/g, 'code=<redacted>')
-    .replace(/(?<![A-Za-z0-9_])state=[^&\s"'<>]+/g, 'state=<redacted>')
+    // for the terminator + lookbehind rationale. Negative lookbehind
+    // includes `-` (wxyc-canary#68 R4-1) so `oauth-code=REAL` is treated
+    // as identifier-shaped, not `code=`. Terminator includes `,`, `;`, `#`
+    // (wxyc-canary#68 R4-3) so a comma / semicolon / fragment doesn't
+    // swallow the tail.
+    .replace(/(?<![-A-Za-z0-9_])code=[^&\s"'<>,;#]+/g, 'code=<redacted>')
+    .replace(/(?<![-A-Za-z0-9_])state=[^&\s"'<>,;#]+/g, 'state=<redacted>')
     // JSON-shape: strictly `"code":"<value>"` / `"state":"<value>"`. The
     // closing quote after `code`/`state` structurally rules out matches on
     // `"errorCode":`, `"statusCode":`, `"session_state":`, `"oauthConsent":`
@@ -119,25 +137,32 @@ const redactCodeAndState = (s: string): string =>
     // `oauthConsent` as a routing breadcrumb. Case-insensitive because
     // JSON keys are conventionally lowercase but nothing forbids `Code`
     // or `State`. Whitespace tolerance around `:` matches pretty-printed
-    // envelopes.
-    .replace(/("code"\s*:\s*")[^"]+"/gi, '$1<redacted>"')
-    .replace(/("state"\s*:\s*")[^"]+"/gi, '$1<redacted>"');
+    // envelopes. Value class `(?:\\.|[^"])+` (wxyc-canary#68 R4-2) spans
+    // escaped quotes so `{"code":"abc\"def"}` doesn't leave `def"`
+    // exposed at the first escape.
+    .replace(/("code"\s*:\s*")(?:\\.|[^"])+"/gi, '$1<redacted>"')
+    .replace(/("state"\s*:\s*")(?:\\.|[^"])+"/gi, '$1<redacted>"');
 
 /**
  * Normalize a URL pathname so `/authorize-echo`, `/authorize-echo/`, and
- * `/authorize-echo//` all compare equal. RFC 3986 §6.2.3 (Scheme-Based
- * Normalization) allows treating trailing-slash variants of a hierarchical
- * path as equivalent — and if the trusted-client registration and the CFN
- * `OidcProbeRedirectUri` param drift by any slash count, the check would
- * page on-call every tick for a no-actual-regression cause. The subdomain
- * / prefix-bypass guard is unaffected because it lives on `origin`, not
- * pathname.
+ * `/authorize-echo//` all compare equal — trailing-slash tolerance only.
+ * This is a NARROWER normalization than RFC 3986 §6.2.3 (Scheme-Based
+ * Normalization), which covers additional equivalences like
+ * percent-encoding case-folding and empty-path-to-`/` (see wxyc-canary#68
+ * R4-4): those extra equivalences are deliberately OUT OF SCOPE here
+ * because the operator failure mode this helper exists for is a slash-
+ * count drift between the trusted-client registration and the CFN
+ * `OidcProbeRedirectUri` param. Widening to full RFC 3986 §6.2.3
+ * would require decoding percent-encoded sequences before the compare —
+ * and no known operator gap on this path emits `%2F`, so that's YAGNI.
  *
  * Strips ALL trailing slashes rather than one so a `base + '/' + path`
  * concatenation bug on either side that produces `//` still compares
  * equal. The `|| '/'` fallback preserves the root path so an
  * `/`-only-configured redirect URI doesn't collapse to empty and start
- * accidentally matching every other Location.
+ * accidentally matching every other Location. The subdomain /
+ * prefix-bypass guard is unaffected because it lives on `origin`, not
+ * pathname.
  *
  * Hoisted to module scope for the same reason as `redactCodeAndState`
  * (see its docstring): a per-tick arrow function inside `run` re-creates

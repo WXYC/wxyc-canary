@@ -157,6 +157,35 @@ describe('runCli — happy paths', () => {
     ]);
   });
 
+  // wxyc-canary#68 R4-12: staging-gate needs per-env OIDC probe overrides
+  // so wxyc-shared's `bs-lml-gate.yml` can validate a staging BS whose
+  // trusted-client registration differs from prod. Pin: both flags are
+  // parsed, both land in CanaryConfig, both are undefined by default so
+  // the handler's fallback picks up.
+  it('threads the OIDC probe overrides into the CanaryConfig when flags are set (R4-12)', async () => {
+    const { io } = setUpStreams();
+    await runCli(
+      [
+        ...baseArgv,
+        '--oidc-probe-client-id=wxyc-canary-staging',
+        '--oidc-probe-redirect-uri=https://canary.staging.wxyc.org/authorize-echo',
+      ],
+      {},
+      io
+    );
+    const [config] = runCanaryMock.mock.calls[0];
+    expect(config.oidcProbeClientId).toBe('wxyc-canary-staging');
+    expect(config.oidcProbeRedirectUri).toBe('https://canary.staging.wxyc.org/authorize-echo');
+  });
+
+  it('leaves oidcProbe* undefined when the flags are omitted so the handler default resolves (R4-12)', async () => {
+    const { io } = setUpStreams();
+    await runCli(baseArgv, {}, io);
+    const [config] = runCanaryMock.mock.calls[0];
+    expect(config.oidcProbeClientId).toBeUndefined();
+    expect(config.oidcProbeRedirectUri).toBeUndefined();
+  });
+
   it('reads DJ credentials and LML bearer from env, not flags', async () => {
     const { io } = setUpStreams();
     await runCli(
