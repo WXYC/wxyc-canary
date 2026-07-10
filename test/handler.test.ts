@@ -90,6 +90,51 @@ const AUTHORIZE_ECHO_STATE_STUB: StubEntry = {
   },
 };
 
+/**
+ * Assert the request-side wire format of an outgoing `/oauth2/authorize`
+ * call. Used by every test that stitches its own bespoke fetch mock for
+ * `/oauth2/authorize` (the happy-path test, the R2-F4 trailing-slash
+ * pair, the R3-3 doubled-slash tests, the prefix-bypass test, the
+ * `redirect: 'manual'` test). The happy-path test pins these assertions
+ * inline for context; the shape-normalization tests below defer to this
+ * helper so a future refactor that corrupts the outgoing `redirect_uri`
+ * search param, drops `redirect: 'manual'`, or breaks the S256 challenge
+ * shape regresses every test that runs the check — not just the
+ * happy-path.
+ *
+ * Callers pass the request URL string and the request init the mock
+ * captured; the helper walks the same invariants the happy-path test
+ * inlines: response_type, client_id, redirect_uri (which
+ * `runCanary` overrides may customize — the helper accepts it as a
+ * parameter for that reason), scope, S256 challenge shape, non-empty
+ * state, `Bearer <session-token>` auth header, `redirect: 'manual'`.
+ */
+function assertAuthorizeRequestShape(
+  urlString: string,
+  init: RequestInit | undefined,
+  { expectedRedirectUri }: { expectedRedirectUri: string } = {
+    expectedRedirectUri: 'https://canary.wxyc.org/authorize-echo',
+  }
+) {
+  const url = new URL(urlString);
+  expect(url.searchParams.get('response_type')).toBe('code');
+  expect(url.searchParams.get('client_id')).toBe('wxyc-canary');
+  expect(url.searchParams.get('redirect_uri')).toBe(expectedRedirectUri);
+  const scope = url.searchParams.get('scope') ?? '';
+  expect(scope).toMatch(/openid/);
+  expect(scope).toMatch(/profile/);
+  expect(scope).toMatch(/email/);
+  expect(url.searchParams.get('code_challenge_method')).toBe('S256');
+  const codeChallenge = url.searchParams.get('code_challenge') ?? '';
+  expect(codeChallenge).toMatch(/^[A-Za-z0-9_-]{43}$/);
+  const state = url.searchParams.get('state') ?? '';
+  expect(state.length).toBeGreaterThan(0);
+  const headers = (init?.headers ?? {}) as Record<string, string>;
+  const auth = headers.Authorization ?? headers.authorization ?? '';
+  expect(auth).toBe('Bearer fake-session-token');
+  expect(init?.redirect).toBe('manual');
+}
+
 function setUpFetchMock(responses: Record<string, StubEntry>) {
   const fetchMock = vi.fn(async (input: string | URL | Request) => {
     const urlString = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
@@ -2787,7 +2832,7 @@ describe('runCanary — oidc-authorize check (wxyc-canary#60)', () => {
   // pathname) and past `searchParams.get('code')` (fragments aren't parsed as
   // query). The "no code param" branch fires — and its error message MUST
   // NOT leak the fragment code. Pin the redaction at the sentinel so a
-  // future regression that drops the `redactCode` wrap (as landed in R2)
+  // future regression that drops the `redactCodeAndState` wrap (as landed in R2)
   // fails this test rather than silently exfiltrating the code into the
   // alert.
   it('does not leak the code when it sits in a URL fragment on the Location header (R2-F1 regression)', async () => {
@@ -3087,9 +3132,14 @@ describe('runCanary — oidc-authorize check (wxyc-canary#60)', () => {
   it('accepts a Location with a trailing slash when the configured redirect URI has none (R2-F4 trailing-slash normalization)', async () => {
     // Configured redirect URI: no trailing slash. Location: trailing slash.
     // Historically this failed the pathname compare; the fix normalizes.
-    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const urlString = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
       if (urlString.includes('/oauth2/authorize')) {
+        // R3-12: pin the outgoing request shape so a future refactor that
+        // corrupts `redirect_uri`, drops `redirect: 'manual'`, or breaks
+        // the S256 challenge regresses this test rather than passing on
+        // a happy 302 alone.
+        assertAuthorizeRequestShape(urlString, init);
         const url = new URL(urlString);
         const state = url.searchParams.get('state') ?? '';
         return new Response(null, {
@@ -3135,9 +3185,14 @@ describe('runCanary — oidc-authorize check (wxyc-canary#60)', () => {
     // Configured redirect URI: trailing slash. Location: no trailing slash.
     // The check must normalize both sides — otherwise the same page-tick
     // storm results from drift in the opposite direction.
-    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const urlString = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
       if (urlString.includes('/oauth2/authorize')) {
+        // R3-12: pin the outgoing request shape. The `redirect_uri` here
+        // is the trailing-slash form the test configures below.
+        assertAuthorizeRequestShape(urlString, init, {
+          expectedRedirectUri: 'https://canary.wxyc.org/authorize-echo/',
+        });
         const url = new URL(urlString);
         const state = url.searchParams.get('state') ?? '';
         return new Response(null, {
@@ -3196,9 +3251,11 @@ describe('runCanary — oidc-authorize check (wxyc-canary#60)', () => {
   // its single-slash strip. The fix strips ALL trailing slashes; this
   // test pins that behavior.
   it('accepts a Location with a doubled trailing slash when the configured redirect URI has none (R3-3 regression)', async () => {
-    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const urlString = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
       if (urlString.includes('/oauth2/authorize')) {
+        // R3-12: pin the outgoing request shape.
+        assertAuthorizeRequestShape(urlString, init);
         const url = new URL(urlString);
         const state = url.searchParams.get('state') ?? '';
         return new Response(null, {
@@ -3246,9 +3303,14 @@ describe('runCanary — oidc-authorize check (wxyc-canary#60)', () => {
   // (they're the same resource by RFC 3986), but `/foo` must NOT collapse
   // to empty and start matching `/bar` accidentally. Pin the root case.
   it('accepts a doubled-slash root Location when the configured redirect URI is a bare host (R3-3 regression, root)', async () => {
-    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const urlString = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
       if (urlString.includes('/oauth2/authorize')) {
+        // R3-12: pin the outgoing request shape. The redirect URI here
+        // is the bare-host form the test configures below.
+        assertAuthorizeRequestShape(urlString, init, {
+          expectedRedirectUri: 'https://canary.wxyc.org/',
+        });
         const url = new URL(urlString);
         const state = url.searchParams.get('state') ?? '';
         return new Response(null, {
