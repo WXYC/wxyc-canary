@@ -841,7 +841,16 @@ const oidcAuthorize: Check = {
         `oidcProbeRedirectUri is not a valid URL — configuration error: ${ctx.oidcProbeRedirectUri.slice(0, 200)}`
       );
     }
-    if (parsed.origin !== expected.origin || parsed.pathname !== expected.pathname) {
+    // Normalize a single trailing slash on both sides before compare — RFC
+    // 3986 §6.2.2.3 considers `/authorize-echo` and `/authorize-echo/` the
+    // same resource, and if the trusted-client registration and the CFN
+    // param drift by a single slash every tick pages on-call for a
+    // no-actual-regression cause. Normalize root ("/") to itself, otherwise
+    // strip a single trailing "/" so `.../authorize-echo` and
+    // `.../authorize-echo/` compare equal. The subdomain-injection guard
+    // still holds because origin includes the host.
+    const normalizePath = (p: string): string => (p.length > 1 && p.endsWith('/') ? p.slice(0, -1) : p);
+    if (parsed.origin !== expected.origin || normalizePath(parsed.pathname) !== normalizePath(expected.pathname)) {
       throw new Error(
         `authorize 302 Location does not match the probe redirect URI origin+path (session invalidated, trusted client missing, or redirect regression): ${redactCodeAndState(location).slice(0, 200)}`
       );

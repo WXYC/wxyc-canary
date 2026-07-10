@@ -2937,6 +2937,115 @@ describe('runCanary — oidc-authorize check (wxyc-canary#60)', () => {
     expect(oidc.message).toMatch(/redirect|Location/i);
   });
 
+  // R2-F4: RFC 3986 §6.2.2.3 treats `/authorize-echo` and `/authorize-echo/`
+  // as equivalent. Without normalization, a single-slash drift between the
+  // trusted-client registration (server side) and the CFN
+  // `OidcProbeRedirectUri` param (canary side) would page on-call every
+  // tick despite no actual regression. Pin both directions of drift so a
+  // future revert of the `normalizePath` helper regresses these tests.
+  it('accepts a Location with a trailing slash when the configured redirect URI has none (R2-F4 trailing-slash normalization)', async () => {
+    // Configured redirect URI: no trailing slash. Location: trailing slash.
+    // Historically this failed the pathname compare; the fix normalizes.
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const urlString = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      if (urlString.includes('/oauth2/authorize')) {
+        const url = new URL(urlString);
+        const state = url.searchParams.get('state') ?? '';
+        return new Response(null, {
+          status: 302,
+          headers: {
+            Location: `https://canary.wxyc.org/authorize-echo/?code=abcd1234&state=${encodeURIComponent(state)}`,
+          },
+        });
+      }
+      const stubs: Record<string, { status: number; body: unknown }> = {
+        '/healthcheck': { status: 200, body: { ok: true } },
+        '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+        '/graph/artists/search': { status: 200, body: { results: [{ id: 1, canonical_name: 'stereolab' }] } },
+        'explore.example.test/health': {
+          status: 200,
+          body: { status: 'healthy', artist_count: 136_702, graph_db_age_seconds: 3_600 },
+        },
+        '/sign-in/email': { status: 200, body: { token: 'fake-session-token', user: { id: 'canary-user-id' } } },
+        '/token': { status: 200, body: { token: 'fake-jwt' } },
+        '/library/?artist_name=': { status: 200, body: stereolabSearchResults },
+        '/flowsheet': { status: 200, body: [] },
+        '/library/rotation': { status: 200, body: [] },
+      };
+      for (const [pattern, resp] of Object.entries(stubs)) {
+        if (urlString.includes(pattern)) {
+          return new Response(typeof resp.body === 'string' ? resp.body : JSON.stringify(resp.body), {
+            status: resp.status,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+      }
+      return new Response(`unmatched mock for ${urlString}`, { status: 599 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const outcomes = await runCanary({ ...baseConfig, djEmail: 'canary@wxyc.org', djPassword: 'pw' });
+    const oidc = outcomes.find((o) => o.name === 'oidc-authorize')!;
+
+    expect(oidc.status).toBe('pass');
+  });
+
+  it('accepts a Location without a trailing slash when the configured redirect URI has one (R2-F4 trailing-slash normalization, reverse direction)', async () => {
+    // Configured redirect URI: trailing slash. Location: no trailing slash.
+    // The check must normalize both sides — otherwise the same page-tick
+    // storm results from drift in the opposite direction.
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const urlString = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      if (urlString.includes('/oauth2/authorize')) {
+        const url = new URL(urlString);
+        const state = url.searchParams.get('state') ?? '';
+        return new Response(null, {
+          status: 302,
+          headers: {
+            Location: `https://canary.wxyc.org/authorize-echo?code=abcd1234&state=${encodeURIComponent(state)}`,
+          },
+        });
+      }
+      const stubs: Record<string, { status: number; body: unknown }> = {
+        '/healthcheck': { status: 200, body: { ok: true } },
+        '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+        '/graph/artists/search': { status: 200, body: { results: [{ id: 1, canonical_name: 'stereolab' }] } },
+        'explore.example.test/health': {
+          status: 200,
+          body: { status: 'healthy', artist_count: 136_702, graph_db_age_seconds: 3_600 },
+        },
+        '/sign-in/email': { status: 200, body: { token: 'fake-session-token', user: { id: 'canary-user-id' } } },
+        '/token': { status: 200, body: { token: 'fake-jwt' } },
+        '/library/?artist_name=': { status: 200, body: stereolabSearchResults },
+        '/flowsheet': { status: 200, body: [] },
+        '/library/rotation': { status: 200, body: [] },
+      };
+      for (const [pattern, resp] of Object.entries(stubs)) {
+        if (urlString.includes(pattern)) {
+          return new Response(typeof resp.body === 'string' ? resp.body : JSON.stringify(resp.body), {
+            status: resp.status,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+      }
+      return new Response(`unmatched mock for ${urlString}`, { status: 599 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    // Configure the redirect URI with a trailing slash so we exercise the
+    // "expected has slash, Location doesn't" direction. `runCanary` accepts
+    // an `oidcProbeRedirectUri` override on the config.
+    const outcomes = await runCanary({
+      ...baseConfig,
+      djEmail: 'canary@wxyc.org',
+      djPassword: 'pw',
+      oidcProbeRedirectUri: 'https://canary.wxyc.org/authorize-echo/',
+    });
+    const oidc = outcomes.find((o) => o.name === 'oidc-authorize')!;
+
+    expect(oidc.status).toBe('pass');
+  });
+
   it('sends `redirect: manual` on /oauth2/authorize so the check can read the 302 Location header', async () => {
     // The check MUST NOT follow the 302 — inspecting the Location header is
     // the whole point of the probe (code + state parity live there). Node's
