@@ -24,9 +24,12 @@ function baseCtx(overrides: Partial<CheckContext>): CheckContext {
     semanticIndexUrl: 'https://explore.example.test',
     lmlUrl: 'https://lml.example.test',
     lmlApiKey: undefined,
-    djBearerToken: 'fake-jwt',
-    djSessionToken: 'fake-session-token',
-    djUserId: 'canary-user-id',
+    djAuth: {
+      kind: 'signed-in',
+      jwt: 'fake-jwt',
+      sessionToken: 'fake-session-token',
+      userId: 'canary-user-id',
+    },
     oidcProbes: [
       {
         clientId: 'wxyc-canary',

@@ -1,7 +1,33 @@
 import { canaryFetch, CanaryFetchError, type FetchResult } from './client.js';
 import { runEnrichmentCheck } from './enrichment-check.js';
 import { oidcAuthorize } from './oidc-authorize.js';
-import type { Check, CheckResult, Suite } from './types.js';
+import type { Check, CheckContext, CheckResult, DjAuthState, Suite } from './types.js';
+
+/**
+ * Narrow `CheckContext.djAuth` to the `signed-in` variant. Every
+ * `requiresAuth: true` check calls this at the top of its `run` in place
+ * of the old `if (!ctx.djBearerToken) throw new Error('DJ bearer token
+ * missing')` guard — which was belt-and-suspenders against the
+ * auth-precondition layer in the runner, and now falls out of the
+ * discriminated union for free (wxyc-canary#65).
+ *
+ * If the runner dispatches a `requiresAuth: true` check with a
+ * non-signed-in `djAuth`, that's a runner bug (the guards in `runCanary`
+ * are supposed to convert those to `skipped` or `fail` outcomes BEFORE
+ * calling `run`). This throw preserves the belt-and-suspenders safety
+ * that the original per-check `if (!ctx.djBearerToken)` guards
+ * expressed — but as a type-narrowing helper so the check body reads
+ * `signedIn.jwt` instead of `ctx.djBearerToken!` and TypeScript enforces
+ * the narrowing.
+ */
+function assertDjAuthed(ctx: CheckContext): DjAuthState & { kind: 'signed-in' } {
+  if (ctx.djAuth.kind !== 'signed-in') {
+    // Same string shape the pre-#65 guards emitted so alert-message
+    // regexes in downstream tests continue to match.
+    throw new Error('DJ bearer token missing');
+  }
+  return ctx.djAuth;
+}
 
 /**
  * The canonical artist used for read-side probes. Stereolab has been on
@@ -36,10 +62,10 @@ const proxyLibrarySearch: Check = {
   requiresAuth: true,
   suites: ['smoke'],
   run: async (ctx) => {
-    if (!ctx.djBearerToken) throw new Error('DJ bearer token missing');
+    const auth = assertDjAuthed(ctx);
     const r = await canaryFetch(
       `${ctx.backendUrl}/proxy/library/search?artist=${encodeURIComponent(PROBE_ARTIST)}&limit=5`,
-      { headers: { Authorization: `Bearer ${ctx.djBearerToken}` } }
+      { headers: { Authorization: `Bearer ${auth.jwt}` } }
     );
     if (!r.ok) throw new Error(`expected 2xx, got ${r.status}: ${r.rawText.slice(0, 200)}`);
     const body = r.body as { results?: unknown };
@@ -209,9 +235,9 @@ const djLibrarySearch: Check = {
   requiresAuth: true,
   suites: ['smoke'],
   run: async (ctx) => {
-    if (!ctx.djBearerToken) throw new Error('DJ bearer token missing');
+    const auth = assertDjAuthed(ctx);
     const r = await canaryFetch(`${ctx.backendUrl}/library/?artist_name=${encodeURIComponent(PROBE_ARTIST)}&n=5`, {
-      headers: { Authorization: `Bearer ${ctx.djBearerToken}` },
+      headers: { Authorization: `Bearer ${auth.jwt}` },
     });
     if (!r.ok) throw new Error(`expected 2xx, got ${r.status}: ${r.rawText.slice(0, 200)}`);
     if (!Array.isArray(r.body)) {
@@ -235,9 +261,9 @@ const djFlowsheetRead: Check = {
   requiresAuth: true,
   suites: ['smoke'],
   run: async (ctx) => {
-    if (!ctx.djBearerToken) throw new Error('DJ bearer token missing');
+    const auth = assertDjAuthed(ctx);
     const r = await canaryFetch(`${ctx.backendUrl}/flowsheet?n=5`, {
-      headers: { Authorization: `Bearer ${ctx.djBearerToken}` },
+      headers: { Authorization: `Bearer ${auth.jwt}` },
     });
     if (!r.ok) throw new Error(`expected 2xx, got ${r.status}: ${r.rawText.slice(0, 200)}`);
   },
@@ -255,9 +281,9 @@ const djRotation: Check = {
   description: 'GET /library/rotation as DJ',
   requiresAuth: true,
   run: async (ctx) => {
-    if (!ctx.djBearerToken) throw new Error('DJ bearer token missing');
+    const auth = assertDjAuthed(ctx);
     const r = await canaryFetch(`${ctx.backendUrl}/library/rotation`, {
-      headers: { Authorization: `Bearer ${ctx.djBearerToken}` },
+      headers: { Authorization: `Bearer ${auth.jwt}` },
     });
     if (!r.ok) throw new Error(`expected 2xx, got ${r.status}: ${r.rawText.slice(0, 200)}`);
     if (!Array.isArray(r.body)) {
@@ -293,9 +319,9 @@ const djRotationPicker: Check = {
   description: 'GET /library/rotation/{id}/tracks as DJ — catches BS#994 / BS#1030 cascade-to-502 class',
   requiresAuth: true,
   run: async (ctx): Promise<CheckResult | void> => {
-    if (!ctx.djBearerToken) throw new Error('DJ bearer token missing');
+    const auth = assertDjAuthed(ctx);
     const list = await canaryFetch(`${ctx.backendUrl}/library/rotation`, {
-      headers: { Authorization: `Bearer ${ctx.djBearerToken}` },
+      headers: { Authorization: `Bearer ${auth.jwt}` },
     });
     if (!list.ok) {
       throw new Error(`rotation list precondition: expected 2xx, got ${list.status}: ${list.rawText.slice(0, 200)}`);
@@ -311,7 +337,7 @@ const djRotationPicker: Check = {
       return { skipped: true, skipReason: 'rotation list is empty — no probe target available' };
     }
     const tracks = await canaryFetch(`${ctx.backendUrl}/library/rotation/${first.id}/tracks`, {
-      headers: { Authorization: `Bearer ${ctx.djBearerToken}` },
+      headers: { Authorization: `Bearer ${auth.jwt}` },
     });
     if (!tracks.ok) {
       throw new Error(`expected 2xx, got ${tracks.status}: ${tracks.rawText.slice(0, 200)}`);
@@ -735,10 +761,14 @@ export function checksForSuite(suite: Suite): readonly Check[] {
  * `Retry-After` (seconds form) when present, capped to 5s so the Lambda
  * still finishes inside its budget.
  */
-// `userId` is best-effort: a missing user.id only fails the write canary
-// (which throws its own preflight error when `ctx.djUserId` is undefined).
-// Read-only DJ-auth checks tolerate the absence so a better-auth response-
-// shape rev doesn't cascade into four false-positive failures.
+// `signInDj` returns the successful-shape only: `{ jwt, sessionToken,
+// userId }`. Failures throw, and the runner in `handler.ts` wraps that
+// into `{ kind: 'precondition-failed', error }` on `CheckContext.djAuth`
+// per wxyc-canary#65. `userId` is best-effort: a missing user.id only
+// fails the write canary (which throws its own preflight error when the
+// `signed-in` variant lacks `userId`). Read-only DJ-auth checks tolerate
+// the absence so a better-auth response-shape rev doesn't cascade into
+// four false-positive failures.
 //
 // `sessionToken` is the raw better-auth session token returned from
 // `/sign-in/email` (pre-JWT-exchange). The OIDC authorize probe uses it as
@@ -747,9 +777,7 @@ export function checksForSuite(suite: Suite): readonly Check[] {
 // authorize endpoint reads via `getSessionFromCtx`. Distinct from `jwt`:
 // the JWT is what Backend-Service routes accept via `requirePermissions`,
 // but `/oauth2/authorize` needs the SESSION, not the JWT (a JWT from
-// `/token` fails on authorize — different token audience). Undefined only
-// when sign-in itself failed; in that case DJ-auth checks are already
-// downgraded to `fail` at the auth-precondition layer.
+// `/token` fails on authorize — different token audience).
 export type DjSignInResult = { jwt: string; userId: string | undefined; sessionToken: string };
 
 export async function signInDj(

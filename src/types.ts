@@ -93,6 +93,42 @@ export type OidcProbe = {
   label: string;
 };
 
+/**
+ * DJ authentication state, discriminated by `kind` (wxyc-canary#65). The
+ * runner resolves this once per tick and threads it through `CheckContext`;
+ * the shape encodes the three states the auth-precondition layer used to
+ * express with a scatter of `djBearerToken: string | undefined` +
+ * `djAuthError: string | undefined` fields:
+ *
+ *   - `signed-in` — sign-in succeeded; `jwt` is the BS bearer, `sessionToken`
+ *     is the raw better-auth session token (for the OIDC authorize probe),
+ *     and `userId` is best-effort (undefined if the sign-in response
+ *     omitted it — write-canary throws its own preflight then; read-only
+ *     DJ-auth checks tolerate absence).
+ *   - `no-creds` — no DJ credentials configured. `requiresAuth: true`
+ *     checks downgrade to `skipped` in the runner, before dispatch.
+ *   - `precondition-failed` — sign-in errored (401, 429-after-retry, token
+ *     exchange failure, credential-resolution regression). `requiresAuth:
+ *     true` checks downgrade to `fail` in the runner with the `error`
+ *     message. `error` is human-readable and safe to include in alerts.
+ *
+ * The union lets the runner narrow to `kind === 'signed-in'` before
+ * dispatching a `requiresAuth: true` check, deleting every per-check
+ * `if (!ctx.djBearerToken) throw ...` guard without losing safety. `sessionToken`
+ * being non-optional on the `signed-in` branch is the shape gap
+ * wxyc-canary#61 F8 flagged — it now falls out of the discriminated union
+ * for free.
+ */
+export type DjAuthState =
+  | {
+      kind: 'signed-in';
+      jwt: string;
+      sessionToken: string;
+      userId: string | undefined;
+    }
+  | { kind: 'no-creds' }
+  | { kind: 'precondition-failed'; error: string };
+
 export type CheckContext = {
   backendUrl: string;
   authUrl: string;
@@ -113,24 +149,17 @@ export type CheckContext = {
    * same pattern as the DJ credentials).
    */
   lmlApiKey: string | undefined;
-  /** Bearer token if the canary has logged in as a DJ; undefined for anonymous-only runs. */
-  djBearerToken: string | undefined;
   /**
-   * Raw better-auth session token returned by `/sign-in/email` — the
-   * OIDC authorize probe (wxyc-canary#60) sends it as
-   * `Authorization: Bearer ...` on `/oauth2/authorize`. The better-auth
-   * `bearer` plugin translates it into the session cookie the authorize
-   * endpoint reads. Distinct from `djBearerToken`: that one is the JWT
-   * from `/token`, which is what BS routes accept but `/oauth2/authorize`
-   * rejects (different audience). Undefined when sign-in failed.
+   * DJ authentication state (wxyc-canary#65). Discriminated union — see
+   * `DjAuthState` above. Every `requiresAuth: true` check narrows to
+   * `kind === 'signed-in'` via the `djAuthed` guard in `oidc-authorize.ts`
+   * (or its `assertDjAuthed` sibling) before touching `jwt` /
+   * `sessionToken` / `userId`. The runner ALSO narrows before dispatch,
+   * so the per-check narrowing is belt-and-suspenders — same discipline
+   * the old `if (!ctx.djBearerToken) throw` guards represented, now
+   * type-enforced.
    */
-  djSessionToken: string | undefined;
-  /**
-   * Auth user id of the canary DJ. Write-canary checks send this as the
-   * `dj_id` in `/flowsheet/join` and `/flowsheet/end` request bodies.
-   * Undefined when sign-in failed or no credentials were configured.
-   */
-  djUserId: string | undefined;
+  djAuth: DjAuthState;
   /**
    * OIDC probes to exercise on `/oauth2/authorize`. Array-shape so a
    * second consumer (WikiJS, additional in-house tools) can register a

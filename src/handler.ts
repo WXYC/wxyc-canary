@@ -3,7 +3,7 @@ import { GetSecretValueCommand, SecretsManagerClient } from '@aws-sdk/client-sec
 import { GetParameterCommand, SSMClient } from '@aws-sdk/client-ssm';
 import { checks, signInDj } from './checks.js';
 import { reportOutcomesToGitHub } from './github-issues.js';
-import type { CanaryConfig, Check, CheckContext, CheckOutcome, CheckResult } from './types.js';
+import type { CanaryConfig, Check, CheckContext, CheckOutcome, CheckResult, DjAuthState } from './types.js';
 
 const METRIC_NAMESPACE = 'WXYC/Canary';
 const DEFAULT_ENRICHMENT_POLL_TIMEOUT_MS = 45_000;
@@ -222,10 +222,25 @@ export async function runCanary(
     ghaRunnerToken = config.ghaRunnerToken;
   }
 
-  let djBearerToken: string | undefined;
-  let djSessionToken: string | undefined;
-  let djUserId: string | undefined;
-  if (djCreds) {
+  // Resolve DJ auth state (wxyc-canary#65). The `DjAuthState`
+  // discriminated union expresses the three states the pre-#65 scatter of
+  // `djBearerToken: string | undefined` + `djAuthError: string | undefined`
+  // implicitly encoded:
+  //   - `signed-in` — sign-in + token-exchange both succeeded.
+  //   - `no-creds` — no DJ credentials configured (or resolution returned
+  //     undefined). `requiresAuth: true` checks downgrade to `skipped`.
+  //   - `precondition-failed` — sign-in errored (401 / 429-after-retry /
+  //     token exchange / credential resolution). `requiresAuth: true`
+  //     checks downgrade to `fail`. `runCanary`'s existing dispatch guards
+  //     still route the outcomes; the union just gives the type system a
+  //     way to prove the check body sees `signed-in` before touching
+  //     `jwt` / `sessionToken` / `userId`.
+  let djAuth: DjAuthState;
+  if (djAuthError) {
+    djAuth = { kind: 'precondition-failed', error: djAuthError };
+  } else if (!djCreds) {
+    djAuth = { kind: 'no-creds' };
+  } else {
     try {
       const signIn = await signInDj(
         config.authUrl,
@@ -233,15 +248,17 @@ export async function runCanary(
         djCreds.password,
         config.originUrl ?? 'https://dj.wxyc.org'
       );
-      djBearerToken = signIn.jwt;
-      djSessionToken = signIn.sessionToken;
-      djUserId = signIn.userId;
+      djAuth = { kind: 'signed-in', jwt: signIn.jwt, sessionToken: signIn.sessionToken, userId: signIn.userId };
     } catch (err) {
-      djAuthError = (err as Error).message;
-      // Don't throw — let the DJ-auth checks individually fail with the auth
-      // error so each one shows up in the per-check metric. Catching it
+      djAuth = { kind: 'precondition-failed', error: (err as Error).message };
+      // Don't throw — let the DJ-auth checks individually fail with the
+      // auth error so each one shows up in the per-check metric. Catching
       // here would mask a partial outage where auth is down but anonymous
-      // reads still work.
+      // reads still work. Update djAuthError so downstream dispatch
+      // continues to route "auth precondition failed" (the runner already
+      // reads `djAuthError` — the union is the source of truth going
+      // forward, but that's a follow-up refactor).
+      djAuthError = (err as Error).message;
     }
   }
 
@@ -251,9 +268,7 @@ export async function runCanary(
     semanticIndexUrl: config.semanticIndexUrl,
     lmlUrl: config.lmlUrl ?? 'https://library-metadata-lookup-production.up.railway.app',
     lmlApiKey,
-    djBearerToken,
-    djSessionToken,
-    djUserId,
+    djAuth,
     enrichmentPollTimeoutMs: config.enrichmentPollTimeoutMs ?? DEFAULT_ENRICHMENT_POLL_TIMEOUT_MS,
     enrichmentPollIntervalMs: config.enrichmentPollIntervalMs ?? DEFAULT_ENRICHMENT_POLL_INTERVAL_MS,
     // `||` (not `??`) on the two string defaults so an empty-string env
