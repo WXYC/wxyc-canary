@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { canaryFetch } from './client.js';
-import type { Check } from './types.js';
+import type { Check, OidcProbe } from './types.js';
 
 /**
  * OIDC code + PKCE authorize probe (wxyc-canary#60). Extracted from
@@ -160,7 +160,18 @@ const normalizePath = (p: string): string => p.replace(/\/+$/, '') || '/';
  * lives in the canary env — the probe stops at the 302, never exchanges
  * the code, and a leaked canary env carries no OIDC credential.
  *
- * Contract (each tick):
+ * Multi-probe shape (wxyc-canary#63): `ctx.oidcProbes` is a non-empty
+ * readonly tuple of `(clientId, redirectUri, label)` triples. Today the
+ * env loader always produces exactly one probe (the `wxyc-canary` trusted
+ * client), so the loop runs once and behaves identically to the single-
+ * client shape it replaced. When a second consumer registers (WikiJS,
+ * in-house tools), the env loader can widen the tuple and any per-client
+ * regression surfaces with the failing probe's `label` in the error
+ * message. The check does not short-circuit on the first failing probe —
+ * every probe runs so a single tick catches multi-client damage in one
+ * alarm rather than N.
+ *
+ * Contract (each tick, per probe):
  *   1. Reuse the session token from `signInDj` (already in `ctx.djSessionToken`).
  *   2. GET `/auth/oauth2/authorize?response_type=code&client_id=<probe>
  *      &redirect_uri=<probe-callback>&scope=openid+profile+email
@@ -212,132 +223,163 @@ export const oidcAuthorize: Check = {
       // confusing "cannot read properties of undefined."
       throw new Error('DJ session token missing (signInDj did not return sessionToken)');
     }
-    const { challenge } = generatePkcePair();
-    // 16 random bytes → 22-char urlsafe base64. Long enough that a
-    // collision within a single tick is astronomical; short enough not to
-    // stuff the query string.
-    const state = randomBytes(16).toString('base64url');
-    const url = new URL(`${ctx.authUrl}/oauth2/authorize`);
-    url.searchParams.set('response_type', 'code');
-    url.searchParams.set('client_id', ctx.oidcProbeClientId);
-    url.searchParams.set('redirect_uri', ctx.oidcProbeRedirectUri);
-    url.searchParams.set('scope', 'openid profile email');
-    url.searchParams.set('state', state);
-    url.searchParams.set('code_challenge', challenge);
-    url.searchParams.set('code_challenge_method', 'S256');
-
-    const r = await canaryFetch(url.toString(), {
-      headers: { Authorization: `Bearer ${ctx.djSessionToken}` },
-      redirect: 'manual',
-    });
-
-    // A 5xx here is the BS#1571 replay surface: `oauthConsent` schema
-    // missing from the Drizzle adapter map → 500. Distinct routing from
-    // the 302-but-wrong-Location cases below (that's a login-page bounce,
-    // not a substrate-missing error). Include the response body truncation
-    // per healthcheck's convention.
-    //
-    // Redact `code` and `state` before slicing — a 5xx body from a
-    // partially-executed authorize handler could contain the code the
-    // handler minted just before the 5xx (better-auth today doesn't, but
-    // a future rev might, and the docstring promises "never logs the
-    // code" without qualification). The redactor covers both URL form
-    // (`code=…`) and JSON form (`"code":"…"`) because better-auth 5xx
-    // bodies are JSON envelopes. The redaction is body-first + slice so
-    // the token can't survive at a truncation boundary.
-    if (r.status >= 500) {
-      throw new Error(
-        `authorize expected 302, got ${r.status} (BS#1571 replay class if body mentions oauthConsent): ${redactCodeAndState(r.rawText).slice(0, 200)}`
-      );
+    // Multi-probe loop (wxyc-canary#63). `ctx.oidcProbes` is a non-empty
+    // tuple; run every probe and collect its failure. Multi-client damage
+    // (one client's trusted-client registration missing while others
+    // survive) surfaces with the failing probe's `label` prefixed on the
+    // message so on-call routes to the right owner rather than "OIDC is
+    // broken." The check does NOT short-circuit on the first failing
+    // probe — one tick catches multi-client damage in one alarm.
+    const failures: string[] = [];
+    for (const probe of ctx.oidcProbes) {
+      try {
+        await runOneProbe(ctx.authUrl, probe, ctx.djSessionToken);
+      } catch (err) {
+        failures.push(`[${probe.label}] ${(err as Error).message}`);
+      }
     }
-    // OAuth 2.0 (RFC 6749 §4.1.2) allows either 302 Found or 303 See Other
-    // on the authorization response. better-auth returns 302 today, but the
-    // spec doesn't pin it — a future rev switching to 303 would be a
-    // legitimate change we must not flap on.
-    if (r.status !== 302 && r.status !== 303) {
-      throw new Error(`authorize expected 302, got ${r.status}: ${redactCodeAndState(r.rawText).slice(0, 200)}`);
-    }
-
-    const location = r.location;
-    if (!location) {
-      // 3xx without a Location header is malformed. `FetchResult.location`
-      // is the typed accessor over `headers.location` (canaryFetch
-      // lowercases on the way out), so this covers `Location:` too.
-      // Reading through the accessor instead of `headers?.location` means
-      // a call-site can't type `headers?.Location` (title-case) and
-      // silently read `undefined` — see wxyc-canary#64.
-      throw new Error(`authorize returned ${r.status} with no Location header`);
-    }
-
-    let parsed: URL;
-    try {
-      // RFC 7231 §7.1.2 permits a relative `Location`; the client MUST
-      // resolve it against the request URL. Passing `url` (the
-      // authorize-endpoint request URL) as the base makes both
-      // `/authorize-echo?code=…` (relative) and
-      // `https://canary.wxyc.org/authorize-echo?code=…` (absolute) parse
-      // through this single call — an absolute URL ignores the base, a
-      // relative one resolves. The origin+pathname compare downstream
-      // still enforces the exact match against `ctx.oidcProbeRedirectUri`,
-      // so RFC compliance does not weaken the anti-prefix-bypass guard.
-      // See wxyc-canary#66.
-      parsed = new URL(location, url);
-    } catch {
-      throw new Error(`authorize 302 Location is not a valid URL: ${redactCodeAndState(location).slice(0, 200)}`);
-    }
-    // Login-page bounce or crafted-redirect regression: strict origin +
-    // pathname comparison rejects both a login-page URL AND the class of
-    // prefix-bypass Locations like
-    //   https://canary.wxyc.org/authorize-echo-attacker.example.com/?code=X
-    // that a naive `location.startsWith(ctx.oidcProbeRedirectUri)` would
-    // accept. Parse both sides — origin + pathname compare — so the guard
-    // holds regardless of how the Location is stringified (trailing slash,
-    // extra path segment, subdomain injection). Distinct message so the
-    // on-call routes to session/auth investigation.
-    let expected: URL;
-    try {
-      expected = new URL(ctx.oidcProbeRedirectUri);
-    } catch {
-      // Should never fire — config-time validation of the redirect URI
-      // is out of scope for the runtime check. Fail loudly if it happens.
-      throw new Error(
-        `oidcProbeRedirectUri is not a valid URL — configuration error: ${ctx.oidcProbeRedirectUri.slice(0, 200)}`
-      );
-    }
-    // Normalize trailing slashes on both sides before compare — see
-    // `normalizePath` for the RFC citation + why we strip ALL of them
-    // instead of one. Origin still contains the host, so the
-    // subdomain-injection guard is untouched.
-    if (parsed.origin !== expected.origin || normalizePath(parsed.pathname) !== normalizePath(expected.pathname)) {
-      throw new Error(
-        `authorize 302 Location does not match the probe redirect URI origin+path (session invalidated, trusted client missing, or redirect regression): ${redactCodeAndState(location).slice(0, 200)}`
-      );
-    }
-    const returnedCode = parsed.searchParams.get('code');
-    if (!returnedCode) {
-      // Wrap in `redactCodeAndState` to match sibling error branches. A
-      // fragment-form Location like
-      //   https://canary.wxyc.org/authorize-echo#code=REAL-CODE&state=X
-      // slips past the origin+pathname compare (fragments live in the URL
-      // hash, not the pathname) and `searchParams.get('code')` returns null
-      // (fragments aren't parsed as query). Without redaction, the raw
-      // fragment lands in the alert — direct violation of the docstring
-      // "never logs the code" promise.
-      throw new Error(
-        `authorize 302 Location has no code query param (better-auth issued a bare redirect instead of a code): ${redactCodeAndState(location).slice(0, 200)}`
-      );
-    }
-    const returnedState = parsed.searchParams.get('state');
-    if (returnedState !== state) {
-      // CSRF barrier: the server MUST echo the state we sent. If it echoes
-      // something else — attacker fix, cross-tab pollution, better-auth
-      // regression — pages. We can't log the returned state either (it
-      // could carry canary-private info in a future rev); log only that
-      // it mismatched.
-      throw new Error('authorize 302 Location state does not match the state the check sent');
+    if (failures.length > 0) {
+      // Join with ` | ` so a multi-client failure fans into a single alert
+      // message; the `[label]` prefixes on each failure preserve routing.
+      throw new Error(failures.join(' | '));
     }
     // Success: don't publish `EnrichmentLagSeconds`-style metrics — this
     // check's cost signal is `CheckLatency` (already emitted per-check by
     // the runner), and there's no domain-meaningful duration to surface.
   },
 };
+
+/**
+ * Execute one authorize probe against `authUrl` for the given
+ * `(clientId, redirectUri, label)` triple. Throws on any failure — the
+ * caller (the `run` loop above) prefixes the message with `[label]` and
+ * aggregates across probes. Extracted from `run` so the multi-probe loop
+ * reads at altitude and the per-probe fail cascade stays testable
+ * against a single probe in isolation.
+ */
+async function runOneProbe(authUrl: string, probe: OidcProbe, sessionToken: string): Promise<void> {
+  const { challenge } = generatePkcePair();
+  // 16 random bytes → 22-char urlsafe base64. Long enough that a
+  // collision within a single tick is astronomical; short enough not to
+  // stuff the query string.
+  const state = randomBytes(16).toString('base64url');
+  const url = new URL(`${authUrl}/oauth2/authorize`);
+  url.searchParams.set('response_type', 'code');
+  url.searchParams.set('client_id', probe.clientId);
+  url.searchParams.set('redirect_uri', probe.redirectUri);
+  url.searchParams.set('scope', 'openid profile email');
+  url.searchParams.set('state', state);
+  url.searchParams.set('code_challenge', challenge);
+  url.searchParams.set('code_challenge_method', 'S256');
+
+  const r = await canaryFetch(url.toString(), {
+    headers: { Authorization: `Bearer ${sessionToken}` },
+    redirect: 'manual',
+  });
+
+  // A 5xx here is the BS#1571 replay surface: `oauthConsent` schema
+  // missing from the Drizzle adapter map → 500. Distinct routing from
+  // the 302-but-wrong-Location cases below (that's a login-page bounce,
+  // not a substrate-missing error). Include the response body truncation
+  // per healthcheck's convention.
+  //
+  // Redact `code` and `state` before slicing — a 5xx body from a
+  // partially-executed authorize handler could contain the code the
+  // handler minted just before the 5xx (better-auth today doesn't, but
+  // a future rev might, and the docstring promises "never logs the
+  // code" without qualification). The redactor covers both URL form
+  // (`code=…`) and JSON form (`"code":"…"`) because better-auth 5xx
+  // bodies are JSON envelopes. The redaction is body-first + slice so
+  // the token can't survive at a truncation boundary.
+  if (r.status >= 500) {
+    throw new Error(
+      `authorize expected 302, got ${r.status} (BS#1571 replay class if body mentions oauthConsent): ${redactCodeAndState(r.rawText).slice(0, 200)}`
+    );
+  }
+  // OAuth 2.0 (RFC 6749 §4.1.2) allows either 302 Found or 303 See Other
+  // on the authorization response. better-auth returns 302 today, but the
+  // spec doesn't pin it — a future rev switching to 303 would be a
+  // legitimate change we must not flap on.
+  if (r.status !== 302 && r.status !== 303) {
+    throw new Error(`authorize expected 302, got ${r.status}: ${redactCodeAndState(r.rawText).slice(0, 200)}`);
+  }
+
+  const location = r.location;
+  if (!location) {
+    // 3xx without a Location header is malformed. `FetchResult.location`
+    // is the typed accessor over `headers.location` (canaryFetch
+    // lowercases on the way out), so this covers `Location:` too.
+    // Reading through the accessor instead of `headers?.location` means
+    // a call-site can't type `headers?.Location` (title-case) and
+    // silently read `undefined` — see wxyc-canary#64.
+    throw new Error(`authorize returned ${r.status} with no Location header`);
+  }
+
+  let parsed: URL;
+  try {
+    // RFC 7231 §7.1.2 permits a relative `Location`; the client MUST
+    // resolve it against the request URL. Passing `url` (the
+    // authorize-endpoint request URL) as the base makes both
+    // `/authorize-echo?code=…` (relative) and
+    // `https://canary.wxyc.org/authorize-echo?code=…` (absolute) parse
+    // through this single call — an absolute URL ignores the base, a
+    // relative one resolves. The origin+pathname compare downstream
+    // still enforces the exact match against `probe.redirectUri`, so
+    // RFC compliance does not weaken the anti-prefix-bypass guard.
+    // See wxyc-canary#66.
+    parsed = new URL(location, url);
+  } catch {
+    throw new Error(`authorize 302 Location is not a valid URL: ${redactCodeAndState(location).slice(0, 200)}`);
+  }
+  // Login-page bounce or crafted-redirect regression: strict origin +
+  // pathname comparison rejects both a login-page URL AND the class of
+  // prefix-bypass Locations like
+  //   https://canary.wxyc.org/authorize-echo-attacker.example.com/?code=X
+  // that a naive `location.startsWith(probe.redirectUri)` would
+  // accept. Parse both sides — origin + pathname compare — so the guard
+  // holds regardless of how the Location is stringified (trailing slash,
+  // extra path segment, subdomain injection). Distinct message so the
+  // on-call routes to session/auth investigation.
+  let expected: URL;
+  try {
+    expected = new URL(probe.redirectUri);
+  } catch {
+    // Should never fire — config-time validation of the redirect URI
+    // is out of scope for the runtime check. Fail loudly if it happens.
+    throw new Error(
+      `oidcProbeRedirectUri is not a valid URL — configuration error: ${probe.redirectUri.slice(0, 200)}`
+    );
+  }
+  // Normalize trailing slashes on both sides before compare — see
+  // `normalizePath` for the RFC citation + why we strip ALL of them
+  // instead of one. Origin still contains the host, so the
+  // subdomain-injection guard is untouched.
+  if (parsed.origin !== expected.origin || normalizePath(parsed.pathname) !== normalizePath(expected.pathname)) {
+    throw new Error(
+      `authorize 302 Location does not match the probe redirect URI origin+path (session invalidated, trusted client missing, or redirect regression): ${redactCodeAndState(location).slice(0, 200)}`
+    );
+  }
+  const returnedCode = parsed.searchParams.get('code');
+  if (!returnedCode) {
+    // Wrap in `redactCodeAndState` to match sibling error branches. A
+    // fragment-form Location like
+    //   https://canary.wxyc.org/authorize-echo#code=REAL-CODE&state=X
+    // slips past the origin+pathname compare (fragments live in the URL
+    // hash, not the pathname) and `searchParams.get('code')` returns null
+    // (fragments aren't parsed as query). Without redaction, the raw
+    // fragment lands in the alert — direct violation of the docstring
+    // "never logs the code" promise.
+    throw new Error(
+      `authorize 302 Location has no code query param (better-auth issued a bare redirect instead of a code): ${redactCodeAndState(location).slice(0, 200)}`
+    );
+  }
+  const returnedState = parsed.searchParams.get('state');
+  if (returnedState !== state) {
+    // CSRF barrier: the server MUST echo the state we sent. If it echoes
+    // something else — attacker fix, cross-tab pollution, better-auth
+    // regression — pages. We can't log the returned state either (it
+    // could carry canary-private info in a future rev); log only that
+    // it mismatched.
+    throw new Error('authorize 302 Location state does not match the state the check sent');
+  }
+}

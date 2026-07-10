@@ -267,13 +267,27 @@ export async function runCanary(
     ghaRunnerOrg: config.ghaRunnerOrg || 'WXYC',
     ghaRunnerId: config.ghaRunnerId,
     ghaRunnerToken,
-    // `||` (not `??`) so an empty-string env value picks up the default —
-    // an operator who accidentally sets `CANARY_OIDC_PROBE_CLIENT_ID=` in
-    // `.env` should still get the WXYC-registered probe client, not an
-    // empty `client_id` query param that better-auth rejects with
-    // `invalid_client`. Same rule the runner-liveness fields use above.
-    oidcProbeClientId: config.oidcProbeClientId || 'wxyc-canary',
-    oidcProbeRedirectUri: config.oidcProbeRedirectUri || 'https://canary.wxyc.invalid/authorize-echo',
+    // Fold the single-probe env vars into the `oidcProbes` array shape
+    // (wxyc-canary#63). Today this always produces exactly one probe (the
+    // `wxyc-canary` PUBLIC trusted client from WXYC/Backend-Service#1576);
+    // widening to N probes when a second consumer registers is a
+    // pure-config change — the check itself already iterates. `||` (not
+    // `??`) so an empty-string env value picks up the default (same rule
+    // the runner-liveness fields use above): an operator who accidentally
+    // sets `CANARY_OIDC_PROBE_CLIENT_ID=` in `.env` should still get the
+    // WXYC-registered probe client, not an empty `client_id` query param
+    // that better-auth rejects with `invalid_client`. Redirect URI uses
+    // the RFC 2606 `.invalid` TLD so a routing accident can never
+    // exfiltrate authorization codes to a real host (BS#1584). The tuple
+    // type on `CheckContext.oidcProbes` expresses "non-empty" so the
+    // check never has to defend against an empty array at runtime.
+    oidcProbes: [
+      {
+        clientId: config.oidcProbeClientId || 'wxyc-canary',
+        redirectUri: config.oidcProbeRedirectUri || 'https://canary.wxyc.invalid/authorize-echo',
+        label: 'wxyc-canary',
+      },
+    ],
   };
 
   const outcomes = await Promise.all(
