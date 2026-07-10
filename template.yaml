@@ -124,6 +124,29 @@ Parameters:
     Type: String
     Default: WXYC
     Description: GitHub organization that owns the self-hosted runner.
+  OidcProbeClientId:
+    Type: String
+    Default: wxyc-canary
+    Description: >
+      OIDC trusted-client id the `oidc-authorize` check (wxyc-canary#60)
+      sends as `client_id` on `/oauth2/authorize`. The auth server MUST
+      have a matching public trustedClient registered
+      (WXYC/Backend-Service#1576) — a mismatch fails the probe with
+      `authorize expected 302, got 400: invalid client_id`. Overridable so
+      a future rev of the trusted client's id doesn't require a code
+      change here; empty-string picks up the handler default (same rule
+      as the runner-liveness fields).
+  OidcProbeRedirectUri:
+    Type: String
+    Default: https://canary.wxyc.org/authorize-echo
+    Description: >
+      Redirect URI the `oidc-authorize` probe's trusted client is
+      registered with. The URL never has to resolve — the check reads the
+      3xx `Location` with `redirect: 'manual'` and never follows it.
+      The check asserts the returned Location matches this value on
+      `origin` and `pathname` (strict URL parse; not `startsWith`, which
+      accepts prefix-crafted attacker URLs like
+      `https://canary.wxyc.org/authorize-echo-attacker.example.com`).
   GhaRunnerId:
     Type: Number
     Default: 0
@@ -184,6 +207,14 @@ Resources:
           # sees a falsy value and the check downgrades to skipped (no alarm).
           # When the probe is enabled, CFN stringifies the Number to e.g. "250".
           CANARY_GHA_RUNNER_ID: !If [HasGhaRunnerProbe, !Ref GhaRunnerId, '']
+          # OIDC authorize probe (wxyc-canary#60). Threaded unconditionally so
+          # the check reads its client_id + redirect_uri from a single source
+          # of truth (CFN → env → context) rather than falling through to the
+          # handler's `||` default. The handler default remains as a
+          # belt-and-suspenders backstop for the local `.env` / test path
+          # where CFN doesn't run.
+          CANARY_OIDC_PROBE_CLIENT_ID: !Ref OidcProbeClientId
+          CANARY_OIDC_PROBE_REDIRECT_URI: !Ref OidcProbeRedirectUri
       Policies:
         - Statement:
             - Effect: Allow
