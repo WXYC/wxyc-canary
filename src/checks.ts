@@ -807,8 +807,16 @@ const oidcAuthorize: Check = {
     }
     const returnedCode = parsed.searchParams.get('code');
     if (!returnedCode) {
+      // Wrap in `redactCode` to match sibling error branches (lines 760, 768,
+      // 782, 805). A fragment-form Location like
+      //   https://canary.wxyc.org/authorize-echo#code=REAL-CODE&state=X
+      // slips past the origin+pathname compare (fragments live in the URL
+      // hash, not the pathname) and `searchParams.get('code')` returns null
+      // (fragments aren't parsed as query). Without redaction, the raw
+      // fragment lands in the alert — direct violation of the docstring
+      // "never logs the code" promise.
       throw new Error(
-        `authorize 302 Location has no code query param (better-auth issued a bare redirect instead of a code): ${location.slice(0, 200)}`
+        `authorize 302 Location has no code query param (better-auth issued a bare redirect instead of a code): ${redactCode(location).slice(0, 200)}`
       );
     }
     const returnedState = parsed.searchParams.get('state');

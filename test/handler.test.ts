@@ -2637,6 +2637,34 @@ describe('runCanary — oidc-authorize check (wxyc-canary#60)', () => {
     expect(oidc.message).toMatch(/code/i);
   });
 
+  // Regression coverage for R2-F1: a Location whose `code=` sits in the URL
+  // fragment (`#code=…`) rather than the query string slips past the
+  // origin+pathname compare (fragments live in the URL hash, not the
+  // pathname) and past `searchParams.get('code')` (fragments aren't parsed as
+  // query). The "no code param" branch fires — and its error message MUST
+  // NOT leak the fragment code. Pin the redaction at the sentinel so a
+  // future regression that drops the `redactCode` wrap (as landed in R2)
+  // fails this test rather than silently exfiltrating the code into the
+  // alert.
+  it('does not leak the code when it sits in a URL fragment on the Location header (R2-F1 regression)', async () => {
+    setUpAuthorizeMock({
+      status: 302,
+      body: '',
+      headers: {
+        Location: 'https://canary.wxyc.org/authorize-echo#code=REAL-CODE-FRAG&state=X',
+      },
+    });
+
+    const outcomes = await runCanary({ ...baseConfig, djEmail: 'canary@wxyc.org', djPassword: 'pw' });
+    const oidc = outcomes.find((o) => o.name === 'oidc-authorize')!;
+
+    expect(oidc.status).toBe('fail');
+    // The check still routes to the "no code query param" branch, so the
+    // message mentions `code`. But the sentinel value must never appear.
+    expect(oidc.message).toMatch(/code/i);
+    expect(oidc.message).not.toMatch(/REAL-CODE-FRAG/);
+  });
+
   it('fails when the returned state does not match the state the check sent', async () => {
     // State parity is the CSRF barrier. If the server issues a code but the
     // `state` echo differs, either an attacker fixed the state or the
