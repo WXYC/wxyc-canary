@@ -2885,6 +2885,81 @@ describe('runCanary — oidc-authorize check (wxyc-canary#60)', () => {
     expect(oidc.message).not.toMatch(/SUPER-SECRET-STATE-URL/);
   });
 
+  // R3-1: the JSON-shape redactor's terminator class omitted `&`, so on
+  // URL-shape input the URL pass would redact `code=`/`state=` first
+  // (leaving the placeholder `<redacted>` before the `&`), then the JSON
+  // pass matched `code=` again and greedily ate everything to end-of-string
+  // (`&` was not a terminator). Result: every diagnostic downstream of
+  // `code=` — `scope=openid`, `client_id=probe`, the OIDC `error=`
+  // routing signal on fragment-form callbacks — was destroyed. Pin the
+  // downstream diagnostics as preserved.
+  it('preserves downstream URL query params after redacting code=/state= (R3-1 regression)', async () => {
+    // A crafted Location where the redirect origin+path matches (so the
+    // guard doesn't fire early), the state matches (so state-mismatch
+    // doesn't fire), but the `code=` sits alongside downstream params
+    // like `scope` and `client_id`. This exercises no failure path
+    // directly — the R3-1 bug is in the redactor invoked by every
+    // failure path — so we route through the 500 branch which slices
+    // the JSON body and applies the redactor.
+    setUpAuthorizeMock({
+      status: 500,
+      body: 'redirect chain: code=REAL-CODE-VAL&state=REAL-STATE-VAL&scope=openid&client_id=probe&error=access_denied',
+    });
+
+    const outcomes = await runCanary({ ...baseConfig, djEmail: 'canary@wxyc.org', djPassword: 'pw' });
+    const oidc = outcomes.find((o) => o.name === 'oidc-authorize')!;
+
+    expect(oidc.status).toBe('fail');
+    // Sensitive values still redacted.
+    expect(oidc.message).not.toMatch(/REAL-CODE-VAL/);
+    expect(oidc.message).not.toMatch(/REAL-STATE-VAL/);
+    // Downstream diagnostics MUST survive — under R3-1's buggy JSON pass
+    // the greedy match ate everything after `code=<redacted>` in the URL.
+    expect(oidc.message).toMatch(/scope=openid/);
+    expect(oidc.message).toMatch(/client_id=probe/);
+    // The OIDC `error=access_denied` routing signal (fragment-form OIDC
+    // failure callbacks carry it) must land in the alert so on-call
+    // routes on the failure code.
+    expect(oidc.message).toMatch(/error=access_denied/);
+  });
+
+  // R3-2: the redactor's `code`/`state` regexes had no word boundary, so
+  // any identifier that happened to contain `code` or `state` as a
+  // substring — `errorCode`, `statusCode`, `session_state`, and most
+  // damagingly `oauthConsent` — had its VALUE redacted (or, in
+  // `oauthConsent`'s case, was fine only because the redactor didn't
+  // match `oauthConsent` as `code`; the risk is any future
+  // `oauthCode`-style breadcrumb). The BS#1571 5xx branch's docstring
+  // explicitly promises to preserve the `oauthConsent` model name so
+  // on-call can route. Pin all three shapes.
+  it('does not redact identifier-adjacent code/state substrings (R3-2 regression)', async () => {
+    setUpAuthorizeMock({
+      status: 500,
+      body: {
+        errorCode: 'OAUTH_500',
+        statusCode: 500,
+        session_state: 'SHOULD-STAY-VISIBLE',
+        oauthConsent: 'missing',
+        message: 'BetterAuthError: model oauthConsent not in schema',
+      },
+    });
+
+    const outcomes = await runCanary({ ...baseConfig, djEmail: 'canary@wxyc.org', djPassword: 'pw' });
+    const oidc = outcomes.find((o) => o.name === 'oidc-authorize')!;
+
+    expect(oidc.status).toBe('fail');
+    // All three identifier keys and values must survive the redactor.
+    expect(oidc.message).toMatch(/errorCode/);
+    expect(oidc.message).toMatch(/OAUTH_500/);
+    expect(oidc.message).toMatch(/statusCode/);
+    expect(oidc.message).toMatch(/500/);
+    // The BS#1571 routing breadcrumb. If a future refactor of the
+    // redactor's `code` regex re-widens to substring-match, this
+    // fails — and the on-call runbook explicitly greps for
+    // `oauthConsent` to route the alert.
+    expect(oidc.message).toMatch(/oauthConsent/);
+  });
+
   it('fails on a crafted Location that starts-with the redirect URI but is a different origin+path (prefix bypass regression)', async () => {
     // An attacker (or a betterauth regression) that echoes a Location whose
     // string starts with the probe redirect URI but does NOT actually match
