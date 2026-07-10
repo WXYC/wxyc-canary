@@ -273,7 +273,7 @@ export async function runCanary(
     // empty `client_id` query param that better-auth rejects with
     // `invalid_client`. Same rule the runner-liveness fields use above.
     oidcProbeClientId: config.oidcProbeClientId || 'wxyc-canary',
-    oidcProbeRedirectUri: config.oidcProbeRedirectUri || 'https://canary.wxyc.org/authorize-echo',
+    oidcProbeRedirectUri: config.oidcProbeRedirectUri || 'https://canary.wxyc.invalid/authorize-echo',
   };
 
   const outcomes = await Promise.all(
