@@ -669,6 +669,46 @@ function generatePkcePair(): { challenge: string } {
 }
 
 /**
+ * Redact the two OIDC secret-adjacent tokens (`code` and `state`) from a
+ * string that's about to land in an operator-visible alert.
+ *
+ * Two shapes are covered because the same value can appear in either a URL
+ * query string OR a JSON envelope (better-auth 5xx bodies are JSON):
+ *
+ *   URL form:  `code=abcd1234`, `state=xyz`
+ *              (also matches URL fragments — `#code=abcd1234` — because the
+ *              `=` separator is identical to a query-string parameter)
+ *   JSON form: `"code":"abcd1234"`, `code: "abcd1234"`, `"state":"xyz"`
+ *
+ * The regexes are ordered URL-first so a URL-shape match wins and doesn't
+ * get double-replaced. `code` MUST be redacted because it's a short-lived
+ * but real single-use credential; `state` MUST be redacted because the
+ * mismatch branch (line 823 below) prints "state does not match" only —
+ * never the returned value — and the sibling error branches must not
+ * silently leak it via the raw-body slice. See the docstring on
+ * `oidcAuthorize` for the "never logs the code" invariant this enforces.
+ *
+ * Hoisted to module scope so every branch that formats an error message
+ * uses the same redaction — a per-call arrow function inside `run` would
+ * be re-created every tick and drift silently if a future error branch
+ * called its own inline redactor.
+ */
+const redactCodeAndState = (s: string): string =>
+  s
+    // URL-shape: `code=<value>` / `state=<value>` — the value runs until an
+    // ampersand, whitespace, quote, or apostrophe. Also catches fragment
+    // form (`#code=…`) since `=` is the separator we key on.
+    .replace(/code=[^&\s"']+/g, 'code=<redacted>')
+    .replace(/state=[^&\s"']+/g, 'state=<redacted>')
+    // JSON-shape: `"code":"<value>"` / `code: "<value>"` / bare `code:<value>`.
+    // Terminators for the value are whitespace, quote, apostrophe, comma,
+    // closing brace, or closing bracket — the boundary characters that end
+    // a JSON string or object entry. Case-insensitive because JSON keys are
+    // conventionally lowercase but nothing forbids `Code` or `State`.
+    .replace(/(["']?code["']?\s*[:=]\s*["']?)[^\s"',}\]]+/gi, '$1<redacted>')
+    .replace(/(["']?state["']?\s*[:=]\s*["']?)[^\s"',}\]]+/gi, '$1<redacted>');
+
+/**
  * OIDC code + PKCE authorize probe. The load-bearing check that would have
  * caught WXYC/Backend-Service#1571 — the `oauthConsent` schema-drift 500 —
  * before the flowsheet-digitization verifier tripped over it in production.
@@ -748,16 +788,17 @@ const oidcAuthorize: Check = {
     // not a substrate-missing error). Include the response body truncation
     // per healthcheck's convention.
     //
-    // Redact `code=<value>` before slicing — a 5xx body from a
+    // Redact `code` and `state` before slicing — a 5xx body from a
     // partially-executed authorize handler could contain the code the
     // handler minted just before the 5xx (better-auth today doesn't, but
     // a future rev might, and the docstring promises "never logs the
-    // code" without qualification). The redaction is body-first + slice
-    // so the token can't survive at a truncation boundary.
-    const redactCode = (s: string): string => s.replace(/code=[^&\s"']+/g, 'code=<redacted>');
+    // code" without qualification). The redactor covers both URL form
+    // (`code=…`) and JSON form (`"code":"…"`) because better-auth 5xx
+    // bodies are JSON envelopes. The redaction is body-first + slice so
+    // the token can't survive at a truncation boundary.
     if (r.status >= 500) {
       throw new Error(
-        `authorize expected 302, got ${r.status} (BS#1571 replay class if body mentions oauthConsent): ${redactCode(r.rawText).slice(0, 200)}`
+        `authorize expected 302, got ${r.status} (BS#1571 replay class if body mentions oauthConsent): ${redactCodeAndState(r.rawText).slice(0, 200)}`
       );
     }
     // OAuth 2.0 (RFC 6749 §4.1.2) allows either 302 Found or 303 See Other
@@ -765,7 +806,7 @@ const oidcAuthorize: Check = {
     // spec doesn't pin it — a future rev switching to 303 would be a
     // legitimate change we must not flap on.
     if (r.status !== 302 && r.status !== 303) {
-      throw new Error(`authorize expected 302, got ${r.status}: ${redactCode(r.rawText).slice(0, 200)}`);
+      throw new Error(`authorize expected 302, got ${r.status}: ${redactCodeAndState(r.rawText).slice(0, 200)}`);
     }
 
     const location = r.headers?.location;
@@ -779,7 +820,7 @@ const oidcAuthorize: Check = {
     try {
       parsed = new URL(location);
     } catch {
-      throw new Error(`authorize 302 Location is not a valid URL: ${redactCode(location).slice(0, 200)}`);
+      throw new Error(`authorize 302 Location is not a valid URL: ${redactCodeAndState(location).slice(0, 200)}`);
     }
     // Login-page bounce or crafted-redirect regression: strict origin +
     // pathname comparison rejects both a login-page URL AND the class of
@@ -802,13 +843,13 @@ const oidcAuthorize: Check = {
     }
     if (parsed.origin !== expected.origin || parsed.pathname !== expected.pathname) {
       throw new Error(
-        `authorize 302 Location does not match the probe redirect URI origin+path (session invalidated, trusted client missing, or redirect regression): ${redactCode(location).slice(0, 200)}`
+        `authorize 302 Location does not match the probe redirect URI origin+path (session invalidated, trusted client missing, or redirect regression): ${redactCodeAndState(location).slice(0, 200)}`
       );
     }
     const returnedCode = parsed.searchParams.get('code');
     if (!returnedCode) {
-      // Wrap in `redactCode` to match sibling error branches (lines 760, 768,
-      // 782, 805). A fragment-form Location like
+      // Wrap in `redactCodeAndState` to match sibling error branches. A
+      // fragment-form Location like
       //   https://canary.wxyc.org/authorize-echo#code=REAL-CODE&state=X
       // slips past the origin+pathname compare (fragments live in the URL
       // hash, not the pathname) and `searchParams.get('code')` returns null
@@ -816,7 +857,7 @@ const oidcAuthorize: Check = {
       // fragment lands in the alert — direct violation of the docstring
       // "never logs the code" promise.
       throw new Error(
-        `authorize 302 Location has no code query param (better-auth issued a bare redirect instead of a code): ${redactCode(location).slice(0, 200)}`
+        `authorize 302 Location has no code query param (better-auth issued a bare redirect instead of a code): ${redactCodeAndState(location).slice(0, 200)}`
       );
     }
     const returnedState = parsed.searchParams.get('state');
