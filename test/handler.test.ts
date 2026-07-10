@@ -3466,6 +3466,162 @@ describe('runCanary — oidc-authorize check (wxyc-canary#60)', () => {
     expect(oidc.status).toBe('pass');
   });
 
+  it('accepts the 200 {redirect,url} JSON shape better-auth uses when isBrowserFetchRequest fires (sec-fetch-mode: cors)', async () => {
+    // better-auth's authorize handler picks its response shape via
+    // `isBrowserFetchRequest()` (@better-auth/core/utils/fetch-metadata),
+    // which returns true when the request header set contains
+    // `sec-fetch-mode: cors`. Node's undici fetch attaches that header by
+    // default on server-side requests, so the canary lands on the JSON
+    // branch every tick against a live server:
+    //     HTTP/1.1 200 OK
+    //     Content-Type: application/json
+    //     {"redirect":true,"url":"<redirect_uri>?code=…&state=…"}
+    // rather than the 302 with `Location:` header the older tests mock.
+    // The check MUST unify both shapes because the underlying OAuth flow
+    // is identical — only the transport differs. This test pins the
+    // JSON-shape acceptance so a future refactor that regresses to
+    // "302-or-fail" flaps the alarm every tick against the real auth
+    // server. Related: canary#61 introduced the check assuming 302 only;
+    // real deploy of BS#1596 (auth wired for `.invalid` + `useJWTPlugin`)
+    // is what surfaced the mismatch, since prior probes never reached a
+    // success path.
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const urlString = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      if (urlString.includes('/oauth2/authorize')) {
+        const url = new URL(urlString);
+        const state = url.searchParams.get('state') ?? '';
+        const redirectUrl = `https://canary.wxyc.invalid/authorize-echo?code=abcd1234&state=${encodeURIComponent(state)}`;
+        return new Response(JSON.stringify({ redirect: true, url: redirectUrl }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      const stubs: Record<string, { status: number; body: unknown }> = {
+        '/healthcheck': { status: 200, body: { ok: true } },
+        '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+        '/graph/artists/search': { status: 200, body: { results: [{ id: 1, canonical_name: 'stereolab' }] } },
+        'explore.example.test/health': {
+          status: 200,
+          body: { status: 'healthy', artist_count: 136_702, graph_db_age_seconds: 3_600 },
+        },
+        '/sign-in/email': { status: 200, body: { token: 'fake-session-token', user: { id: 'canary-user-id' } } },
+        '/token': { status: 200, body: { token: 'fake-jwt' } },
+        '/library/?artist_name=': { status: 200, body: stereolabSearchResults },
+        '/flowsheet': { status: 200, body: [] },
+        '/library/rotation': { status: 200, body: [] },
+      };
+      for (const [pattern, resp] of Object.entries(stubs)) {
+        if (urlString.includes(pattern)) {
+          return new Response(typeof resp.body === 'string' ? resp.body : JSON.stringify(resp.body), {
+            status: resp.status,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+      }
+      return new Response(`unmatched mock for ${urlString}`, { status: 599 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const outcomes = await runCanary({ ...baseConfig, djEmail: 'canary@wxyc.org', djPassword: 'pw' });
+    const oidc = outcomes.find((o) => o.name === 'oidc-authorize')!;
+
+    expect(oidc.status).toBe('pass');
+  });
+
+  it('fails distinctly when authorize returns 200 with a non-JSON body (regression class differs from a legit 302)', async () => {
+    // A 200 with a body that isn't parseable JSON is a real regression
+    // class — likely a proxy/gateway HTML error page reaching the client
+    // as 200 (better-auth would surface its own errors as JSON). Route to
+    // its own message so on-call knows the auth server isn't returning
+    // either OAuth shape, rather than getting a generic "expected 302".
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const urlString = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      if (urlString.includes('/oauth2/authorize')) {
+        return new Response('<html><body>Gateway timeout</body></html>', {
+          status: 200,
+          headers: { 'Content-Type': 'text/html' },
+        });
+      }
+      const stubs: Record<string, { status: number; body: unknown }> = {
+        '/healthcheck': { status: 200, body: { ok: true } },
+        '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+        '/graph/artists/search': { status: 200, body: { results: [{ id: 1, canonical_name: 'stereolab' }] } },
+        'explore.example.test/health': {
+          status: 200,
+          body: { status: 'healthy', artist_count: 136_702, graph_db_age_seconds: 3_600 },
+        },
+        '/sign-in/email': { status: 200, body: { token: 'fake-session-token', user: { id: 'canary-user-id' } } },
+        '/token': { status: 200, body: { token: 'fake-jwt' } },
+        '/library/?artist_name=': { status: 200, body: stereolabSearchResults },
+        '/flowsheet': { status: 200, body: [] },
+        '/library/rotation': { status: 200, body: [] },
+      };
+      for (const [pattern, resp] of Object.entries(stubs)) {
+        if (urlString.includes(pattern)) {
+          return new Response(typeof resp.body === 'string' ? resp.body : JSON.stringify(resp.body), {
+            status: resp.status,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+      }
+      return new Response(`unmatched mock for ${urlString}`, { status: 599 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const outcomes = await runCanary({ ...baseConfig, djEmail: 'canary@wxyc.org', djPassword: 'pw' });
+    const oidc = outcomes.find((o) => o.name === 'oidc-authorize')!;
+
+    expect(oidc.status).toBe('fail');
+    expect(oidc.message).toMatch(/non-JSON body/);
+  });
+
+  it('fails distinctly when authorize returns 200 JSON without the {redirect,url} shape', async () => {
+    // JSON that parses but lacks the `redirect: true` + `url` fields is
+    // another distinct regression: better-auth reworking the response
+    // envelope, or a different endpoint handler catching the route. Route
+    // to its own message so on-call knows the shape drifted rather than
+    // the flow being missing.
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const urlString = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      if (urlString.includes('/oauth2/authorize')) {
+        return new Response(JSON.stringify({ success: true, note: 'no url here' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      const stubs: Record<string, { status: number; body: unknown }> = {
+        '/healthcheck': { status: 200, body: { ok: true } },
+        '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+        '/graph/artists/search': { status: 200, body: { results: [{ id: 1, canonical_name: 'stereolab' }] } },
+        'explore.example.test/health': {
+          status: 200,
+          body: { status: 'healthy', artist_count: 136_702, graph_db_age_seconds: 3_600 },
+        },
+        '/sign-in/email': { status: 200, body: { token: 'fake-session-token', user: { id: 'canary-user-id' } } },
+        '/token': { status: 200, body: { token: 'fake-jwt' } },
+        '/library/?artist_name=': { status: 200, body: stereolabSearchResults },
+        '/flowsheet': { status: 200, body: [] },
+        '/library/rotation': { status: 200, body: [] },
+      };
+      for (const [pattern, resp] of Object.entries(stubs)) {
+        if (urlString.includes(pattern)) {
+          return new Response(typeof resp.body === 'string' ? resp.body : JSON.stringify(resp.body), {
+            status: resp.status,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+      }
+      return new Response(`unmatched mock for ${urlString}`, { status: 599 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const outcomes = await runCanary({ ...baseConfig, djEmail: 'canary@wxyc.org', djPassword: 'pw' });
+    const oidc = outcomes.find((o) => o.name === 'oidc-authorize')!;
+
+    expect(oidc.status).toBe('fail');
+    expect(oidc.message).toMatch(/\{redirect:true,url\}/);
+  });
+
   it('does NOT retry on a 500 from /oauth2/authorize (single tick → single call → single fail)', async () => {
     // The 429 precondition path retries once at the sign-in layer, but the
     // oidc-authorize check itself must not double-tap the auth server on a

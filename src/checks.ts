@@ -852,19 +852,52 @@ const oidcAuthorize: Check = {
         `authorize expected 302, got ${r.status} (BS#1571 replay class if body mentions oauthConsent): ${redactCodeAndState(r.rawText).slice(0, 200)}`
       );
     }
-    // OAuth 2.0 (RFC 6749 §4.1.2) allows either 302 Found or 303 See Other
-    // on the authorization response. better-auth returns 302 today, but the
-    // spec doesn't pin it — a future rev switching to 303 would be a
-    // legitimate change we must not flap on.
-    if (r.status !== 302 && r.status !== 303) {
+    // better-auth returns the authorize redirect in one of two shapes,
+    // chosen by `isBrowserFetchRequest()` (@better-auth/core fetch-metadata),
+    // which flips on `sec-fetch-mode: cors`:
+    //   - "browser" shape (JSON, HTTP 200): `{ redirect: true, url: '<redirect>' }`.
+    //     Node's undici sets `sec-fetch-mode: cors` automatically on server-side
+    //     `fetch()`, so the canary lands here today.
+    //   - "server" shape (HTTP 302/303 with `Location:` header). RFC 6749
+    //     §4.1.2 allows either 302 or 303; better-auth defaults to 302.
+    // Extract the redirect target from either shape into a single `location`
+    // string; downstream validation (origin+pathname compare, code presence,
+    // fragment guard) treats both identically because the underlying redirect
+    // URL is the same — it's only the transport that differs.
+    let location: string | undefined;
+    if (r.status === 302 || r.status === 303) {
+      location = r.headers?.location;
+      if (!location) {
+        // 3xx without a Location header is malformed. `canaryFetch` lowercases
+        // header names, so this covers `Location:` too.
+        throw new Error(`authorize returned ${r.status} with no Location header`);
+      }
+    } else if (r.status === 200) {
+      // Parse the JSON body defensively. A 200 with a non-JSON body OR a JSON
+      // body without `{redirect: true, url}` is a regression class distinct
+      // from a legit 302 — surface it as such so on-call routes to a
+      // better-auth response-shape investigation, not a login/session bounce.
+      let body: unknown;
+      try {
+        body = JSON.parse(r.rawText);
+      } catch {
+        throw new Error(
+          `authorize returned 200 with non-JSON body (expected 302 or {redirect,url}): ${redactCodeAndState(r.rawText).slice(0, 200)}`
+        );
+      }
+      if (
+        !body ||
+        typeof body !== 'object' ||
+        (body as { redirect?: unknown }).redirect !== true ||
+        typeof (body as { url?: unknown }).url !== 'string'
+      ) {
+        throw new Error(
+          `authorize returned 200 without the {redirect:true,url} shape better-auth uses on browser-fetch requests: ${redactCodeAndState(r.rawText).slice(0, 200)}`
+        );
+      }
+      location = (body as { url: string }).url;
+    } else {
       throw new Error(`authorize expected 302, got ${r.status}: ${redactCodeAndState(r.rawText).slice(0, 200)}`);
-    }
-
-    const location = r.headers?.location;
-    if (!location) {
-      // 3xx without a Location header is malformed. `canaryFetch` lowercases
-      // header names, so this covers `Location:` too.
-      throw new Error(`authorize returned ${r.status} with no Location header`);
     }
 
     let parsed: URL;
