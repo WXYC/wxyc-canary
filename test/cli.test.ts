@@ -153,6 +153,7 @@ describe('runCli — happy paths', () => {
       'dj-library-search',
       'dj-flowsheet-read',
       'lml-auth',
+      'oidc-authorize',
     ]);
   });
 

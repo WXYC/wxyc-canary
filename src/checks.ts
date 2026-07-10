@@ -1,3 +1,4 @@
+import { createHash, randomBytes } from 'node:crypto';
 import { canaryFetch, CanaryFetchError, type FetchResult } from './client.js';
 import { runEnrichmentCheck } from './enrichment-check.js';
 import type { Check, CheckResult, Suite } from './types.js';
@@ -643,6 +644,149 @@ const enrichmentQuality: Check = {
   run: async (ctx) => runEnrichmentCheck(ctx),
 };
 
+/**
+ * Generate a fresh PKCE `code_verifier` / `code_challenge` pair per RFC
+ * 7636 §4. The verifier is 32 random bytes rendered as urlsafe base64 (43
+ * chars with the padding stripped). The challenge is
+ * `base64url(sha256(verifier))`. Node's `randomBytes` is a CSPRNG; the
+ * verifier lives for the duration of a single `oidc-authorize` tick and
+ * never leaves the process, so any weaker source would already be over-
+ * engineered for a canary that doesn't exchange the code.
+ */
+function generatePkcePair(): { verifier: string; challenge: string } {
+  const verifier = randomBytes(32).toString('base64url');
+  const challenge = createHash('sha256').update(verifier).digest('base64url');
+  return { verifier, challenge };
+}
+
+/**
+ * OIDC code + PKCE authorize probe. The load-bearing check that would have
+ * caught WXYC/Backend-Service#1571 — the `oauthConsent` schema-drift 500 —
+ * before the flowsheet-digitization verifier tripped over it in production.
+ * Every future OIDC client (WikiJS, additional in-house tools) rides on the
+ * same authorize path, so a regression here is a login-broken-for-everyone
+ * outage that's invisible to the existing DJ-bearer/proxy/healthcheck
+ * probes.
+ *
+ * Uses a DEDICATED `wxyc-canary` PUBLIC trusted client (registered in
+ * WXYC/Backend-Service#1576). Public client + PKCE means no `client_secret`
+ * lives in the canary env — the probe stops at the 302, never exchanges
+ * the code, and a leaked canary env carries no OIDC credential.
+ *
+ * Contract (each tick):
+ *   1. Reuse the session token from `signInDj` (already in `ctx.djSessionToken`).
+ *   2. GET `/auth/oauth2/authorize?response_type=code&client_id=<probe>
+ *      &redirect_uri=<probe-callback>&scope=openid+profile+email
+ *      &state=<random>&code_challenge=<S256(v)>&code_challenge_method=S256`
+ *      with `Authorization: Bearer <session-token>` (the better-auth
+ *      `bearer` plugin translates it to a session cookie) and
+ *      `redirect: 'manual'` (so we can inspect the 302 Location).
+ *   3. Assert 302, Location starts with the probe redirect URI, has a
+ *      non-empty `code` query param, and echoes the `state` we sent.
+ *
+ * Fails on: non-302, missing/mismatched state, missing code, Location
+ * pointing at a login page (session invalidated), 5xx, or the exact
+ * BS#1571 500 shape. Message truncates to the first 200 chars of body per
+ * `healthcheck`'s convention — never logs the code, never logs Set-Cookie
+ * (both are session-material for the canary DJ).
+ */
+const oidcAuthorize: Check = {
+  name: 'oidc-authorize',
+  description:
+    'GET /auth/oauth2/authorize with PKCE — catches BS#1571 oauthConsent-500 and every OIDC login-broken regression',
+  requiresAuth: true,
+  suites: ['smoke'],
+  // Default paging tier. Login is a DJ-on-air surface — every OIDC client
+  // (flowsheet verifier today, WikiJS + others planned) breaks when this
+  // path breaks.
+  run: async (ctx) => {
+    if (!ctx.djSessionToken) {
+      // Belt-and-suspenders: the auth-precondition layer already downgrades
+      // the check to `fail` when sign-in errored. This branch fires only if
+      // `signInDj`'s contract changes and starts returning a result without
+      // a session token — a shape rev we want a clear message on, not a
+      // confusing "cannot read properties of undefined."
+      throw new Error('DJ session token missing (signInDj did not return sessionToken)');
+    }
+    const { verifier: _verifier, challenge } = generatePkcePair();
+    // 16 random bytes → 22-char urlsafe base64. Long enough that a
+    // collision within a single tick is astronomical; short enough not to
+    // stuff the query string. `_verifier` is discarded — the check never
+    // exchanges the code, so the verifier only exists to be hashed.
+    const state = randomBytes(16).toString('base64url');
+    const url = new URL(`${ctx.authUrl}/oauth2/authorize`);
+    url.searchParams.set('response_type', 'code');
+    url.searchParams.set('client_id', ctx.oidcProbeClientId);
+    url.searchParams.set('redirect_uri', ctx.oidcProbeRedirectUri);
+    url.searchParams.set('scope', 'openid profile email');
+    url.searchParams.set('state', state);
+    url.searchParams.set('code_challenge', challenge);
+    url.searchParams.set('code_challenge_method', 'S256');
+
+    const r = await canaryFetch(url.toString(), {
+      headers: { Authorization: `Bearer ${ctx.djSessionToken}` },
+      redirect: 'manual',
+    });
+
+    // A 5xx here is the BS#1571 replay surface: `oauthConsent` schema
+    // missing from the Drizzle adapter map → 500. Distinct routing from
+    // the 302-but-wrong-Location cases below (that's a login-page bounce,
+    // not a substrate-missing error). Include the response body truncation
+    // per healthcheck's convention.
+    if (r.status >= 500) {
+      throw new Error(
+        `authorize expected 302, got ${r.status} (BS#1571 replay class if body mentions oauthConsent): ${r.rawText.slice(0, 200)}`
+      );
+    }
+    if (r.status !== 302) {
+      throw new Error(`authorize expected 302, got ${r.status}: ${r.rawText.slice(0, 200)}`);
+    }
+
+    const location = r.headers?.location;
+    if (!location) {
+      // 302 without a Location header is malformed. `canaryFetch` lowercases
+      // header names, so this covers `Location:` too.
+      throw new Error('authorize returned 302 with no Location header');
+    }
+
+    // Login-page bounce: the auth server accepted the session as far as
+    // /sign-in/email, but rejected it on /oauth2/authorize (invalidated
+    // between calls, trusted client missing, etc.). The Location won't
+    // start with the registered probe redirect URI. Distinct message so
+    // the on-call routes to session/auth investigation.
+    if (!location.startsWith(ctx.oidcProbeRedirectUri)) {
+      throw new Error(
+        `authorize 302 Location does not start with the probe redirect URI (session invalidated or trusted client missing): ${location.slice(0, 200)}`
+      );
+    }
+
+    let parsed: URL;
+    try {
+      parsed = new URL(location);
+    } catch {
+      throw new Error(`authorize 302 Location is not a valid URL: ${location.slice(0, 200)}`);
+    }
+    const returnedCode = parsed.searchParams.get('code');
+    if (!returnedCode) {
+      throw new Error(
+        `authorize 302 Location has no code query param (better-auth issued a bare redirect instead of a code): ${location.slice(0, 200)}`
+      );
+    }
+    const returnedState = parsed.searchParams.get('state');
+    if (returnedState !== state) {
+      // CSRF barrier: the server MUST echo the state we sent. If it echoes
+      // something else — attacker fix, cross-tab pollution, better-auth
+      // regression — pages. We can't log the returned state either (it
+      // could carry canary-private info in a future rev); log only that
+      // it mismatched.
+      throw new Error('authorize 302 Location state does not match the state the check sent');
+    }
+    // Success: don't publish `EnrichmentLagSeconds`-style metrics — this
+    // check's cost signal is `CheckLatency` (already emitted per-check by
+    // the runner), and there's no domain-meaningful duration to surface.
+  },
+};
+
 export const checks: readonly Check[] = [
   healthcheck,
   proxyLibrarySearch,
@@ -655,6 +799,7 @@ export const checks: readonly Check[] = [
   lmlAuth,
   ghaRunnerOnline,
   enrichmentQuality,
+  oidcAuthorize,
 ];
 
 /**
@@ -751,7 +896,18 @@ function parseRetryAfterMs(result: FetchResult): number | undefined {
 // (which throws its own preflight error when `ctx.djUserId` is undefined).
 // Read-only DJ-auth checks tolerate the absence so a better-auth response-
 // shape rev doesn't cascade into four false-positive failures.
-export type DjSignInResult = { jwt: string; userId: string | undefined };
+//
+// `sessionToken` is the raw better-auth session token returned from
+// `/sign-in/email` (pre-JWT-exchange). The OIDC authorize probe uses it as
+// an `Authorization: Bearer ...` header on `/oauth2/authorize` because
+// better-auth's `bearer` plugin translates it into the session cookie the
+// authorize endpoint reads via `getSessionFromCtx`. Distinct from `jwt`:
+// the JWT is what Backend-Service routes accept via `requirePermissions`,
+// but `/oauth2/authorize` needs the SESSION, not the JWT (a JWT from
+// `/token` fails on authorize — different token audience). Undefined only
+// when sign-in itself failed; in that case DJ-auth checks are already
+// downgraded to `fail` at the auth-precondition layer.
+export type DjSignInResult = { jwt: string; userId: string | undefined; sessionToken: string };
 
 export async function signInDj(
   authUrl: string,
@@ -795,5 +951,5 @@ export async function signInDj(
   if (!tokenBody || typeof tokenBody.token !== 'string' || tokenBody.token.length === 0) {
     throw new Error(`auth token exchange returned no JWT: ${tokenExchange.rawText.slice(0, 200)}`);
   }
-  return { jwt: tokenBody.token, userId };
+  return { jwt: tokenBody.token, userId, sessionToken };
 }
