@@ -64,6 +64,23 @@ function setUpFetchMock(responses: Record<string, { status: number; body: unknow
         });
       }
     }
+    // Default `/oauth2/authorize` fallback so DJ-credentialed tests that
+    // don't explicitly stub the OIDC probe get a canned pass instead of
+    // the 599 fallback (which makes `oidc-authorize` a spurious `fail`
+    // shape in unrelated tests' outcome lists). Explicit stubs still win —
+    // the `responses` loop above runs first. Only fires for the OIDC
+    // authorize endpoint; every other unstubbed URL still 599s so a real
+    // missing stub is not silently absorbed.
+    if (urlString.includes('/oauth2/authorize')) {
+      const url = new URL(urlString);
+      const state = url.searchParams.get('state') ?? '';
+      return new Response(null, {
+        status: 302,
+        headers: {
+          Location: `https://canary.wxyc.org/authorize-echo?code=canned-code&state=${encodeURIComponent(state)}`,
+        },
+      });
+    }
     return new Response(`unmatched mock for ${urlString}`, { status: 599 });
   });
   vi.stubGlobal('fetch', fetchMock);
@@ -2505,6 +2522,11 @@ describe('runCanary — oidc-authorize check (wxyc-canary#60)', () => {
         const headers = (init?.headers ?? {}) as Record<string, string>;
         const auth = headers.Authorization ?? headers.authorization ?? '';
         expect(auth).toBe('Bearer fake-session-token');
+        // `redirect: 'manual'` is load-bearing — without it Node's fetch
+        // follows the 302 and swallows the Location header. Pin it so a
+        // future refactor of the check that drops the init option regresses
+        // this test rather than silently masking every 302-shape failure.
+        expect(init?.redirect).toBe('manual');
         // Echo the state back to prove the state-parity check works.
         const location = `https://canary.wxyc.org/authorize-echo?code=abcd1234&state=${encodeURIComponent(state)}`;
         return new Response(null, {
@@ -2651,10 +2673,13 @@ describe('runCanary — oidc-authorize check (wxyc-canary#60)', () => {
     expect(oidc.message).toMatch(/302|200/);
   });
 
-  it('propagates the sign-in 429 precondition — check reports fail with the auth precondition message (single 429 → no retry consumes 4 outcomes)', async () => {
+  it('propagates a terminal sign-in 401 as the auth-precondition failure (invalid credentials, no retry)', async () => {
     // The check is `requiresAuth: true`, so a broken sign-in cascades into
     // the standard auth-precondition-failed path. Distinct from the check-
     // level probe: a sign-in outage shouldn't page as an OIDC regression.
+    // A 401 is a terminal shape — signInDj throws immediately (no retry;
+    // retries are 429-only). See the "real 429" test below for the
+    // transient retry-succeeds path.
     setUpFetchMock({
       '/healthcheck': { status: 200, body: { ok: true } },
       '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
@@ -2678,9 +2703,13 @@ describe('runCanary — oidc-authorize check (wxyc-canary#60)', () => {
     // and the GitHub-issue reporter. Leaking a real authorization code is
     // a mid-severity credential exposure (short-lived, single-use, but real);
     // Set-Cookie leaks the session token outright. Pin the redaction.
+    //
+    // `code=SUPER-SECRET` intentionally lands inside the first 200 chars so
+    // the redaction is exercised at the truncated-slice boundary. A body-first
+    // redact + slice must strip the token even before the truncation.
     setUpAuthorizeMock({
       status: 500,
-      body: 'sensitive body prefix, do not leak past 200 chars, code=SUPER-SECRET, and then '.repeat(20),
+      body: 'code=SUPER-SECRET sensitive body prefix, do not leak past 200 chars, and then '.repeat(20),
       headers: { 'Set-Cookie': 'better-auth.session_token=leaked-cookie-value; Path=/; HttpOnly' },
     });
 
@@ -2690,10 +2719,296 @@ describe('runCanary — oidc-authorize check (wxyc-canary#60)', () => {
     expect(oidc.status).toBe('fail');
     expect(oidc.message).not.toMatch(/leaked-cookie-value/);
     expect(oidc.message).not.toMatch(/Set-Cookie/i);
+    // The literal code value must never appear (even under the "first 200
+    // chars" truncation, since it lives in the first ~17 chars of the body).
+    // The redaction may substitute a placeholder like `code=<redacted>`,
+    // which is fine — pin on the sentinel token itself, not on the pattern
+    // shape (a shape-based regex would also match the placeholder).
+    expect(oidc.message).not.toMatch(/SUPER-SECRET/);
     // The status suffix is short; 200 chars from a repeated body is capped.
     // The whole "sensitive body" content past the first 200 chars must not
     // land in the alert message.
     expect((oidc.message ?? '').length).toBeLessThan(500);
+  });
+
+  it('fails on a crafted Location that starts-with the redirect URI but is a different origin+path (prefix bypass regression)', async () => {
+    // An attacker (or a betterauth regression) that echoes a Location whose
+    // string starts with the probe redirect URI but does NOT actually match
+    // the registered client callback origin+path must fail. A naive
+    // `startsWith` guard accepts:
+    //   https://canary.wxyc.org/authorize-echo-attacker.example.com/?code=X
+    // as valid because the string prefix matches; strict URL parsing
+    // (origin+pathname compare) rejects it. The mock echoes the state so
+    // the state-mismatch guard doesn't shadow the URL check we're pinning.
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const urlString = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      if (urlString.includes('/oauth2/authorize')) {
+        const url = new URL(urlString);
+        const state = url.searchParams.get('state') ?? '';
+        // Echo the state so this test isolates the URL check.
+        const location = `https://canary.wxyc.org/authorize-echo-attacker.example.com/?code=abcd1234&state=${encodeURIComponent(state)}`;
+        return new Response(null, {
+          status: 302,
+          headers: { Location: location },
+        });
+      }
+      const stubs: Record<string, { status: number; body: unknown }> = {
+        '/healthcheck': { status: 200, body: { ok: true } },
+        '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+        '/graph/artists/search': { status: 200, body: { results: [{ id: 1, canonical_name: 'stereolab' }] } },
+        'explore.example.test/health': {
+          status: 200,
+          body: { status: 'healthy', artist_count: 136_702, graph_db_age_seconds: 3_600 },
+        },
+        '/sign-in/email': { status: 200, body: { token: 'fake-session-token', user: { id: 'canary-user-id' } } },
+        '/token': { status: 200, body: { token: 'fake-jwt' } },
+        '/library/?artist_name=': { status: 200, body: stereolabSearchResults },
+        '/flowsheet': { status: 200, body: [] },
+        '/library/rotation': { status: 200, body: [] },
+      };
+      for (const [pattern, resp] of Object.entries(stubs)) {
+        if (urlString.includes(pattern)) {
+          return new Response(typeof resp.body === 'string' ? resp.body : JSON.stringify(resp.body), {
+            status: resp.status,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+      }
+      return new Response(`unmatched mock for ${urlString}`, { status: 599 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const outcomes = await runCanary({ ...baseConfig, djEmail: 'canary@wxyc.org', djPassword: 'pw' });
+    const oidc = outcomes.find((o) => o.name === 'oidc-authorize')!;
+
+    expect(oidc.status).toBe('fail');
+    // Message should route the on-call to session/redirect investigation.
+    expect(oidc.message).toMatch(/redirect|Location/i);
+  });
+
+  it('sends `redirect: manual` on /oauth2/authorize so the check can read the 302 Location header', async () => {
+    // The check MUST NOT follow the 302 — inspecting the Location header is
+    // the whole point of the probe (code + state parity live there). Node's
+    // default fetch follows redirects, which would swallow the Location and
+    // deliver whatever the redirect target returns (typically an ECONNREFUSED
+    // against the canary.wxyc.org placeholder callback). Pin the request-init.
+    let capturedRedirect: RequestInit['redirect'] | undefined;
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const urlString = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      if (urlString.includes('/oauth2/authorize')) {
+        capturedRedirect = init?.redirect;
+        const url = new URL(urlString);
+        const state = url.searchParams.get('state') ?? '';
+        return new Response(null, {
+          status: 302,
+          headers: {
+            Location: `https://canary.wxyc.org/authorize-echo?code=abcd1234&state=${encodeURIComponent(state)}`,
+          },
+        });
+      }
+      const stubs: Record<string, { status: number; body: unknown }> = {
+        '/healthcheck': { status: 200, body: { ok: true } },
+        '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+        '/graph/artists/search': { status: 200, body: { results: [{ id: 1, canonical_name: 'stereolab' }] } },
+        'explore.example.test/health': {
+          status: 200,
+          body: { status: 'healthy', artist_count: 136_702, graph_db_age_seconds: 3_600 },
+        },
+        '/sign-in/email': { status: 200, body: { token: 'fake-session-token', user: { id: 'canary-user-id' } } },
+        '/token': { status: 200, body: { token: 'fake-jwt' } },
+        '/library/?artist_name=': { status: 200, body: stereolabSearchResults },
+        '/flowsheet': { status: 200, body: [] },
+        '/library/rotation': { status: 200, body: [] },
+      };
+      for (const [pattern, resp] of Object.entries(stubs)) {
+        if (urlString.includes(pattern)) {
+          return new Response(typeof resp.body === 'string' ? resp.body : JSON.stringify(resp.body), {
+            status: resp.status,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+      }
+      return new Response(`unmatched mock for ${urlString}`, { status: 599 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const outcomes = await runCanary({ ...baseConfig, djEmail: 'canary@wxyc.org', djPassword: 'pw' });
+    const oidc = outcomes.find((o) => o.name === 'oidc-authorize')!;
+
+    expect(oidc.status).toBe('pass');
+    expect(capturedRedirect).toBe('manual');
+  });
+
+  it('accepts a 303 See Other as well as a 302 Found — OAuth 2.0 does not pin the redirect status', async () => {
+    // OAuth 2.0 (RFC 6749 §4.1.2) allows the authorization server to redirect
+    // via either 302 or 303. better-auth currently returns 302, but a future
+    // rev could switch to 303 without breaking the protocol. The check must
+    // not flap on that rev.
+    setUpAuthorizeMock({
+      status: 303,
+      body: '',
+      headers: {
+        // Any state — mock echoes what the check sent. But setUpAuthorizeMock
+        // returns a static Location that doesn't echo state, so this test
+        // uses a helper that DOES echo state. Fall through to raw fetch.
+      },
+    });
+    // The static helper doesn't echo state; build a bespoke fetch that does.
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const urlString = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      if (urlString.includes('/oauth2/authorize')) {
+        const url = new URL(urlString);
+        const state = url.searchParams.get('state') ?? '';
+        return new Response(null, {
+          status: 303,
+          headers: {
+            Location: `https://canary.wxyc.org/authorize-echo?code=abcd1234&state=${encodeURIComponent(state)}`,
+          },
+        });
+      }
+      const stubs: Record<string, { status: number; body: unknown }> = {
+        '/healthcheck': { status: 200, body: { ok: true } },
+        '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+        '/graph/artists/search': { status: 200, body: { results: [{ id: 1, canonical_name: 'stereolab' }] } },
+        'explore.example.test/health': {
+          status: 200,
+          body: { status: 'healthy', artist_count: 136_702, graph_db_age_seconds: 3_600 },
+        },
+        '/sign-in/email': { status: 200, body: { token: 'fake-session-token', user: { id: 'canary-user-id' } } },
+        '/token': { status: 200, body: { token: 'fake-jwt' } },
+        '/library/?artist_name=': { status: 200, body: stereolabSearchResults },
+        '/flowsheet': { status: 200, body: [] },
+        '/library/rotation': { status: 200, body: [] },
+      };
+      for (const [pattern, resp] of Object.entries(stubs)) {
+        if (urlString.includes(pattern)) {
+          return new Response(typeof resp.body === 'string' ? resp.body : JSON.stringify(resp.body), {
+            status: resp.status,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+      }
+      return new Response(`unmatched mock for ${urlString}`, { status: 599 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const outcomes = await runCanary({ ...baseConfig, djEmail: 'canary@wxyc.org', djPassword: 'pw' });
+    const oidc = outcomes.find((o) => o.name === 'oidc-authorize')!;
+
+    expect(oidc.status).toBe('pass');
+  });
+
+  it('does NOT retry on a 500 from /oauth2/authorize (single tick → single call → single fail)', async () => {
+    // The 429 precondition path retries once at the sign-in layer, but the
+    // oidc-authorize check itself must not double-tap the auth server on a
+    // 5xx: retrying disguises the outage in dashboards (two failures per tick
+    // that only surface as one) and doubles the auth-server load in exactly
+    // the moment it's already unhealthy. Pin the call count.
+    let authorizeCalls = 0;
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const urlString = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      if (urlString.includes('/oauth2/authorize')) {
+        authorizeCalls += 1;
+        return new Response(JSON.stringify({ message: 'internal server error' }), {
+          status: 500,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      const stubs: Record<string, { status: number; body: unknown }> = {
+        '/healthcheck': { status: 200, body: { ok: true } },
+        '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+        '/graph/artists/search': { status: 200, body: { results: [{ id: 1, canonical_name: 'stereolab' }] } },
+        'explore.example.test/health': {
+          status: 200,
+          body: { status: 'healthy', artist_count: 136_702, graph_db_age_seconds: 3_600 },
+        },
+        '/sign-in/email': { status: 200, body: { token: 'fake-session-token', user: { id: 'canary-user-id' } } },
+        '/token': { status: 200, body: { token: 'fake-jwt' } },
+        '/library/?artist_name=': { status: 200, body: stereolabSearchResults },
+        '/flowsheet': { status: 200, body: [] },
+        '/library/rotation': { status: 200, body: [] },
+      };
+      for (const [pattern, resp] of Object.entries(stubs)) {
+        if (urlString.includes(pattern)) {
+          return new Response(typeof resp.body === 'string' ? resp.body : JSON.stringify(resp.body), {
+            status: resp.status,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+      }
+      return new Response(`unmatched mock for ${urlString}`, { status: 599 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const outcomes = await runCanary({ ...baseConfig, djEmail: 'canary@wxyc.org', djPassword: 'pw' });
+    const oidc = outcomes.find((o) => o.name === 'oidc-authorize')!;
+
+    expect(oidc.status).toBe('fail');
+    expect(authorizeCalls).toBe(1);
+  });
+
+  it('propagates a real 429 sign-in preflight — the retry succeeds on second try, and the OIDC check passes downstream', async () => {
+    // `signInDj` retries once on 429 (respecting Retry-After up to 5s ceiling).
+    // If the second attempt succeeds, the DJ-authed check proceeds normally.
+    // This is distinct from the 401 case above (which is a terminal auth
+    // precondition failure) — a 429 is transient, and the check tier that
+    // depends on sign-in must actually see the retry path work end-to-end.
+    let signInCalls = 0;
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const urlString = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      if (urlString.includes('/sign-in/email')) {
+        signInCalls += 1;
+        if (signInCalls === 1) {
+          return new Response(JSON.stringify({ error: 'rate limited' }), {
+            status: 429,
+            headers: { 'Content-Type': 'application/json', 'Retry-After': '0' },
+          });
+        }
+        return new Response(JSON.stringify({ token: 'fake-session-token', user: { id: 'canary-user-id' } }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      if (urlString.includes('/oauth2/authorize')) {
+        const url = new URL(urlString);
+        const state = url.searchParams.get('state') ?? '';
+        return new Response(null, {
+          status: 302,
+          headers: {
+            Location: `https://canary.wxyc.org/authorize-echo?code=abcd1234&state=${encodeURIComponent(state)}`,
+          },
+        });
+      }
+      const stubs: Record<string, { status: number; body: unknown }> = {
+        '/healthcheck': { status: 200, body: { ok: true } },
+        '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+        '/graph/artists/search': { status: 200, body: { results: [{ id: 1, canonical_name: 'stereolab' }] } },
+        'explore.example.test/health': {
+          status: 200,
+          body: { status: 'healthy', artist_count: 136_702, graph_db_age_seconds: 3_600 },
+        },
+        '/token': { status: 200, body: { token: 'fake-jwt' } },
+        '/library/?artist_name=': { status: 200, body: stereolabSearchResults },
+        '/flowsheet': { status: 200, body: [] },
+        '/library/rotation': { status: 200, body: [] },
+      };
+      for (const [pattern, resp] of Object.entries(stubs)) {
+        if (urlString.includes(pattern)) {
+          return new Response(typeof resp.body === 'string' ? resp.body : JSON.stringify(resp.body), {
+            status: resp.status,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+      }
+      return new Response(`unmatched mock for ${urlString}`, { status: 599 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const outcomes = await runCanary({ ...baseConfig, djEmail: 'canary@wxyc.org', djPassword: 'pw' });
+    const oidc = outcomes.find((o) => o.name === 'oidc-authorize')!;
+
+    expect(signInCalls).toBe(2);
+    expect(oidc.status).toBe('pass');
   });
 });
 
