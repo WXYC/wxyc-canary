@@ -58,6 +58,14 @@ Resources:
                 Effect: Allow
                 Action: [cloudformation:ListStacks, cloudformation:ValidateTemplate]
                 Resource: '*'
+              - Sid: SamTransform
+                # The template's `Transform: AWS::Serverless-2016-10-31` is expanded
+                # by this AWS-owned macro during CreateChangeSet; CloudFormation
+                # authorizes the expansion against the transform's own ARN (account
+                # segment is literally `aws`). Standard sam-pipeline-bootstrap grant.
+                Effect: Allow
+                Action: cloudformation:CreateChangeSet
+                Resource: !Sub arn:aws:cloudformation:${AWS::Region}:aws:transform/Serverless-2016-10-31
               - Sid: SamBucket
                 Effect: Allow
                 Action: [s3:PutObject, s3:GetObject, s3:ListBucket, s3:GetBucketLocation]
