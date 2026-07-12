@@ -38,8 +38,12 @@ jobs:
           use-installer: true
       - uses: aws-actions/configure-aws-credentials@v6
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          # Assume the wxyc-canary-deploy role in the WXYC account (203767826763)
+          # via GitHub OIDC — no long-lived AWS keys are stored in the repo. The
+          # `permissions: id-token: write` block above mints the OIDC token; the
+          # role's trust policy is pinned to this repo's main ref. See
+          # bootstrap/deploy-role.yaml and README "CI deploys (GitHub OIDC)".
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
       - run: npm ci
       - run: npm run build
