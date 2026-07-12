@@ -77,12 +77,20 @@ jobs:
           if [ -n "$INFRA_ALERT_EMAIL" ]; then
             OPTIONAL_ARGS+=("InfraAlertEmail=$INFRA_ALERT_EMAIL")
           fi
+          # Use the existing SAM managed bucket explicitly rather than
+          # --resolve-s3. --resolve-s3 reconciles the `aws-sam-cli-managed-default`
+          # CloudFormation stack (CreateChangeSet against it) to ensure the bucket
+          # exists — but the least-privilege deploy role is scoped to
+          # stack/wxyc-canary/*, so that reconciliation is AccessDenied. The bucket
+          # already exists (created when the account was first SAM-bootstrapped);
+          # pointing at it directly skips the managed-stack step. The deploy role's
+          # SamBucket statement grants the needed s3:* on this bucket.
           sam deploy \
             --no-confirm-changeset \
             --no-fail-on-empty-changeset \
             --stack-name wxyc-canary \
             --capabilities CAPABILITY_IAM \
-            --resolve-s3 \
+            --s3-bucket "${{ vars.SAM_S3_BUCKET || 'aws-sam-cli-managed-default-samclisourcebucket-v0kc5deo10yi' }}" \
             --parameter-overrides \
               BackendUrl=${{ vars.BACKEND_URL || 'https://api.wxyc.org' }} \
               AuthUrl=${{ vars.AUTH_URL || 'https://api.wxyc.org/auth' }} \
