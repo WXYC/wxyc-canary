@@ -278,17 +278,32 @@ When the runner is replaced (instance swap or re-registration), repeat step 3 an
 
 To turn the probe off, redeploy with an empty `GhaRunnerTokenSsmParamName` or `GhaRunnerId=0`. The conditional in `template.yaml` then strips the SSM IAM grant and the env vars; the check downgrades to `skipped` and the alarm stays quiet.
 
-### CI deploys
+### CI deploys (GitHub OIDC)
 
-`.github/workflows/deploy.yml` builds + deploys on push to `main`. Required GitHub secrets:
+`.github/workflows/deploy.yml` builds + deploys on push to `main`. It authenticates to the WXYC AWS account (`203767826763`) by assuming an IAM role via **GitHub OIDC — no long-lived AWS keys are stored in the repo**. The role's trust policy is pinned to `repo:WXYC/wxyc-canary:ref:refs/heads/main`, so only a push to `main` in this repo can assume it.
 
-- `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION` — same shape as Backend-Service
-- `DJ_CREDENTIALS_SECRET_ARN` — the ARN from step 2 above
+**One-time account bootstrap** (already applied to `203767826763`): deploy `bootstrap/deploy-role.yaml`, which creates the account-global GitHub OIDC provider and the least-privilege `wxyc-canary-deploy` role (scoped to `wxyc-canary*` resources + the SAM managed bucket):
 
-Required GitHub variables (override defaults if needed):
+```bash
+aws cloudformation deploy \
+  --template-file bootstrap/deploy-role.yaml \
+  --stack-name wxyc-canary-deploy \
+  --capabilities CAPABILITY_NAMED_IAM
+```
 
-- `BACKEND_URL`, `AUTH_URL`, `SEMANTIC_INDEX_URL`, `ALERT_EMAIL`
+Take the stack's `DeployRoleArn` output and set it as the `AWS_DEPLOY_ROLE_ARN` GitHub variable. The OIDC provider is account-global (unique per URL) — when a second WXYC repo adopts OIDC, move the provider into its own shared stack and leave only per-repo roles in each repo's bootstrap.
+
+Required GitHub variables:
+
+- `AWS_DEPLOY_ROLE_ARN` — the `wxyc-canary-deploy` role ARN from the bootstrap stack. The workflow's `permissions: id-token: write` block (already present) lets the runner mint the OIDC token; `configure-aws-credentials` exchanges it for short-lived role credentials.
+- `AWS_REGION` — `us-east-1`.
+- `BACKEND_URL`, `AUTH_URL`, `SEMANTIC_INDEX_URL`, `LML_URL`, `OIDC_PROBE_REDIRECT_URI`, `ALERT_EMAIL`
 - `INFRA_ALERT_EMAIL` — optional low-urgency recipient for `wxyc-canary-infra-degraded` (the infra/CI tier, wxyc-canary#48). Leave unset for console-only; set it to a filtered alias to get non-paging email. An empty value is an accepted gap, not a silent one.
+
+Required GitHub secrets:
+
+- `DJ_CREDENTIALS_SECRET_ARN` — ARN of the Secrets Manager secret holding the canary DJ login (from the one-time setup above).
+- `LML_API_KEY_SECRET_ARN` — ARN of the Secrets Manager secret holding the shared LML bearer. **Copied, never rotated** — the same value backs BS + rom + tubafrenzy (Railway's one-secret-one-value convention).
 
 Optional GitHub variables for the runner-liveness probe (when all three are set the next deploy enables `gha-runner-online`; leave unset to keep it skipped):
 
