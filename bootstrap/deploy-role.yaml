@@ -45,7 +45,15 @@ Resources:
               - Sid: CfnStack
                 Effect: Allow
                 Action: cloudformation:*
-                Resource: !Sub arn:aws:cloudformation:us-east-1:${AWS::AccountId}:stack/wxyc-canary/*
+                Resource:
+                  - !Sub arn:aws:cloudformation:us-east-1:${AWS::AccountId}:stack/wxyc-canary/*
+                  # SAM deploys through a change set: CreateChangeSet authorizes
+                  # against the stack, but DescribeChangeSet/ExecuteChangeSet
+                  # authorize against the changeSet resource ARN — which can't be
+                  # scoped to a stack by ARN. Without this, the CI deploy creates
+                  # the changeset then fails AccessDenied polling its status.
+                  # Changesets are ephemeral, deploy-only artifacts.
+                  - !Sub arn:aws:cloudformation:us-east-1:${AWS::AccountId}:changeSet/*
               - Sid: CfnListDescribe # unscopable read actions SAM issues pre-changeset
                 Effect: Allow
                 Action: [cloudformation:ListStacks, cloudformation:ValidateTemplate]
