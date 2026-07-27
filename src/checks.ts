@@ -501,6 +501,104 @@ const lmlAuth: Check = {
 };
 
 /**
+ * LML `/health` values of `discogs_breaker_state` that mean the
+ * saturation-protection breaker is shedding Discogs lookup traffic.
+ * `half-open` still sheds every caller except the breaker's own one
+ * in-flight trial request, so it counts alongside `open`. `closed` and
+ * `null` (Discogs unconfigured — never expected on prod) do not.
+ */
+const DISCOGS_BREAKER_SHEDDING_STATES = new Set(['open', 'half-open']);
+
+/**
+ * Anonymous: detects when LML's Discogs-saturation breaker is shedding
+ * lookup traffic. `GET /health` on LML surfaces the breaker's raw state as
+ * top-level `discogs_breaker_state` (`"closed" | "open" | "half-open" |
+ * null` — library-metadata-lookup#939, merged 2026-07-27). Key on this raw
+ * field, not the derived `services.discogs_api: "rate-limited"` — the raw
+ * field is authoritative and #939's own docs recommend it.
+ *
+ * This check's pass/fail status NEVER reflects the breaker state — it
+ * always returns `pass` and carries the shed signal entirely in the
+ * `DiscogsBreakerShedding` metric (0 or 1), emitted dimensioned +
+ * dimensionless per the `{ metrics: {...} }` convention. That's
+ * deliberate: a dedicated `template.yaml` alarm on the dimensionless
+ * series (`Statistic: Maximum`, `EvaluationPeriods: 3`,
+ * `DatapointsToAlarm: 3`) is what pages after 3 consecutive shedding
+ * ticks (~15 minutes) — a breaker legitimately trips OPEN for a window or
+ * two during real saturation, so 3-of-3 is the "never recovers" signature,
+ * distinct from the shared `wxyc-canary-check-failure` alarm's 2-of-3.
+ * Routing the shed through `CheckFailure` / `UserFacingCheckFailure`
+ * instead would double-debounce against that aggregate's own evaluation
+ * window and page on its schedule rather than this signal's.
+ *
+ * A network error, non-200, or an unparseable/missing/non-string
+ * `discogs_breaker_state` is treated as *indeterminate* — the same
+ * abstain-on-indeterminate posture `lml-auth` and `semantic-index-freshness`
+ * use for an unreachable dependency — and reads as NOT shedding
+ * (`DiscogsBreakerShedding: 0`) rather than paging on an inability to read
+ * LML. LML availability itself is already a paging surface via
+ * `proxy-library-search` and the dj-* checks.
+ *
+ * KNOWN LIMITATION — the idle-tail false positive (library-metadata-
+ * lookup#939's own docs flag this; deliberately accepted here rather than
+ * volume-gated — see wxyc-canary#79 for the full analysis). The breaker's
+ * `open -> half-open` recovery transition (and the LML#787 watchdog) only
+ * advance inside `allow_request()`, which only the live `/lookup` path
+ * calls — reading `.state` via `/health` never advances it. So after a
+ * genuine OPEN trip, if NO live Discogs lookups follow (an overnight quiet
+ * window — cache-hit library searches do not count), `.state` stays
+ * latched `open` and `/health` keeps reporting `discogs_breaker_state:
+ * "open"` even though the next real lookup would likely recover it
+ * immediately. The proper fix — gate the shed signal on concurrent lookup
+ * volume — needs a read-only lookup-rate field `/health` does not expose
+ * today; that's a follow-up LML ticket, not something this check should
+ * work around by calling `/lookup` itself (which would spend the very
+ * token bucket the breaker guards). Until that field exists, an overnight
+ * idle-open can page after 3 ticks with zero concurrent user impact.
+ *
+ * On-call response to this alarm: do NOT rely on `/health` alone to judge
+ * recovery — verify via `api.discogs.com` spans resuming in Sentry
+ * instead. Sentry stores `span.domain` wildcard-normalized: query
+ * `span.domain:*.discogs.com`, NOT the literal `span.domain:api.discogs.com`
+ * — the literal-subdomain filter returns zero rows even while live traffic
+ * is flowing (it produced a false "still latched" reading during the
+ * 2026-07-14 post-fix verification). `span.op:http.client` grouped by
+ * `span.domain` is the reliable shape.
+ */
+const lmlDiscogsBreakerShed: Check = {
+  name: 'lml-discogs-breaker-shed',
+  description: 'GET /health on LML — discogs_breaker_state open/half-open means Discogs lookups are being shed',
+  requiresAuth: false,
+  pagesOncall: true,
+  run: async (ctx): Promise<CheckResult> => {
+    let r: FetchResult;
+    try {
+      r = await canaryFetch(`${ctx.lmlUrl}/health`);
+    } catch (err) {
+      if (err instanceof CanaryFetchError) {
+        // LML never answered — breaker state is indeterminate, not
+        // shedding. LML availability is covered elsewhere (proxy-library-
+        // search, dj-* checks); this probe must not page on top of that.
+        return { metrics: { DiscogsBreakerShedding: 0 } };
+      }
+      throw err;
+    }
+    if (!r.ok) {
+      // Non-200: indeterminate, same abstain posture as the network-error
+      // branch above.
+      return { metrics: { DiscogsBreakerShedding: 0 } };
+    }
+    const body = r.body as { discogs_breaker_state?: unknown };
+    if (!body || typeof body !== 'object' || typeof body.discogs_breaker_state !== 'string') {
+      // Missing field, non-JSON body, or an unexpected type: indeterminate.
+      return { metrics: { DiscogsBreakerShedding: 0 } };
+    }
+    const shedding = DISCOGS_BREAKER_SHEDDING_STATES.has(body.discogs_breaker_state);
+    return { metrics: { DiscogsBreakerShedding: shedding ? 1 : 0 } };
+  },
+};
+
+/**
  * Liveness probe for the EC2-hosted self-hosted GitHub Actions runner
  * (label `e2e-runner`) that backs the staging-gate suites in
  * Backend-Service, library-metadata-lookup, and dj-site. Wired up as
@@ -680,6 +778,7 @@ export const checks: readonly Check[] = [
   djRotation,
   djRotationPicker,
   lmlAuth,
+  lmlDiscogsBreakerShed,
   ghaRunnerOnline,
   enrichmentQuality,
   oidcAuthorize,

@@ -30,6 +30,7 @@ describe('checksForSuite', () => {
       'dj-rotation-picker',
       'gha-runner-online',
       'enrichment-quality',
+      'lml-discogs-breaker-shed',
     ]) {
       expect(smokeNames).not.toContain(name);
     }
@@ -93,7 +94,12 @@ describe('pagesOncall — paging-tier classification', () => {
     expect(paging).toContain('dj-rotation-picker');
     // semantic-index-search pages again post-#347 (wxyc-canary#50).
     expect(paging).toContain('semantic-index-search');
-    // The 9 user-facing checks + enrichment-quality (writes; pages by
+    // lml-discogs-breaker-shed (wxyc-canary#79) pages explicitly — its own
+    // check status never fails (the shed signal is carried entirely by the
+    // DiscogsBreakerShedding metric + a dedicated alarm), but the
+    // classification still routes it into the user-facing tier, not infra.
+    expect(paging).toContain('lml-discogs-breaker-shed');
+    // The 10 user-facing checks + enrichment-quality (writes; pages by
     // default though it skips in prod) all page; only the 2 infra checks
     // are excluded. `oidc-authorize` (wxyc-canary#60) is user-facing —
     // login is the DJ-on-air gate for every OIDC client.

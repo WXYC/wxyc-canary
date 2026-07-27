@@ -18,6 +18,17 @@ Demoting a check to the infra tier reduces paging coverage of whatever it probes
 - All anonymous checks pass when upstreams behave; DJ-auth checks skip without creds.
 - Each of the three 2026-04-30 incident shapes produces a `fail` outcome on the right check (catalog-search 503, semantic-index missing `results` envelope, LML proxy 504).
 - `semantic-index-freshness` (semantic-index#348 / wxyc-canary#53) fails on a stale graph (`graph_db_age_seconds` > 36 h) and on a sub-floor `artist_count` (< 100k), passes when fresh + above-floor (emitting `GraphDbAgeSeconds`), and — because `graph_db_age_seconds` is not yet live in prod `/health` — passes on the pre-#348 shape (`artist_count` only) without fabricating an age failure. Tier routing (infra, non-paging) is pinned in the `publishMetrics — tier split` block.
+- `lml-discogs-breaker-shed` (wxyc-canary#79) always passes — `open`/`half-open`/`closed`/missing-field/non-200/network-error all reach `status: 'pass'` — and instead pins the `DiscogsBreakerShedding` metric value for each `discogs_breaker_state` reading: `open` → 1, `half-open` → 1, `closed` → 0, `null`/missing/unparseable/non-200 → 0 (indeterminate abstain, not a page-worthy verdict).
 - One failing check does not short-circuit the others.
 - Auth sign-in errors propagate as fail (not skip) on every DJ-auth check.
 - Sign-in 429 retries once (and only on 429) and recovers when the second attempt succeeds; both attempts failing or any non-429 fail the precondition without retrying.
+
+## Metric-carries-the-signal: an alternate design when `fail` is the wrong verb
+
+Most checks throw on failure and let the runner's `CheckFailure` / `UserFacingCheckFailure` machinery carry the page. `lml-discogs-breaker-shed` (wxyc-canary#79) is the first check that deliberately does NOT: it always returns `pass`, and the thing worth paging on — the LML Discogs-breaker shedding lookup traffic — is carried entirely by a custom `{ metrics: {...} }` value (`DiscogsBreakerShedding`, 0 or 1) with its own dedicated `template.yaml` alarm (3-of-3 evaluations, not the shared page alarm's 2-of-3).
+
+Reach for this pattern when a single observation is expected to flap on its own (a breaker legitimately trips for a window or two under real load) and the page-worthy signal is _sustained_ state, not a one-tick verdict — routing that through `CheckFailure` would either double-debounce against the shared aggregate's own window or force every other check's alarm to inherit a bespoke evaluation count it doesn't need. A dedicated metric + dedicated alarm keeps the sustained-detection logic out of the (stateless, per-tick) check body entirely.
+
+## When "I can't tell" should read as 0, not as a failure
+
+`lml-discogs-breaker-shed` also fixes an abstain value for its custom metric: a network error, non-200, or unparseable/missing field all reads as `DiscogsBreakerShedding: 0` — the same abstain-on-indeterminate posture `lml-auth` and `semantic-index-freshness` use for an unreachable dependency, just expressed as a metric value instead of a `skipped` outcome (a metric-carrying check has no "skip the whole check" option — it always runs to completion and always reports a number). Don't invent a third value or omit the metric on indeterminate — a missing datapoint reads as "no data" on the dashboard, not as "confirmed not shedding," and the alarm's `TreatMissingData: notBreaching` already covers true absence (e.g. a deploy where the check hasn't run yet).
