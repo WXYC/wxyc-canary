@@ -411,46 +411,92 @@ Resources:
       OKActions:
         - !Ref AlertTopic
 
-  # Discogs-breaker sustained-shed alarm (wxyc-canary#79). Targets the
-  # dimensionless DiscogsBreakerShedding series the lml-discogs-breaker-shed
-  # check emits (0/1 gauge — Count unit, no *Seconds/*Milliseconds suffix).
-  # Unlike the shared page alarm's 2-of-3, this is 3-of-3: a breaker
-  # legitimately trips OPEN for a window or two during real Discogs
-  # saturation, and that must NOT page; only a shed that holds for 3
-  # consecutive 5-minute ticks (~15 min — the "never recovers on its own"
+  # Discogs-breaker sustained-shed alarm (wxyc-canary#79), volume-gated
+  # (wxyc-canary#84). Pages only when BOTH hold for 3 consecutive 5-minute
+  # ticks (~15 min): the breaker is shedding (the dimensionless
+  # DiscogsBreakerShedding series the lml-discogs-breaker-shed check emits
+  # reads >= 1) AND live Discogs lookups are actually flowing
+  # (DIFF(DiscogsLiveRequestsTotal) > 0 — library-metadata-lookup#940's
+  # monotonic counter of live-Discogs request attempts, including
+  # breaker-shed ones, also emitted dimensionless by the same check). This
+  # is this repo's first metric-math alarm: a `Metrics:` array combines the
+  # two dimensionless series into a single 0/1 gate via `IF(... AND ..., 1,
+  # 0)`, with the gate expression as the sole `ReturnData: true` entry the
+  # alarm evaluates. Unlike the shared page alarm's 2-of-3, this is 3-of-3:
+  # a breaker legitimately trips OPEN for a window or two during real
+  # Discogs saturation, and that must NOT page; only shedding-with-traffic
+  # that holds for 3 consecutive ticks (the "never recovers on its own"
   # signature) does. Routed to the same AlertTopic the check-failure page
   # uses, since the check's own status always stays `pass` (the shed signal
-  # lives entirely in this metric, not in CheckFailure/UserFacingCheckFailure)
+  # lives entirely in this alarm, not in CheckFailure/UserFacingCheckFailure)
   # — this alarm is the only page path for this signal.
   #
-  # KNOWN LIMITATION (accepted, not volume-gated — see the docstring on
-  # `lmlDiscogsBreakerShed` in src/checks.ts and wxyc-canary#79): reading
-  # LML's `/health` never advances the breaker's recovery state machine —
-  # only a live `/lookup` call does. An overnight quiet period following a
-  # real OPEN trip can leave the breaker idle-latched `open`, and this alarm
-  # will page on that idle tail even though the next real lookup would
-  # likely recover it immediately. On a page, verify recovery via
-  # `api.discogs.com` spans resuming in Sentry (query `span.domain:*.discogs.com`
-  # — Sentry wildcard-normalizes the domain, so the literal subdomain filter
-  # returns zero rows even with live traffic), not via `/health` alone. A
-  # follow-up LML ticket to expose a read-only lookup-rate field on `/health`
-  # would let a future iteration gate this alarm on concurrent volume and
-  # remove the false-page risk.
+  # PutMetricAlarm acceptance of this expression is the item flagged as open
+  # in the wxyc-canary#84 PR — `sam validate`/`--lint` catch YAML-shape
+  # errors but not an API-layer rejection of the metric-math expression
+  # itself, per the org CLAUDE.md's SEARCH/metric-math caveat, so only a
+  # real deploy/changeset confirms it. If PutMetricAlarm rejects it, the
+  # documented fallback is a composite alarm ANDing a simple-form
+  # DiscogsBreakerShedding alarm with a second metric-math alarm on
+  # DIFF(DiscogsLiveRequestsTotal) > 0 (shape (b) in wxyc-canary#84).
+  #
+  # VOLUME GATE MECHANICS — how this kills the idle tail (wxyc-canary#84;
+  # previously an ACCEPTED, not handled, limitation — see the docstring on
+  # `lmlDiscogsBreakerShed` in src/checks.ts and wxyc-canary#79). Reading
+  # LML's `/health` never advances the breaker's `open -> half-open`
+  # recovery — only a live `/lookup` call does. An idle-latched breaker
+  # after an overnight quiet period has a FLAT DiscogsLiveRequestsTotal (no
+  # lookups => the `liveDelta` DIFF is 0 => the gate is false => no page). A
+  # real shed under load keeps DiscogsLiveRequestsTotal climbing (LML#940
+  # counts shed attempts too, not just admitted calls) => `liveDelta` > 0 =>
+  # gate true => still pages within ~15 min. DIFF (not `abs()`, not a bare
+  # `RATE`) also fails safe across an LML restart: the counter resets to 0,
+  # producing one negative-diff period that correctly reads as "no traffic,"
+  # masking a genuine ongoing shed for at most 1 of the 3 required periods.
+  #
+  # On a page, verify recovery via `api.discogs.com` spans resuming in
+  # Sentry (query `span.domain:*.discogs.com` — Sentry wildcard-normalizes
+  # the domain, so the literal subdomain filter returns zero rows even with
+  # live traffic), not via `/health` alone. See CLAUDE.md and
+  # docs/adding-a-check.md.
   DiscogsBreakerShedAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
       AlarmName: wxyc-canary-lml-discogs-breaker-shed
       AlarmDescription: >
-        LML's Discogs-saturation breaker has been shedding lookup traffic for
-        3 consecutive 5-minute checks (~15 min). Verify recovery via
+        LML's Discogs-saturation breaker has been shedding lookup traffic
+        AND live Discogs lookups are still flowing for 3 consecutive
+        5-minute checks (~15 min) — a flat live-request counter under
+        sustained shed (the idle tail) does not page. Verify recovery via
         api.discogs.com spans resuming in Sentry (span.domain:*.discogs.com),
-        not /health alone — an overnight idle period can idle-latch the
-        breaker `open` without live traffic. See CLAUDE.md and
-        docs/adding-a-check.md for the known idle-tail limitation.
-      Namespace: WXYC/Canary
-      MetricName: DiscogsBreakerShedding
-      Statistic: Maximum
-      Period: 300
+        not /health alone. See CLAUDE.md and docs/adding-a-check.md.
+      Metrics:
+        - Id: shed
+          MetricStat:
+            Metric:
+              Namespace: WXYC/Canary
+              MetricName: DiscogsBreakerShedding
+              Dimensions: []
+            Period: 300
+            Stat: Maximum
+          ReturnData: false
+        - Id: liveTotal
+          MetricStat:
+            Metric:
+              Namespace: WXYC/Canary
+              MetricName: DiscogsLiveRequestsTotal
+              Dimensions: []
+            Period: 300
+            Stat: Maximum
+          ReturnData: false
+        - Id: liveDelta
+          Expression: DIFF(liveTotal)
+          Label: DiscogsLiveRequestsDelta
+          ReturnData: false
+        - Id: sheddingWithTraffic
+          Expression: 'IF(shed >= 1 AND liveDelta > 0, 1, 0)'
+          Label: DiscogsBreakerSheddingWithTraffic
+          ReturnData: true
       EvaluationPeriods: 3
       DatapointsToAlarm: 3
       Threshold: 1
