@@ -605,11 +605,15 @@ const lmlDiscogsBreakerShed: Check = {
     const shedding = DISCOGS_BREAKER_SHEDDING_STATES.has(body.discogs_breaker_state);
     const metrics: NonNullable<CheckResult['metrics']> = { DiscogsBreakerShedding: shedding ? 1 : 0 };
     // discogs_live_requests_total (library-metadata-lookup#940): emit ONLY
-    // when it's a number. An older LML that doesn't return the field yet,
-    // or any other shape drift, abstains — see the docstring above for why
-    // a fabricated 0 would corrupt the alarm's DIFF().
-    if (typeof body.discogs_live_requests_total === 'number') {
-      metrics.DiscogsLiveRequestsTotal = body.discogs_live_requests_total;
+    // when it's a non-negative integer — the contract LML#940 guarantees for
+    // this monotonic counter. An older LML that doesn't return the field yet,
+    // or any shape/contract drift (missing, non-numeric, negative, or
+    // fractional), abstains — see the docstring above for why a fabricated or
+    // out-of-contract value would corrupt the alarm's DIFF() (e.g. a stray
+    // negative followed by a real value reads as a spurious positive delta).
+    const liveTotal = body.discogs_live_requests_total;
+    if (typeof liveTotal === 'number' && Number.isInteger(liveTotal) && liveTotal >= 0) {
+      metrics.DiscogsLiveRequestsTotal = liveTotal;
     }
     return { metrics };
   },

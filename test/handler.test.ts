@@ -1134,6 +1134,34 @@ describe('runCanary — lml-discogs-breaker-shed check (wxyc-canary#79)', () => 
     expect(shed.metrics && 'DiscogsLiveRequestsTotal' in shed.metrics).toBe(false);
   });
 
+  it('abstains on DiscogsLiveRequestsTotal when the field is a negative number (contract violation — LML#940 guarantees a non-negative counter)', async () => {
+    setUpHealthMock({
+      status: 200,
+      body: { status: 'ok', discogs_breaker_state: 'closed', discogs_live_requests_total: -7 },
+    });
+
+    const outcomes = await runCanary(breakerConfig);
+    const shed = outcomes.find((o) => o.name === 'lml-discogs-breaker-shed')!;
+
+    expect(shed.status).toBe('pass');
+    expect(shed.metrics?.DiscogsBreakerShedding).toBe(0);
+    expect(shed.metrics && 'DiscogsLiveRequestsTotal' in shed.metrics).toBe(false);
+  });
+
+  it('abstains on DiscogsLiveRequestsTotal when the field is a non-integer (contract violation — the counter is an integer)', async () => {
+    setUpHealthMock({
+      status: 200,
+      body: { status: 'ok', discogs_breaker_state: 'closed', discogs_live_requests_total: 3.5 },
+    });
+
+    const outcomes = await runCanary(breakerConfig);
+    const shed = outcomes.find((o) => o.name === 'lml-discogs-breaker-shed')!;
+
+    expect(shed.status).toBe('pass');
+    expect(shed.metrics?.DiscogsBreakerShedding).toBe(0);
+    expect(shed.metrics && 'DiscogsLiveRequestsTotal' in shed.metrics).toBe(false);
+  });
+
   it('abstains on DiscogsLiveRequestsTotal on a non-200 response (same indeterminate branch as DiscogsBreakerShedding)', async () => {
     setUpHealthMock({
       status: 503,
