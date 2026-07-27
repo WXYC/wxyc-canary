@@ -539,22 +539,30 @@ const DISCOGS_BREAKER_SHEDDING_STATES = new Set(['open', 'half-open']);
  * LML. LML availability itself is already a paging surface via
  * `proxy-library-search` and the dj-* checks.
  *
- * KNOWN LIMITATION — the idle-tail false positive (library-metadata-
- * lookup#939's own docs flag this; deliberately accepted here rather than
- * volume-gated — see wxyc-canary#79 for the full analysis). The breaker's
- * `open -> half-open` recovery transition (and the LML#787 watchdog) only
- * advance inside `allow_request()`, which only the live `/lookup` path
- * calls — reading `.state` via `/health` never advances it. So after a
- * genuine OPEN trip, if NO live Discogs lookups follow (an overnight quiet
- * window — cache-hit library searches do not count), `.state` stays
- * latched `open` and `/health` keeps reporting `discogs_breaker_state:
- * "open"` even though the next real lookup would likely recover it
- * immediately. The proper fix — gate the shed signal on concurrent lookup
- * volume — needs a read-only lookup-rate field `/health` does not expose
- * today; that's a follow-up LML ticket, not something this check should
- * work around by calling `/lookup` itself (which would spend the very
- * token bucket the breaker guards). Until that field exists, an overnight
- * idle-open can page after 3 ticks with zero concurrent user impact.
+ * VOLUME GATE (wxyc-canary#84) — the idle-tail false positive is now
+ * HANDLED, not accepted. The breaker's `open -> half-open` recovery
+ * transition (and the LML#787 watchdog) only advance inside
+ * `allow_request()`, which only the live `/lookup` path calls — reading
+ * `.state` via `/health` never advances it, so after a genuine OPEN trip
+ * with no live Discogs lookups following (an overnight quiet window —
+ * cache-hit library searches do not count), `.state` stays latched `open`
+ * indefinitely even though the next real lookup would likely recover it.
+ * This check also reads `discogs_live_requests_total`
+ * (library-metadata-lookup#940, merged to LML `main`) — a monotonic
+ * counter of live Discogs-request attempts, including breaker-shed ones —
+ * and emits it as `DiscogsLiveRequestsTotal`. The Lambda is stateless
+ * across ticks, so it cannot itself diff the counter; instead
+ * `DiscogsBreakerShedAlarm` in `template.yaml` computes `DIFF()` on the
+ * CloudWatch series and only pages when the breaker is shedding AND the
+ * counter is advancing — a flat counter under sustained shed (the idle
+ * tail) no longer pages. See that alarm's comment for the full mechanism.
+ * The total is emitted ONLY when the field is a `number`; on the three
+ * indeterminate branches above (network error / non-200 /
+ * missing-or-non-string `discogs_breaker_state`), the metric is omitted
+ * entirely (never a fabricated `0`) — a fabricated `0` would make
+ * `DIFF()` misread "LML just became reachable again" as a traffic spike.
+ * Backward-compatible: an LML that predates #940 simply never has the key
+ * in its `/health` body, which reads identically to "indeterminate" here.
  *
  * On-call response to this alarm: do NOT rely on `/health` alone to judge
  * recovery — verify via `api.discogs.com` spans resuming in Sentry
@@ -576,9 +584,10 @@ const lmlDiscogsBreakerShed: Check = {
       r = await canaryFetch(`${ctx.lmlUrl}/health`);
     } catch (err) {
       if (err instanceof CanaryFetchError) {
-        // LML never answered — breaker state is indeterminate, not
-        // shedding. LML availability is covered elsewhere (proxy-library-
-        // search, dj-* checks); this probe must not page on top of that.
+        // LML never answered — breaker state (and live-request volume) is
+        // indeterminate, not shedding. LML availability is covered
+        // elsewhere (proxy-library-search, dj-* checks); this probe must
+        // not page on top of that.
         return { metrics: { DiscogsBreakerShedding: 0 } };
       }
       throw err;
@@ -588,13 +597,21 @@ const lmlDiscogsBreakerShed: Check = {
       // branch above.
       return { metrics: { DiscogsBreakerShedding: 0 } };
     }
-    const body = r.body as { discogs_breaker_state?: unknown };
+    const body = r.body as { discogs_breaker_state?: unknown; discogs_live_requests_total?: unknown };
     if (!body || typeof body !== 'object' || typeof body.discogs_breaker_state !== 'string') {
       // Missing field, non-JSON body, or an unexpected type: indeterminate.
       return { metrics: { DiscogsBreakerShedding: 0 } };
     }
     const shedding = DISCOGS_BREAKER_SHEDDING_STATES.has(body.discogs_breaker_state);
-    return { metrics: { DiscogsBreakerShedding: shedding ? 1 : 0 } };
+    const metrics: NonNullable<CheckResult['metrics']> = { DiscogsBreakerShedding: shedding ? 1 : 0 };
+    // discogs_live_requests_total (library-metadata-lookup#940): emit ONLY
+    // when it's a number. An older LML that doesn't return the field yet,
+    // or any other shape drift, abstains — see the docstring above for why
+    // a fabricated 0 would corrupt the alarm's DIFF().
+    if (typeof body.discogs_live_requests_total === 'number') {
+      metrics.DiscogsLiveRequestsTotal = body.discogs_live_requests_total;
+    }
+    return { metrics };
   },
 };
 

@@ -916,6 +916,16 @@ describe('runCanary — lml-auth check (BS#1094 layer 1)', () => {
  * `closed`, a missing/non-string field, and a non-200 response all read 0
  * (not shedding / indeterminate). The tier-routing classification itself
  * (`pagesOncall: true`) is pinned in `test/checks.test.ts`.
+ *
+ * wxyc-canary#84 adds a second metric, `DiscogsLiveRequestsTotal`, read
+ * from the same `/health` body's `discogs_live_requests_total`
+ * (library-metadata-lookup#940) — a monotonic counter of live
+ * Discogs-request attempts, including breaker-shed ones. It's emitted
+ * ONLY when the field is a `number`; every indeterminate branch (network
+ * error, non-200, or a missing/non-string `discogs_breaker_state`) omits
+ * the metric key entirely rather than fabricating a `0` — the alarm-side
+ * `DIFF()` would otherwise misread "LML just became reachable again" as a
+ * traffic spike.
  */
 describe('runCanary — lml-discogs-breaker-shed check (wxyc-canary#79)', () => {
   const breakerConfig: CanaryConfig = {
@@ -1066,6 +1076,108 @@ describe('runCanary — lml-discogs-breaker-shed check (wxyc-canary#79)', () => 
 
     expect(shed.status).toBe('pass');
     expect(shed.metrics?.DiscogsBreakerShedding).toBe(0);
+  });
+
+  it('emits DiscogsLiveRequestsTotal when /health returns a numeric field, alongside DiscogsBreakerShedding (wxyc-canary#84)', async () => {
+    setUpHealthMock({
+      status: 200,
+      body: { status: 'degraded', discogs_breaker_state: 'open', discogs_live_requests_total: 4231 },
+    });
+
+    const outcomes = await runCanary(breakerConfig);
+    const shed = outcomes.find((o) => o.name === 'lml-discogs-breaker-shed')!;
+
+    expect(shed.status).toBe('pass');
+    expect(shed.metrics?.DiscogsBreakerShedding).toBe(1);
+    expect(shed.metrics?.DiscogsLiveRequestsTotal).toBe(4231);
+  });
+
+  it('emits DiscogsLiveRequestsTotal as 0 when LML reports a real zero — a genuine 0 is not the same as abstaining', async () => {
+    setUpHealthMock({
+      status: 200,
+      body: { status: 'ok', discogs_breaker_state: 'closed', discogs_live_requests_total: 0 },
+    });
+
+    const outcomes = await runCanary(breakerConfig);
+    const shed = outcomes.find((o) => o.name === 'lml-discogs-breaker-shed')!;
+
+    expect(shed.status).toBe('pass');
+    expect(shed.metrics?.DiscogsBreakerShedding).toBe(0);
+    expect(shed.metrics?.DiscogsLiveRequestsTotal).toBe(0);
+  });
+
+  it('abstains on DiscogsLiveRequestsTotal (no key emitted) when the field is missing from an otherwise-determinate response', async () => {
+    setUpHealthMock({
+      status: 200,
+      body: { status: 'ok', discogs_breaker_state: 'closed' },
+    });
+
+    const outcomes = await runCanary(breakerConfig);
+    const shed = outcomes.find((o) => o.name === 'lml-discogs-breaker-shed')!;
+
+    expect(shed.status).toBe('pass');
+    expect(shed.metrics?.DiscogsBreakerShedding).toBe(0);
+    expect(shed.metrics && 'DiscogsLiveRequestsTotal' in shed.metrics).toBe(false);
+  });
+
+  it('abstains on DiscogsLiveRequestsTotal when the field is present but non-numeric', async () => {
+    setUpHealthMock({
+      status: 200,
+      body: { status: 'ok', discogs_breaker_state: 'closed', discogs_live_requests_total: 'not-a-number' },
+    });
+
+    const outcomes = await runCanary(breakerConfig);
+    const shed = outcomes.find((o) => o.name === 'lml-discogs-breaker-shed')!;
+
+    expect(shed.status).toBe('pass');
+    expect(shed.metrics?.DiscogsBreakerShedding).toBe(0);
+    expect(shed.metrics && 'DiscogsLiveRequestsTotal' in shed.metrics).toBe(false);
+  });
+
+  it('abstains on DiscogsLiveRequestsTotal on a non-200 response (same indeterminate branch as DiscogsBreakerShedding)', async () => {
+    setUpHealthMock({
+      status: 503,
+      body: { discogs_live_requests_total: 999 },
+    });
+
+    const outcomes = await runCanary(breakerConfig);
+    const shed = outcomes.find((o) => o.name === 'lml-discogs-breaker-shed')!;
+
+    expect(shed.status).toBe('pass');
+    expect(shed.metrics?.DiscogsBreakerShedding).toBe(0);
+    expect(shed.metrics && 'DiscogsLiveRequestsTotal' in shed.metrics).toBe(false);
+  });
+
+  it('abstains on DiscogsLiveRequestsTotal on a network error (same indeterminate branch as DiscogsBreakerShedding)', async () => {
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const urlString = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      if (urlString.includes('lml.example.test/health')) {
+        throw new TypeError('fetch failed');
+      }
+      return new Response(`unmatched mock for ${urlString}`, { status: 599 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const outcomes = await runCanary(breakerConfig);
+    const shed = outcomes.find((o) => o.name === 'lml-discogs-breaker-shed')!;
+
+    expect(shed.status).toBe('pass');
+    expect(shed.metrics?.DiscogsBreakerShedding).toBe(0);
+    expect(shed.metrics && 'DiscogsLiveRequestsTotal' in shed.metrics).toBe(false);
+  });
+
+  it('abstains on DiscogsLiveRequestsTotal when discogs_breaker_state itself is missing, even if the counter field is present and numeric', async () => {
+    setUpHealthMock({
+      status: 200,
+      body: { status: 'ok', discogs_live_requests_total: 55 },
+    });
+
+    const outcomes = await runCanary(breakerConfig);
+    const shed = outcomes.find((o) => o.name === 'lml-discogs-breaker-shed')!;
+
+    expect(shed.status).toBe('pass');
+    expect(shed.metrics?.DiscogsBreakerShedding).toBe(0);
+    expect(shed.metrics && 'DiscogsLiveRequestsTotal' in shed.metrics).toBe(false);
   });
 });
 
@@ -1816,6 +1928,64 @@ describe('publishMetrics — dimensioned + dimensionless emit-twice', () => {
     expect(metricData.filter((d) => d.MetricName === 'CheckSkipped')).toHaveLength(13);
     expect(metricData.filter((d) => d.MetricName === 'CheckLatency')).toHaveLength(13);
   });
+
+  // wxyc-canary#84: DiscogsLiveRequestsTotal follows the same custom-metric
+  // emit-twice convention as DiscogsBreakerShedding — the alarm-side gate
+  // (DiscogsBreakerShedAlarm) reads the dimensionless copy via DIFF(); the
+  // dimensioned copy is a #78-acknowledged cardinality cost, not something
+  // any alarm targets (see CLAUDE.md / template.yaml comment).
+  it('emits DiscogsLiveRequestsTotal dimensioned + dimensionless when /health returns a numeric field', async () => {
+    setUpFetchMock({
+      '/healthcheck': { status: 200, body: { ok: true } },
+      '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+      '/graph/artists/search': { status: 200, body: { results: [{ id: 97426, canonical_name: 'stereolab' }] } },
+      'explore.example.test/health': {
+        status: 200,
+        body: { status: 'healthy', artist_count: 136_702, graph_db_age_seconds: 3_600 },
+      },
+      'library-metadata-lookup-production.up.railway.app/health': {
+        status: 200,
+        body: { status: 'ok', discogs_breaker_state: 'closed', discogs_live_requests_total: 812 },
+      },
+    });
+
+    await handler();
+
+    const totalMetrics = getPublishedMetrics().filter((d) => d.MetricName === 'DiscogsLiveRequestsTotal');
+    const dimensioned = totalMetrics.filter((d) => d.Dimensions && d.Dimensions.length > 0);
+    const dimensionless = totalMetrics.filter((d) => !d.Dimensions || d.Dimensions.length === 0);
+
+    expect(dimensioned).toHaveLength(1);
+    expect(dimensionless).toHaveLength(1);
+    expect(dimensioned[0]!.Dimensions![0]!).toEqual({ Name: 'Check', Value: 'lml-discogs-breaker-shed' });
+    expect(dimensioned[0]!.Value).toBe(812);
+    expect(dimensionless[0]!.Value).toBe(812);
+  });
+
+  // Mirrors the EnrichmentLagSeconds "does NOT emit" pin below: an older
+  // LML that doesn't return discogs_live_requests_total yet (or any of the
+  // other indeterminate branches) must not fabricate a datapoint at all —
+  // a missing metric reads as "no data" to the alarm's DIFF(), not a false
+  // traffic reading.
+  it('does NOT emit DiscogsLiveRequestsTotal when /health omits the field (older LML, backward-compatible abstain)', async () => {
+    setUpFetchMock({
+      '/healthcheck': { status: 200, body: { ok: true } },
+      '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+      '/graph/artists/search': { status: 200, body: { results: [{ id: 97426, canonical_name: 'stereolab' }] } },
+      'explore.example.test/health': {
+        status: 200,
+        body: { status: 'healthy', artist_count: 136_702, graph_db_age_seconds: 3_600 },
+      },
+      'library-metadata-lookup-production.up.railway.app/health': {
+        status: 200,
+        body: { status: 'ok', discogs_breaker_state: 'closed' },
+      },
+    });
+
+    await handler();
+
+    expect(getPublishedMetrics().filter((d) => d.MetricName === 'DiscogsLiveRequestsTotal')).toHaveLength(0);
+  });
 });
 
 /**
@@ -2317,6 +2487,21 @@ function setUpEnrichmentHappyPathMock(): ReturnType<typeof setUpMethodAwareMock>
       method: 'GET',
       pattern: 'explore.example.test/health',
       responses: [{ status: 200, body: { status: 'healthy', artist_count: 136_702, graph_db_age_seconds: 3_600 } }],
+    },
+    // lml-discogs-breaker-shed polls LML's /health too, on the default
+    // production LML URL (no CANARY_LML_URL override in this suite). A
+    // numeric discogs_live_requests_total here is required for the
+    // `template.yaml ↔ publishMetrics contract` test (wxyc-canary#84): the
+    // DiscogsBreakerShedAlarm's metric-math expression references the
+    // dimensionless DiscogsLiveRequestsTotal series, so at least one run in
+    // this suite must actually emit it or the contract test's "every alarm
+    // targets an emitted shape" assertion has nothing to match.
+    {
+      method: 'GET',
+      pattern: 'library-metadata-lookup-production.up.railway.app/health',
+      responses: [
+        { status: 200, body: { status: 'ok', discogs_breaker_state: 'closed', discogs_live_requests_total: 128 } },
+      ],
     },
     { method: 'GET', pattern: '/proxy/library/search', responses: [{ status: 200, body: proxyLibrarySearchResponse }] },
     {
