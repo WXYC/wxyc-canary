@@ -411,6 +411,56 @@ Resources:
       OKActions:
         - !Ref AlertTopic
 
+  # Discogs-breaker sustained-shed alarm (wxyc-canary#79). Targets the
+  # dimensionless DiscogsBreakerShedding series the lml-discogs-breaker-shed
+  # check emits (0/1 gauge — Count unit, no *Seconds/*Milliseconds suffix).
+  # Unlike the shared page alarm's 2-of-3, this is 3-of-3: a breaker
+  # legitimately trips OPEN for a window or two during real Discogs
+  # saturation, and that must NOT page; only a shed that holds for 3
+  # consecutive 5-minute ticks (~15 min — the "never recovers on its own"
+  # signature) does. Routed to the same AlertTopic the check-failure page
+  # uses, since the check's own status always stays `pass` (the shed signal
+  # lives entirely in this metric, not in CheckFailure/UserFacingCheckFailure)
+  # — this alarm is the only page path for this signal.
+  #
+  # KNOWN LIMITATION (accepted, not volume-gated — see the docstring on
+  # `lmlDiscogsBreakerShed` in src/checks.ts and wxyc-canary#79): reading
+  # LML's `/health` never advances the breaker's recovery state machine —
+  # only a live `/lookup` call does. An overnight quiet period following a
+  # real OPEN trip can leave the breaker idle-latched `open`, and this alarm
+  # will page on that idle tail even though the next real lookup would
+  # likely recover it immediately. On a page, verify recovery via
+  # `api.discogs.com` spans resuming in Sentry (query `span.domain:*.discogs.com`
+  # — Sentry wildcard-normalizes the domain, so the literal subdomain filter
+  # returns zero rows even with live traffic), not via `/health` alone. A
+  # follow-up LML ticket to expose a read-only lookup-rate field on `/health`
+  # would let a future iteration gate this alarm on concurrent volume and
+  # remove the false-page risk.
+  DiscogsBreakerShedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: wxyc-canary-lml-discogs-breaker-shed
+      AlarmDescription: >
+        LML's Discogs-saturation breaker has been shedding lookup traffic for
+        3 consecutive 5-minute checks (~15 min). Verify recovery via
+        api.discogs.com spans resuming in Sentry (span.domain:*.discogs.com),
+        not /health alone — an overnight idle period can idle-latch the
+        breaker `open` without live traffic. See CLAUDE.md and
+        docs/adding-a-check.md for the known idle-tail limitation.
+      Namespace: WXYC/Canary
+      MetricName: DiscogsBreakerShedding
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+      OKActions:
+        - !Ref AlertTopic
+
   # Catches the case where the Lambda itself fails to run (timeout, crash
   # before reaching the metric publish, etc). Without this, a Lambda that
   # never publishes metrics would let the check-failure and infra-degraded

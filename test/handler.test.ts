@@ -196,6 +196,13 @@ describe('runCanary — anonymous-only configuration', () => {
         status: 200,
         body: { status: 'healthy', artist_count: 136_702, graph_db_age_seconds: 3_600 },
       },
+      // `lml-discogs-breaker-shed` polls LML's `/health` too, on the default
+      // production LML URL (`baseConfig` leaves `lmlUrl` unset). Host-qualified
+      // so it can't be shadowed by another `/health` pattern.
+      'library-metadata-lookup-production.up.railway.app/health': {
+        status: 200,
+        body: { status: 'ok', discogs_breaker_state: 'closed' },
+      },
     });
   });
 
@@ -203,14 +210,19 @@ describe('runCanary — anonymous-only configuration', () => {
     vi.unstubAllGlobals();
   });
 
-  it('passes the 3 truly-anonymous checks and skips the 9 conditional checks when no credentials are configured', async () => {
+  it('passes the 4 truly-anonymous checks and skips the 9 conditional checks when no credentials are configured', async () => {
     const outcomes = await runCanary(baseConfig);
 
-    expect(outcomes).toHaveLength(12);
+    expect(outcomes).toHaveLength(13);
     const byName = Object.fromEntries(outcomes.map((o) => [o.name, o]));
     expect(byName['backend-healthcheck'].status).toBe('pass');
     expect(byName['semantic-index-search'].status).toBe('pass');
     expect(byName['semantic-index-freshness'].status).toBe('pass');
+    // `lml-discogs-breaker-shed` requires no auth either — it always passes,
+    // carrying the shed signal in the DiscogsBreakerShedding metric rather
+    // than in the check's own status (see src/checks.ts docstring).
+    expect(byName['lml-discogs-breaker-shed'].status).toBe('pass');
+    expect(byName['lml-discogs-breaker-shed'].metrics?.DiscogsBreakerShedding).toBe(0);
     expect(byName['proxy-library-search'].status).toBe('skipped');
     expect(byName['dj-library-search'].status).toBe('skipped');
     expect(byName['dj-flowsheet-read'].status).toBe('skipped');
@@ -894,6 +906,170 @@ describe('runCanary — lml-auth check (BS#1094 layer 1)', () => {
 });
 
 /**
+ * `lml-discogs-breaker-shed` (wxyc-canary#79) detects when LML's Discogs-
+ * saturation breaker is shedding lookup traffic, via the
+ * `discogs_breaker_state` field library-metadata-lookup#939 added to
+ * `GET /health`. Unlike every other check, its own pass/fail status never
+ * reflects the breaker state — it always `pass`es and carries the shed
+ * signal in the `DiscogsBreakerShedding` metric (0 or 1). These tests pin
+ * the value matrix: `open` and `half-open` both read 1 (shedding);
+ * `closed`, a missing/non-string field, and a non-200 response all read 0
+ * (not shedding / indeterminate). The tier-routing classification itself
+ * (`pagesOncall: true`) is pinned in `test/checks.test.ts`.
+ */
+describe('runCanary — lml-discogs-breaker-shed check (wxyc-canary#79)', () => {
+  const breakerConfig: CanaryConfig = {
+    ...baseConfig,
+    lmlUrl: 'https://lml.example.test',
+  };
+
+  function setUpHealthMock(health: { status: number; body: unknown }) {
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const urlString = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      if (urlString.includes('lml.example.test/health')) {
+        return new Response(typeof health.body === 'string' ? health.body : JSON.stringify(health.body), {
+          status: health.status,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return new Response(`unmatched mock for ${urlString}`, { status: 599 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    return fetchMock;
+  }
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('reads 1 (shedding) when discogs_breaker_state is "open"', async () => {
+    setUpHealthMock({
+      status: 200,
+      body: { status: 'degraded', discogs_breaker_state: 'open', services: { discogs_api: 'rate-limited' } },
+    });
+
+    const outcomes = await runCanary(breakerConfig);
+    const shed = outcomes.find((o) => o.name === 'lml-discogs-breaker-shed')!;
+
+    expect(shed.status).toBe('pass');
+    expect(shed.metrics?.DiscogsBreakerShedding).toBe(1);
+  });
+
+  it('reads 1 (shedding) when discogs_breaker_state is "half-open" (the breaker\'s own trial call still sheds everyone else)', async () => {
+    setUpHealthMock({
+      status: 200,
+      body: { status: 'degraded', discogs_breaker_state: 'half-open' },
+    });
+
+    const outcomes = await runCanary(breakerConfig);
+    const shed = outcomes.find((o) => o.name === 'lml-discogs-breaker-shed')!;
+
+    expect(shed.status).toBe('pass');
+    expect(shed.metrics?.DiscogsBreakerShedding).toBe(1);
+  });
+
+  it('reads 0 when discogs_breaker_state is "closed" (healthy)', async () => {
+    setUpHealthMock({
+      status: 200,
+      body: { status: 'ok', discogs_breaker_state: 'closed', services: { discogs_api: 'ok' } },
+    });
+
+    const outcomes = await runCanary(breakerConfig);
+    const shed = outcomes.find((o) => o.name === 'lml-discogs-breaker-shed')!;
+
+    expect(shed.status).toBe('pass');
+    expect(shed.metrics?.DiscogsBreakerShedding).toBe(0);
+  });
+
+  it('reads 0 when discogs_breaker_state is null (Discogs unconfigured — never expected on prod, but must not misread as shedding)', async () => {
+    setUpHealthMock({
+      status: 200,
+      body: { status: 'ok', discogs_breaker_state: null },
+    });
+
+    const outcomes = await runCanary(breakerConfig);
+    const shed = outcomes.find((o) => o.name === 'lml-discogs-breaker-shed')!;
+
+    expect(shed.status).toBe('pass');
+    expect(shed.metrics?.DiscogsBreakerShedding).toBe(0);
+  });
+
+  it('reads 0 (indeterminate) when discogs_breaker_state is missing from the response', async () => {
+    setUpHealthMock({
+      status: 200,
+      body: { status: 'ok' },
+    });
+
+    const outcomes = await runCanary(breakerConfig);
+    const shed = outcomes.find((o) => o.name === 'lml-discogs-breaker-shed')!;
+
+    expect(shed.status).toBe('pass');
+    expect(shed.metrics?.DiscogsBreakerShedding).toBe(0);
+  });
+
+  it('reads 0 (indeterminate) on a non-200 response — does not page on inability to read LML', async () => {
+    setUpHealthMock({
+      status: 503,
+      body: { error: 'service unavailable' },
+    });
+
+    const outcomes = await runCanary(breakerConfig);
+    const shed = outcomes.find((o) => o.name === 'lml-discogs-breaker-shed')!;
+
+    expect(shed.status).toBe('pass');
+    expect(shed.metrics?.DiscogsBreakerShedding).toBe(0);
+  });
+
+  it('reads 0 (indeterminate) on unparseable JSON — does not throw', async () => {
+    setUpHealthMock({
+      status: 200,
+      body: 'not json',
+    });
+
+    const outcomes = await runCanary(breakerConfig);
+    const shed = outcomes.find((o) => o.name === 'lml-discogs-breaker-shed')!;
+
+    expect(shed.status).toBe('pass');
+    expect(shed.metrics?.DiscogsBreakerShedding).toBe(0);
+  });
+
+  it('reads 0 (indeterminate) on a network error — does not throw or fail the check', async () => {
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const urlString = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      if (urlString.includes('lml.example.test/health')) {
+        throw new TypeError('fetch failed');
+      }
+      return new Response(`unmatched mock for ${urlString}`, { status: 599 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const outcomes = await runCanary(breakerConfig);
+    const shed = outcomes.find((o) => o.name === 'lml-discogs-breaker-shed')!;
+
+    expect(shed.status).toBe('pass');
+    expect(shed.metrics?.DiscogsBreakerShedding).toBe(0);
+  });
+
+  it('requires no auth — runs and passes with no DJ credentials and no LML_API_KEY configured', async () => {
+    setUpHealthMock({
+      status: 200,
+      body: { status: 'ok', discogs_breaker_state: 'closed' },
+    });
+
+    const outcomes = await runCanary({
+      backendUrl: breakerConfig.backendUrl,
+      authUrl: breakerConfig.authUrl,
+      semanticIndexUrl: breakerConfig.semanticIndexUrl,
+      lmlUrl: breakerConfig.lmlUrl,
+    });
+    const shed = outcomes.find((o) => o.name === 'lml-discogs-breaker-shed')!;
+
+    expect(shed.status).toBe('pass');
+    expect(shed.metrics?.DiscogsBreakerShedding).toBe(0);
+  });
+});
+
+/**
  * `gha-runner-online` is the liveness probe for the EC2-hosted self-hosted
  * GitHub Actions runner that backs the staging-gate suites (Backend-Service,
  * library-metadata-lookup, dj-site). Wired up as part of WXYC/wiki#80
@@ -1572,9 +1748,9 @@ describe('publishMetrics — dimensioned + dimensionless emit-twice', () => {
     const dimensioned = checkFailureData.filter((d) => d.Dimensions && d.Dimensions.length > 0);
     const dimensionless = checkFailureData.filter((d) => !d.Dimensions || d.Dimensions.length === 0);
 
-    // Twelve checks, each contributes one dimensioned and one dimensionless datapoint.
-    expect(dimensioned).toHaveLength(12);
-    expect(dimensionless).toHaveLength(12);
+    // Thirteen checks, each contributes one dimensioned and one dimensionless datapoint.
+    expect(dimensioned).toHaveLength(13);
+    expect(dimensionless).toHaveLength(13);
     // Without an inducer, every value is 0 (passes + skips).
     expect(dimensioned.every((d) => d.Value === 0)).toBe(true);
     expect(dimensionless.every((d) => d.Value === 0)).toBe(true);
@@ -1612,7 +1788,7 @@ describe('publishMetrics — dimensioned + dimensionless emit-twice', () => {
     // isn't enough — `Statistic: Maximum` on the alarm needs at least one
     // `1` in the window, so this asserts the count of 1s explicitly.
     expect(dimensionless.filter((d) => d.Value === 1)).toHaveLength(1);
-    expect(dimensionless.filter((d) => d.Value === 0)).toHaveLength(11);
+    expect(dimensionless.filter((d) => d.Value === 0)).toHaveLength(12);
   });
 
   // `CheckSkipped` and `CheckLatency` are dashboard data, not alarm inputs.
@@ -1637,8 +1813,8 @@ describe('publishMetrics — dimensioned + dimensionless emit-twice', () => {
     expect(metricData.filter((d) => d.MetricName === 'CheckSkipped' && isDimensionless(d))).toHaveLength(0);
     expect(metricData.filter((d) => d.MetricName === 'CheckLatency' && isDimensionless(d))).toHaveLength(0);
     // Sanity: the dimensioned series for each is present (one per check).
-    expect(metricData.filter((d) => d.MetricName === 'CheckSkipped')).toHaveLength(12);
-    expect(metricData.filter((d) => d.MetricName === 'CheckLatency')).toHaveLength(12);
+    expect(metricData.filter((d) => d.MetricName === 'CheckSkipped')).toHaveLength(13);
+    expect(metricData.filter((d) => d.MetricName === 'CheckLatency')).toHaveLength(13);
   });
 });
 
@@ -1887,10 +2063,10 @@ describe('publishMetrics — tier split (UserFacingCheckFailure / InfraCheckFail
     await handler();
     const metrics = getPublishedMetrics();
 
-    // 10 paging checks (9 user-facing + enrichment-quality), 2 infra checks
+    // 11 paging checks (10 user-facing + enrichment-quality), 2 infra checks
     // (gha-runner-online, semantic-index-freshness); every aggregate datum is
     // dimensionless and 0.
-    expect(tierValues(metrics, 'UserFacingCheckFailure')).toHaveLength(10);
+    expect(tierValues(metrics, 'UserFacingCheckFailure')).toHaveLength(11);
     expect(tierValues(metrics, 'InfraCheckFailure')).toHaveLength(2);
     expect(tierMax(metrics, 'UserFacingCheckFailure')).toBe(0);
     expect(tierMax(metrics, 'InfraCheckFailure')).toBe(0);
