@@ -431,14 +431,18 @@ Resources:
   # lives entirely in this alarm, not in CheckFailure/UserFacingCheckFailure)
   # — this alarm is the only page path for this signal.
   #
-  # PutMetricAlarm acceptance of this expression is the item flagged as open
-  # in the wxyc-canary#84 PR — `sam validate`/`--lint` catch YAML-shape
-  # errors but not an API-layer rejection of the metric-math expression
-  # itself, per the org CLAUDE.md's SEARCH/metric-math caveat, so only a
-  # real deploy/changeset confirms it. If PutMetricAlarm rejects it, the
-  # documented fallback is a composite alarm ANDing a simple-form
-  # DiscogsBreakerShedding alarm with a second metric-math alarm on
-  # DIFF(DiscogsLiveRequestsTotal) > 0 (shape (b) in wxyc-canary#84).
+  # PutMetricAlarm acceptance of this expression is VERIFIED (wxyc-canary#84,
+  # 2026-07-27): a throwaway probe alarm carrying this exact `Metrics:` array
+  # was created, read back, and deleted against the deploy account (503977661500,
+  # us-east-1), and PutMetricAlarm accepted it. The org CLAUDE.md SEARCH/metric-
+  # math caveat does NOT apply here — it's about `SUM(SEARCH(...))` cross-
+  # dimension aggregation, not a fixed two-metric `IF`/`DIFF` expression like
+  # this one. (`sam validate`/`--lint` can't confirm this class of acceptance,
+  # which is why the probe stood in for a deploy.) If this expression is ever
+  # CHANGED, re-verify the same way; the documented fallback is a composite
+  # alarm ANDing a simple-form DiscogsBreakerShedding alarm with a second
+  # metric-math alarm on DIFF(DiscogsLiveRequestsTotal) > 0 (shape (b) in
+  # wxyc-canary#84).
   #
   # VOLUME GATE MECHANICS — how this kills the idle tail (wxyc-canary#84;
   # previously an ACCEPTED, not handled, limitation — see the docstring on
