@@ -629,9 +629,21 @@ const lmlDiscogsBreakerShed: Check = {
  * Probe: `GET /orgs/{org}/actions/runners/{id}` with a fine-scoped PAT.
  * Pass on `status === "online"`. Fail on any other status (`offline`
  * is the spec's primary failure mode), 404 (runner id no longer exists
- * after a host replacement that didn't re-set the stack parameter),
- * 401/403 (PAT rotation drift), or 5xx (GitHub itself degraded — rare
- * but distinct enough to surface separately).
+ * after a host replacement that didn't re-set the stack parameter), or
+ * 401/403 (PAT rotation drift) — all three are determinate, WXYC-
+ * actionable verdicts.
+ *
+ * A GitHub-API 5xx — or a network error/timeout reaching github.com —
+ * is NOT one of those: it means GitHub itself couldn't answer, which
+ * says nothing about the runner's liveness. Both abstain (`skipped`,
+ * indeterminate) instead of failing (wxyc-canary#86; mirrors the
+ * `lml-auth` abstain-on-indeterminate pattern from wxyc-canary#58). The
+ * real signal is fully preserved: a genuinely-offline runner still
+ * returns HTTP 200 with `{"status":"offline"}`, which still fails.
+ * Trade-off accepted: a prolonged GitHub outage masks a genuinely-
+ * offline runner for its duration — this is infra-tier / low-urgency,
+ * and a truly-dead runner resurfaces the moment GitHub recovers (200 +
+ * `offline`).
  *
  * This check is infra-tier (`pagesOncall: false`, see below), so its
  * failures feed the low-urgency `wxyc-canary-infra-degraded` alarm — NOT
@@ -641,10 +653,11 @@ const lmlDiscogsBreakerShed: Check = {
  * shape of the page alarm, just on the infra series.
  *
  * Skip semantics mirror `lml-auth` / DJ credentials: missing PAT or
- * runner-id is an operator gap (alarm stays quiet), but a downstream
- * resolution error fails (real signal — surfaced on the low-urgency
- * `wxyc-canary-infra-degraded` alarm, not the page, since this check is
- * `pagesOncall: false`).
+ * runner-id is an operator gap (alarm stays quiet); a 404/401/403 or a
+ * downstream credential-resolution error fails (real signal — surfaced
+ * on the low-urgency `wxyc-canary-infra-degraded` alarm, not the page,
+ * since this check is `pagesOncall: false`); a GitHub 5xx or an
+ * unreachable github.com abstains (skipped) as described above.
  */
 const ghaRunnerOnline: Check = {
   name: 'gha-runner-online',
@@ -690,13 +703,26 @@ const ghaRunnerOnline: Check = {
     // "runner replaced" runbook.
     const apiBase = ctx.ghaRunnerApiBase.replace(/\/+$/, '');
     const url = `${apiBase}/orgs/${ctx.ghaRunnerOrg}/actions/runners/${ctx.ghaRunnerId}`;
-    const r = await canaryFetch(url, {
-      headers: {
-        Authorization: `Bearer ${ctx.ghaRunnerToken}`,
-        Accept: 'application/vnd.github+json',
-        'X-GitHub-Api-Version': '2022-11-28',
-      },
-    });
+    let r: FetchResult;
+    try {
+      r = await canaryFetch(url, {
+        headers: {
+          Authorization: `Bearer ${ctx.ghaRunnerToken}`,
+          Accept: 'application/vnd.github+json',
+          'X-GitHub-Api-Version': '2022-11-28',
+        },
+      });
+    } catch (err) {
+      if (err instanceof CanaryFetchError) {
+        // github.com never answered (network error or timeout) — exactly
+        // as indeterminate as the 5xx branch below, same abstain rationale.
+        return {
+          skipped: true,
+          skipReason: `GitHub did not answer the runner-liveness probe (${err.message}); runner status indeterminate`,
+        };
+      }
+      throw err;
+    }
     if (r.status === 404) {
       // Runner id no longer exists — the operator replaced the host and
       // did not re-set the CFN parameter. Distinct from "offline" so the
@@ -738,13 +764,18 @@ const ghaRunnerOnline: Check = {
       );
     }
     if (r.status >= 500) {
-      // GitHub itself is degraded. Route the on-call to githubstatus.com
-      // before they SSH the runner or rotate the PAT — the runner has
-      // nothing to do with this failure. The docstring above promised this
-      // would be a distinct surface; here it actually is.
-      throw new Error(
-        `GitHub API degraded (status ${r.status}) — check githubstatus.com before investigating the runner: ${r.rawText.slice(0, 200)}`
-      );
+      // GitHub itself is degraded — the probe simply couldn't get an
+      // answer, which says nothing about the runner's liveness. Abstain
+      // rather than fail: a `fail` here would trip both the low-urgency
+      // infra-degraded alarm and (via the handler's unconditional throw
+      // on any failed check) the page-tier lambda-errors alarm, for a
+      // condition with zero WXYC signal. A genuinely-offline runner still
+      // returns HTTP 200 with {"status":"offline"} (see below), so that
+      // real signal is fully preserved (wxyc-canary#86).
+      return {
+        skipped: true,
+        skipReason: `GitHub API degraded (status ${r.status}) — indeterminate, cannot verify runner liveness; check githubstatus.com: ${r.rawText.slice(0, 200)}`,
+      };
     }
     if (!r.ok) {
       throw new Error(`expected 2xx from GitHub runner endpoint, got ${r.status}: ${r.rawText.slice(0, 200)}`);
