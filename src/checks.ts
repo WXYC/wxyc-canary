@@ -620,6 +620,24 @@ const lmlDiscogsBreakerShed: Check = {
 };
 
 /**
+ * Shared `skipped` result for every GitHub rate-limit shape the runner-
+ * liveness probe can hit (403-primary/secondary and bare 429). All are the
+ * same "GitHub couldn't answer this cycle" class as the 5xx / network-error
+ * abstain (wxyc-canary#86): the probe never got a runner-liveness verdict, so
+ * it abstains rather than failing (wxyc-canary#88). `waitHint` carries whatever
+ * wait-time signal GitHub supplied — the `X-RateLimit-Reset` epoch on a 403,
+ * the `Retry-After` seconds on a 429 — so the two call sites can't drift.
+ * Phrased to keep the on-call away from PAT-rotation: the PAT is valid; the
+ * bucket needs to refill.
+ */
+function githubRateLimitSkip(rawText: string, waitHint: string): CheckResult {
+  return {
+    skipped: true,
+    skipReason: `GitHub rate limit exceeded${waitHint} — wait for the bucket to reset; the PAT is valid: ${rawText.slice(0, 200)}`,
+  };
+}
+
+/**
  * Liveness probe for the EC2-hosted self-hosted GitHub Actions runner
  * (label `e2e-runner`) that backs the staging-gate suites in
  * Backend-Service, library-metadata-lookup, and dj-site. Wired up as
@@ -754,20 +772,16 @@ const ghaRunnerOnline: Check = {
       const remaining = r.headers?.['x-ratelimit-remaining'];
       const bodyText = r.rawText.toLowerCase();
       if (remaining === '0' || bodyText.includes('rate limit') || bodyText.includes('secondary rate')) {
-        const reset = r.headers?.['x-ratelimit-reset'];
-        const resetSuffix = reset ? ` (reset epoch ${reset})` : '';
         // A rate-limit is the same "GitHub couldn't answer" class as the
         // 5xx / network-error abstain below (wxyc-canary#86): the probe
         // never got a runner-liveness verdict this cycle, so it abstains
         // rather than failing (wxyc-canary#88, option (a) — see also the
         // bare-429 branch below, which covers the secondary-rate-limit
-        // shape that skips this 403 wrapper entirely). Phrased to keep the
-        // on-call away from PAT-rotation actions: the PAT is valid; the
-        // bucket needs to refill.
-        return {
-          skipped: true,
-          skipReason: `GitHub rate limit exceeded${resetSuffix} — wait for the bucket to reset; the PAT is valid: ${r.rawText.slice(0, 200)}`,
-        };
+        // shape that skips this 403 wrapper entirely). Surface the
+        // `X-RateLimit-Reset` epoch as the wait-time hint when GitHub
+        // supplies it.
+        const reset = r.headers?.['x-ratelimit-reset'];
+        return githubRateLimitSkip(r.rawText, reset ? ` (reset epoch ${reset})` : '');
       }
       throw new Error(
         `GitHub rejected PAT with 403 — rotate the runner-liveness PAT in SSM: ${r.rawText.slice(0, 200)}`
@@ -787,10 +801,12 @@ const ghaRunnerOnline: Check = {
       // `Retry-After` header. Same indeterminate-abstain rationale as the
       // 403-rate-limit branch above and the 5xx branch below
       // (wxyc-canary#88): the probe never got a runner-liveness verdict.
-      return {
-        skipped: true,
-        skipReason: `GitHub rate limit exceeded (429) — wait for the bucket to reset; the PAT is valid: ${r.rawText.slice(0, 200)}`,
-      };
+      // Surface the parsed `Retry-After` seconds (via the typed
+      // `retryAfterMs` accessor — wxyc-canary#64) as the wait-time hint so
+      // the operator gets the same "how long" signal the 403 path's reset
+      // epoch provides; fall back to a bare `(429)` marker when absent.
+      const waitHint = r.retryAfterMs !== undefined ? ` (retry after ${Math.round(r.retryAfterMs / 1000)}s)` : ' (429)';
+      return githubRateLimitSkip(r.rawText, waitHint);
     }
     if (r.status >= 500) {
       // GitHub itself is degraded — the probe simply couldn't get an
