@@ -1470,11 +1470,15 @@ describe('runCanary — gha-runner-online check (runner liveness probe, wiki#80 
     expect(runner.message).toMatch(/no runner id|invalid runner id/i);
   });
 
-  it('fails with a distinct "GitHub rate-limited" message when 403 is a rate-limit, not a PAT-rejection', async () => {
+  it('abstains (skipped, not fail) with a distinct "GitHub rate-limited" message when 403 is a rate-limit, not a PAT-rejection (wxyc-canary#88)', async () => {
     // Primary-rate-limit 403s carry `X-RateLimit-Remaining: 0` and a body
-    // mentioning "rate limit". The check must NOT route this to "rotate the
+    // mentioning "rate limit". This is the same "GitHub couldn't answer"
+    // class as the 5xx / network-error abstain (wxyc-canary#86): the probe
+    // never got a runner-liveness verdict, so it abstains rather than
+    // failing. The message still must NOT route the operator to "rotate the
     // runner-liveness PAT" — that wastes operator time on a token that's
-    // perfectly valid. Distinct message + 'wait' framing instead.
+    // perfectly valid. Distinct message + 'wait' framing preserved in
+    // skipReason.
     const fetchMock = vi.fn(async (input: string | URL | Request) => {
       const urlString = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
       const respond = (resp: { status: number; body: unknown; headers?: Record<string, string> }) =>
@@ -1501,9 +1505,30 @@ describe('runCanary — gha-runner-online check (runner liveness probe, wiki#80 
     const outcomes = await runCanary(ghaRunnerConfig);
     const runner = outcomes.find((o) => o.name === 'gha-runner-online')!;
 
-    expect(runner.status).toBe('fail');
+    expect(runner.status).toBe('skipped');
     expect(runner.message).toMatch(/rate limit/i);
     // Must NOT mis-route to the PAT rotation runbook.
+    expect(runner.message).not.toMatch(/rotate/i);
+  });
+
+  it('abstains (skipped) with a "GitHub rate limit" message on a bare 429 (secondary rate-limit, wxyc-canary#88)', async () => {
+    // A bare 429 (no 403 wrapper) is GitHub's secondary-rate-limit shape,
+    // sometimes carrying a Retry-After header. It previously fell through
+    // to the generic `!r.ok` throw ("expected 2xx ... got 429") → fail.
+    // Same indeterminate rationale as the 403-rate-limit and 5xx abstains:
+    // the probe never got a runner-liveness verdict.
+    setUpGhaApiMock({
+      runnerStatus: 429,
+      runnerBody: { message: 'You have exceeded a secondary rate limit. Please wait a few minutes.' },
+    });
+
+    const outcomes = await runCanary(ghaRunnerConfig);
+    const runner = outcomes.find((o) => o.name === 'gha-runner-online')!;
+
+    expect(runner.status).toBe('skipped');
+    expect(runner.message).toMatch(/rate limit/i);
+    // Must NOT mis-route to the runner-replaced or PAT-rotation runbook.
+    expect(runner.message).not.toMatch(/replaced/i);
     expect(runner.message).not.toMatch(/rotate/i);
   });
 

@@ -629,21 +629,30 @@ const lmlDiscogsBreakerShed: Check = {
  * Probe: `GET /orgs/{org}/actions/runners/{id}` with a fine-scoped PAT.
  * Pass on `status === "online"`. Fail on any other status (`offline`
  * is the spec's primary failure mode), 404 (runner id no longer exists
- * after a host replacement that didn't re-set the stack parameter), or
- * 401/403 (PAT rotation drift) — all three are determinate, WXYC-
- * actionable verdicts.
+ * after a host replacement that didn't re-set the stack parameter), 401
+ * (PAT revoked), or a genuine non-rate-limit 403 (PAT rejection) — all
+ * four are determinate, WXYC-actionable verdicts.
  *
- * A GitHub-API 5xx — or a network error/timeout reaching github.com —
- * is NOT one of those: it means GitHub itself couldn't answer, which
- * says nothing about the runner's liveness. Both abstain (`skipped`,
- * indeterminate) instead of failing (wxyc-canary#86; mirrors the
- * `lml-auth` abstain-on-indeterminate pattern from wxyc-canary#58). The
- * real signal is fully preserved: a genuinely-offline runner still
- * returns HTTP 200 with `{"status":"offline"}`, which still fails.
- * Trade-off accepted: a prolonged GitHub outage masks a genuinely-
- * offline runner for its duration — this is infra-tier / low-urgency,
- * and a truly-dead runner resurfaces the moment GitHub recovers (200 +
- * `offline`).
+ * A GitHub-API 5xx, a network error/timeout reaching github.com, or a
+ * rate-limit response are NOT among those: all three mean GitHub itself
+ * couldn't answer (or wouldn't, this cycle), which says nothing about
+ * the runner's liveness. All abstain (`skipped`, indeterminate) instead
+ * of failing — the 5xx/network-error class landed in wxyc-canary#86;
+ * rate-limit joined in wxyc-canary#88 (mirrors the `lml-auth`
+ * abstain-on-indeterminate pattern from wxyc-canary#58). GitHub returns
+ * rate-limit two ways, and both can arrive at either status code: a
+ * primary rate-limit is usually 403 with `X-RateLimit-Remaining: 0`; a
+ * secondary rate-limit is sometimes a 403 with "secondary rate" in the
+ * body, sometimes a bare 429 (often with `Retry-After`). The 403 branch
+ * matches all of `remaining === '0'`, `"rate limit"`, and `"secondary
+ * rate"` in the body, so it covers every 403-shaped rate-limit; a bare
+ * 429 is handled as its own branch since it skips the 403 wrapper
+ * entirely. The real signal is fully preserved: a genuinely-offline
+ * runner still returns HTTP 200 with `{"status":"offline"}`, which
+ * still fails. Trade-off accepted: a prolonged GitHub outage or
+ * rate-limit window masks a genuinely-offline runner for its duration —
+ * this is infra-tier / low-urgency, and a truly-dead runner resurfaces
+ * the moment GitHub recovers or the bucket refills (200 + `offline`).
  *
  * This check is infra-tier (`pagesOncall: false`, see below), so its
  * failures feed the low-urgency `wxyc-canary-infra-degraded` alarm — NOT
@@ -653,11 +662,13 @@ const lmlDiscogsBreakerShed: Check = {
  * shape of the page alarm, just on the infra series.
  *
  * Skip semantics mirror `lml-auth` / DJ credentials: missing PAT or
- * runner-id is an operator gap (alarm stays quiet); a 404/401/403 or a
- * downstream credential-resolution error fails (real signal — surfaced
- * on the low-urgency `wxyc-canary-infra-degraded` alarm, not the page,
- * since this check is `pagesOncall: false`); a GitHub 5xx or an
- * unreachable github.com abstains (skipped) as described above.
+ * runner-id is an operator gap (alarm stays quiet); a 404, 401, or a
+ * genuine non-rate-limit 403, or a downstream credential-resolution
+ * error fails (real signal — surfaced on the low-urgency
+ * `wxyc-canary-infra-degraded` alarm, not the page, since this check is
+ * `pagesOncall: false`); a GitHub 5xx, an unreachable github.com, or any
+ * rate-limit response (403-primary, 403-secondary, or bare 429)
+ * abstains (skipped) as described above.
  */
 const ghaRunnerOnline: Check = {
   name: 'gha-runner-online',
@@ -745,11 +756,18 @@ const ghaRunnerOnline: Check = {
       if (remaining === '0' || bodyText.includes('rate limit') || bodyText.includes('secondary rate')) {
         const reset = r.headers?.['x-ratelimit-reset'];
         const resetSuffix = reset ? ` (reset epoch ${reset})` : '';
-        // Phrased to keep the on-call away from PAT-rotation actions: the
-        // PAT is valid; the bucket needs to refill.
-        throw new Error(
-          `GitHub rate limit exceeded${resetSuffix} — wait for the bucket to reset; the PAT is valid: ${r.rawText.slice(0, 200)}`
-        );
+        // A rate-limit is the same "GitHub couldn't answer" class as the
+        // 5xx / network-error abstain below (wxyc-canary#86): the probe
+        // never got a runner-liveness verdict this cycle, so it abstains
+        // rather than failing (wxyc-canary#88, option (a) — see also the
+        // bare-429 branch below, which covers the secondary-rate-limit
+        // shape that skips this 403 wrapper entirely). Phrased to keep the
+        // on-call away from PAT-rotation actions: the PAT is valid; the
+        // bucket needs to refill.
+        return {
+          skipped: true,
+          skipReason: `GitHub rate limit exceeded${resetSuffix} — wait for the bucket to reset; the PAT is valid: ${r.rawText.slice(0, 200)}`,
+        };
       }
       throw new Error(
         `GitHub rejected PAT with 403 — rotate the runner-liveness PAT in SSM: ${r.rawText.slice(0, 200)}`
@@ -762,6 +780,17 @@ const ghaRunnerOnline: Check = {
       throw new Error(
         `GitHub rejected PAT with 401 — rotate the runner-liveness PAT in SSM: ${r.rawText.slice(0, 200)}`
       );
+    }
+    if (r.status === 429) {
+      // Secondary rate-limit sometimes arrives as a bare 429 — no 403
+      // wrapper, so it skips the heuristic above entirely — often with a
+      // `Retry-After` header. Same indeterminate-abstain rationale as the
+      // 403-rate-limit branch above and the 5xx branch below
+      // (wxyc-canary#88): the probe never got a runner-liveness verdict.
+      return {
+        skipped: true,
+        skipReason: `GitHub rate limit exceeded (429) — wait for the bucket to reset; the PAT is valid: ${r.rawText.slice(0, 200)}`,
+      };
     }
     if (r.status >= 500) {
       // GitHub itself is degraded — the probe simply couldn't get an
