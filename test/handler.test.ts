@@ -1507,9 +1507,13 @@ describe('runCanary — gha-runner-online check (runner liveness probe, wiki#80 
     expect(runner.message).not.toMatch(/rotate/i);
   });
 
-  it('fails with a distinct "GitHub degraded" message on 5xx (not the generic !ok branch)', async () => {
-    // The docstring on the check promises 5xx routes distinctly so the
-    // on-call goes to githubstatus.com, not the runner. Pin the contract.
+  it('abstains (skipped, not fail) with a "GitHub degraded" message on 5xx — indeterminate, not a runner signal (wxyc-canary#86)', async () => {
+    // A GitHub-side 5xx means the probe couldn't get an answer at all —
+    // it says nothing about the runner's liveness. A genuinely-offline
+    // runner still returns 200 + {"status":"offline"} (see the dedicated
+    // offline test above), so that real signal survives untouched; only
+    // the "GitHub itself is unreachable/degraded" case abstains instead
+    // of tripping the infra-degraded alarm and the lambda-errors page.
     setUpGhaApiMock({
       runnerStatus: 503,
       runnerBody: { message: 'Service Unavailable' },
@@ -1518,9 +1522,41 @@ describe('runCanary — gha-runner-online check (runner liveness probe, wiki#80 
     const outcomes = await runCanary(ghaRunnerConfig);
     const runner = outcomes.find((o) => o.name === 'gha-runner-online')!;
 
-    expect(runner.status).toBe('fail');
+    expect(runner.status).toBe('skipped');
     expect(runner.message).toMatch(/GitHub.*degraded|githubstatus/i);
     // Must NOT mis-route to the runner-replaced or PAT-rotation runbook.
+    expect(runner.message).not.toMatch(/replaced/i);
+    expect(runner.message).not.toMatch(/rotate/i);
+  });
+
+  it('abstains (skipped) when github.com itself is unreachable (network error / timeout) — same indeterminate rationale as 5xx (wxyc-canary#86)', async () => {
+    // canaryFetch throws a CanaryFetchError on network failure or timeout.
+    // Previously that propagated as a thrown Error → 'fail'. Since a
+    // network error is exactly as indeterminate as a 5xx (GitHub never
+    // gave a verdict either way), it gets the same abstain treatment —
+    // mirrors the lml-auth good-bearer-probe pattern (wxyc-canary#58).
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const urlString = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      if (urlString.includes(`gha.example.test/orgs/WXYC/actions/runners/${RUNNER_ID}`)) {
+        throw new TypeError('fetch failed');
+      }
+      if (urlString.includes('/healthcheck')) {
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      }
+      if (urlString.includes('/graph/artists/search')) {
+        return new Response(JSON.stringify({ results: [{ id: 1 }] }), { status: 200 });
+      }
+      return new Response(`unmatched mock for ${urlString}`, { status: 599 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const outcomes = await runCanary(ghaRunnerConfig);
+    const runner = outcomes.find((o) => o.name === 'gha-runner-online')!;
+
+    expect(runner.status).toBe('skipped');
+    expect(runner.message).toMatch(/did not answer|indeterminate/i);
+    // Same anti-mis-routing guard as the 5xx test: a network-error skip must
+    // not borrow the runner-replaced or PAT-rotation runbook phrasing.
     expect(runner.message).not.toMatch(/replaced/i);
     expect(runner.message).not.toMatch(/rotate/i);
   });
