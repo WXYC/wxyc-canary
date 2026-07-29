@@ -355,7 +355,7 @@ The low-urgency infra/CI tier (wxyc-canary#48) — `gha-runner-online` or `seman
 
 ### Alarm fires: `wxyc-canary-lambda-errors`
 
-The Lambda crashed before it could publish per-check metrics. Usually means a config error (missing env, bad secret), an AWS SDK retry storm, or an unhandled exception. Check the most recent log stream for the stack trace.
+As of wxyc-canary#87 this alarm is tier-aware: it fires when at least one **page-tier** check failed (belt-and-suspenders alongside `wxyc-canary-check-failure`), or when the Lambda crashed before it could publish per-check metrics at all — a config error (missing env, bad secret), an AWS SDK retry storm, or an unhandled exception. Check the most recent log stream for the stack trace; if the run did publish metrics, the log line's `pageFailures` / `infraOnlyFailures` counts and the dimensioned `CheckFailure` series tell you which check(s) tripped it. An infra-tier-only failure (`gha-runner-online`, `semantic-index-freshness` alone) does **not** trip this alarm — it surfaces only on `wxyc-canary-infra-degraded` instead; see that alarm's entry above.
 
 ### A check is too noisy
 

@@ -2115,8 +2115,11 @@ describe('publishMetrics — tier split (UserFacingCheckFailure / InfraCheckFail
   });
 
   // Replay of the 2026-06-17 22:30 page: the staging-gate runner went
-  // offline. Infra failure must NOT trip the user-facing page.
-  it('does not page when only gha-runner-online fails (runner offline → InfraCheckFailure, not UserFacingCheckFailure)', async () => {
+  // offline. Infra failure must NOT trip the user-facing page — and, per
+  // wxyc-canary#87, must NOT trip `lambda-errors` either: the handler
+  // resolves normally (exit 0) rather than throwing, since only page-tier
+  // check failures drive the tier-aware throw.
+  it('does not page and does not throw when only gha-runner-online fails (runner offline → InfraCheckFailure only, exit 0)', async () => {
     process.env.CANARY_GHA_RUNNER_API_BASE = 'https://gha.example.test';
     process.env.CANARY_GHA_RUNNER_ORG = 'WXYC';
     process.env.CANARY_GHA_RUNNER_ID = '250';
@@ -2136,7 +2139,8 @@ describe('publishMetrics — tier split (UserFacingCheckFailure / InfraCheckFail
       },
     });
 
-    await expect(handler()).rejects.toThrow(/canary failed/);
+    const result = await handler();
+    expect(result.failed).toBe(1);
     const metrics = getPublishedMetrics();
 
     // The runner check is the failing one…
@@ -2177,8 +2181,10 @@ describe('publishMetrics — tier split (UserFacingCheckFailure / InfraCheckFail
 
   // The new silent-stale-graph backstop (semantic-index#348 / wxyc-canary#53)
   // is infra-tier: a stale or empty graph DB must raise the low-urgency infra
-  // alarm, never the user-facing page.
-  it('does not page when only semantic-index-freshness fails (stale graph → InfraCheckFailure)', async () => {
+  // alarm, never the user-facing page. Per wxyc-canary#87, an infra-tier-only
+  // failure also must not trip `lambda-errors` — the handler resolves rather
+  // than throwing.
+  it('does not page and does not throw when only semantic-index-freshness fails (stale graph → InfraCheckFailure only, exit 0)', async () => {
     setUpFetchMock({
       '/healthcheck': { status: 200, body: { ok: true } },
       '/graph/artists/search': { status: 200, body: { results: [{ id: 1, canonical_name: 'stereolab' }] } },
@@ -2189,7 +2195,8 @@ describe('publishMetrics — tier split (UserFacingCheckFailure / InfraCheckFail
       },
     });
 
-    await expect(handler()).rejects.toThrow(/canary failed/);
+    const result = await handler();
+    expect(result.failed).toBe(1);
     const metrics = getPublishedMetrics();
 
     expect(dimensionedFailureValue(metrics, 'semantic-index-freshness')).toBe(1);
@@ -2279,6 +2286,52 @@ describe('publishMetrics — tier split (UserFacingCheckFailure / InfraCheckFail
     expect(tierMax(metrics, 'UserFacingCheckFailure')).toBe(1);
     // Infra series stays flat — semantic checks pass and the runner check skips.
     expect(tierMax(metrics, 'InfraCheckFailure')).toBe(0);
+  });
+
+  // wxyc-canary#87: a mixed failure set (one page-tier check down alongside
+  // an infra-tier check) must still throw — the page-tier failure alone is
+  // sufficient — and the thrown message must name the page-tier failure(s),
+  // not just a generic count. It should NOT be misread as naming the
+  // infra-only failure as the reason for the page.
+  it('throws on a mixed page-tier + infra-tier failure, naming the page-tier failure in the message', async () => {
+    process.env.CANARY_GHA_RUNNER_API_BASE = 'https://gha.example.test';
+    process.env.CANARY_GHA_RUNNER_ORG = 'WXYC';
+    process.env.CANARY_GHA_RUNNER_ID = '250';
+    process.env.CANARY_GHA_RUNNER_TOKEN = 'fake-gha-pat';
+    setUpFetchMock({
+      // Page-tier failure.
+      '/healthcheck': { status: 500, body: { error: 'oops' } },
+      '/graph/artists/search': { status: 200, body: { results: [{ id: 1, canonical_name: 'stereolab' }] } },
+      'explore.example.test/health': {
+        status: 200,
+        body: { status: 'healthy', artist_count: 136_702, graph_db_age_seconds: 3_600 },
+      },
+      // Infra-tier failure, concurrently.
+      'gha.example.test/orgs/WXYC/actions/runners/250': {
+        status: 200,
+        body: { id: 250, name: 'wxyc-e2e-runner', status: 'offline' },
+      },
+    });
+
+    let caught: Error | undefined;
+    try {
+      await handler();
+    } catch (err) {
+      caught = err as Error;
+    }
+
+    expect(caught).toBeDefined();
+    expect(caught!.message).toMatch(/canary failed/);
+    expect(caught!.message).toContain('backend-healthcheck');
+    // The infra-only failure must not be counted among the page-tier
+    // failures the message reports — it's a distinct, non-paging signal.
+    expect(caught!.message).not.toContain('gha-runner-online');
+
+    const metrics = getPublishedMetrics();
+    expect(dimensionedFailureValue(metrics, 'backend-healthcheck')).toBe(1);
+    expect(dimensionedFailureValue(metrics, 'gha-runner-online')).toBe(1);
+    expect(tierMax(metrics, 'UserFacingCheckFailure')).toBe(1);
+    expect(tierMax(metrics, 'InfraCheckFailure')).toBe(1);
   });
 
   // Skip is not a failure on EITHER tier. With no DJ creds / LML key /

@@ -472,12 +472,20 @@ async function publishMetrics(outcomes: CheckOutcome[], region: string): Promise
 }
 
 /**
- * Lambda entry. Exits non-zero (via thrown error) if any check failed, so
- * CloudWatch's built-in `Errors` metric on the Lambda function lights up
- * even before the custom metrics arrive. The CloudFormation alarms fire on
- * the dimensionless tier aggregates (`UserFacingCheckFailure` page /
- * `InfraCheckFailure` low-urgency); the dimensioned `CheckFailure` series
- * names *which* surface is broken for dashboards and drill-down.
+ * Lambda entry. Exits non-zero (via thrown error) when at least one
+ * **page-tier** check failed (`pagesOncall !== false`, via
+ * `pagesOncallByName` — the same map `publishMetrics` uses to route the
+ * tier aggregates), so CloudWatch's built-in `Errors` metric on the Lambda
+ * function — and therefore `wxyc-canary-lambda-errors` — lights up
+ * alongside the user-facing `wxyc-canary-check-failure` page
+ * (belt-and-suspenders). An infra-tier-only failure set (e.g.
+ * `gha-runner-online`, `semantic-index-freshness`) does NOT throw here:
+ * `publishMetrics` already published `InfraCheckFailure=1` above, so the low-urgency
+ * `wxyc-canary-infra-degraded` alarm still fires, but the handler returns
+ * normally (exit 0) so the page-tier alarm stays quiet (wxyc-canary#87 —
+ * completes the #48 tier split, which `lambda-errors` previously bypassed).
+ * Setup failures (config/secret errors) throw earlier, before the check
+ * loop, and are unaffected by this — they always trip `lambda-errors`.
  */
 export const handler = async (): Promise<{ outcomes: CheckOutcome[]; failed: number; skipped: number }> => {
   const config = loadConfigFromEnv();
@@ -508,16 +516,42 @@ export const handler = async (): Promise<{ outcomes: CheckOutcome[]; failed: num
     }
   }
 
-  const failed = outcomes.filter((o) => o.status === 'fail').length;
+  // Tier-aware throw (wxyc-canary#87). `failed` counts every failed check
+  // regardless of tier — callers/tests depend on this total. Only
+  // `pageFailures` drives the throw: an infra-tier-only failure set must
+  // not trip `lambda-errors` (that's what `wxyc-canary-infra-degraded`,
+  // fed by `InfraCheckFailure` above, is for).
+  const failedOutcomes = outcomes.filter((o) => o.status === 'fail');
   const skipped = outcomes.filter((o) => o.status === 'skipped').length;
-  console.log(JSON.stringify({ outcomes, failed, skipped }));
+  const pageFailures = failedOutcomes.filter((o) => pagesOncallByName.get(o.name) ?? true);
+  const infraOnlyFailures = failedOutcomes.filter((o) => !(pagesOncallByName.get(o.name) ?? true));
+  console.log(
+    JSON.stringify({
+      outcomes,
+      failed: failedOutcomes.length,
+      skipped,
+      pageFailures: pageFailures.length,
+      infraOnlyFailures: infraOnlyFailures.length,
+    })
+  );
 
-  if (failed > 0) {
-    const failures = outcomes.filter((o) => o.status === 'fail').map((o) => `${o.name}: ${o.message}`);
-    throw new Error(`canary failed (${failed}/${outcomes.length} checks): ${failures.join('; ')}`);
+  if (infraOnlyFailures.length > 0) {
+    console.error(
+      `infra-tier check(s) failed (low-urgency, no page): ${infraOnlyFailures
+        .map((o) => `${o.name}: ${o.message}`)
+        .join('; ')}`
+    );
   }
 
-  return { outcomes, failed, skipped };
+  if (pageFailures.length > 0) {
+    throw new Error(
+      `canary failed (${pageFailures.length} page-tier of ${outcomes.length} checks): ${pageFailures
+        .map((o) => `${o.name}: ${o.message}`)
+        .join('; ')}`
+    );
+  }
+
+  return { outcomes, failed: failedOutcomes.length, skipped };
 };
 
 // The `npm run local` autorun now lives in `src/handler-local.ts` so
