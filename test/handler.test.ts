@@ -1507,6 +1507,8 @@ describe('runCanary — gha-runner-online check (runner liveness probe, wiki#80 
 
     expect(runner.status).toBe('skipped');
     expect(runner.message).toMatch(/rate limit/i);
+    // The X-RateLimit-Reset epoch is surfaced as the operator wait-time hint.
+    expect(runner.message).toMatch(/reset epoch 1718000000/);
     // Must NOT mis-route to the PAT rotation runbook.
     expect(runner.message).not.toMatch(/rotate/i);
   });
@@ -1527,8 +1529,44 @@ describe('runCanary — gha-runner-online check (runner liveness probe, wiki#80 
 
     expect(runner.status).toBe('skipped');
     expect(runner.message).toMatch(/rate limit/i);
+    // No Retry-After on this response, so the skip reason falls back to the
+    // bare "(429)" marker rather than a "retry after Ns" hint.
+    expect(runner.message).toMatch(/\(429\)/);
     // Must NOT mis-route to the runner-replaced or PAT-rotation runbook.
     expect(runner.message).not.toMatch(/replaced/i);
+    expect(runner.message).not.toMatch(/rotate/i);
+  });
+
+  it('surfaces the Retry-After wait time in the skip reason on a 429 that carries it (wxyc-canary#88)', async () => {
+    // A 429 often carries a Retry-After (seconds). Parity with the 403 path's
+    // reset epoch: the abstain surfaces the wait time so the operator knows how
+    // long the bucket needs. `canaryFetch` parses Retry-After into the typed
+    // `retryAfterMs` accessor (wxyc-canary#64), which the check reads.
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const urlString = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      const respond = (resp: { status: number; body: unknown; headers?: Record<string, string> }) =>
+        new Response(typeof resp.body === 'string' ? resp.body : JSON.stringify(resp.body), {
+          status: resp.status,
+          headers: { 'Content-Type': 'application/json', ...(resp.headers ?? {}) },
+        });
+      if (urlString.includes('/healthcheck')) return respond({ status: 200, body: { ok: true } });
+      if (urlString.includes('/graph/artists/search')) return respond({ status: 200, body: { results: [{ id: 1 }] } });
+      if (urlString.includes(`gha.example.test/orgs/WXYC/actions/runners/${RUNNER_ID}`)) {
+        return respond({
+          status: 429,
+          body: { message: 'You have exceeded a secondary rate limit. Please wait a few minutes.' },
+          headers: { 'Retry-After': '42' },
+        });
+      }
+      return new Response(`unmatched mock for ${urlString}`, { status: 599 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const outcomes = await runCanary(ghaRunnerConfig);
+    const runner = outcomes.find((o) => o.name === 'gha-runner-online')!;
+
+    expect(runner.status).toBe('skipped');
+    expect(runner.message).toMatch(/retry after 42s/i);
     expect(runner.message).not.toMatch(/rotate/i);
   });
 
