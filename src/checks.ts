@@ -501,6 +501,169 @@ const lmlAuth: Check = {
 };
 
 /**
+ * Budget for `lml-protected-search`. Tied to the same class-1 timeout
+ * Backend-Service's own protected-search caller uses for
+ * `/proxy/library/search` (`apps/backend/controllers/proxy.controller.ts`,
+ * BS#1826 PR 2 — "class 1 (3s timeout, no budget header), so local catalog
+ * search can't be starved by enrichment/batch LML traffic sharing the same
+ * default"), rather than the generic 8s `canaryFetch` default every other
+ * check uses. LML prod measured this path at p99 41 ms even during a live
+ * enrichment-saturation window (BS#1819 close-condition comment,
+ * 2026-07-30), so 3s leaves ample headroom while still enforcing the
+ * documented SLO instead of a much looser generic ceiling.
+ */
+const PROTECTED_SEARCH_TIMEOUT_MS = 3000;
+
+/**
+ * Anonymous (LML-bearer-gated): direct-to-LML probe of the BS#1819
+ * "protected local-search" path — `GET /api/v1/library/search`. LML#929
+ * proved this handler invokes zero Discogs/Apple/streaming/enrichment code
+ * (a guard test in LML's own suite), so this check's pass/fail is a
+ * first-class, isolated signal of local-catalog-search health, decoupled
+ * from any enrichment/upstream degradation by construction.
+ *
+ * Deliberately bypasses Backend-Service and calls LML directly, unlike
+ * `proxy-library-search`. As of BS#1826 PR 2, `/proxy/library/search`
+ * degrades to `{results: [], total: 0}` on any LML error instead of
+ * surfacing it — a correct DJ-facing UX contract (the search box never
+ * shows an error toast), but one that means `proxy-library-search` alone
+ * can no longer detect an LML-side local-search regression: a timed-out or
+ * 5xx LML response still reads as a clean 200 with an empty (but
+ * shape-valid) `results` array through the BS proxy. This check closes
+ * that gap by hitting LML with the shared service bearer and asserting a
+ * genuine hit for the probe artist, the same non-empty assertion
+ * `dj-library-search` already uses for the BS-fronted path.
+ *
+ * Pairs with `lml-enrichment-lookup` below — together they are the
+ * BS#1819 isolation-contract canaries: this one is expected to stay green
+ * while that one is failing or degraded (see the wxyc-canary#82 isolation
+ * regression tests in `test/handler.test.ts`).
+ *
+ * Skips when no LML_API_KEY is configured (operator gap, mirrors lml-auth).
+ */
+const lmlProtectedSearch: Check = {
+  name: 'lml-protected-search',
+  description: 'GET /api/v1/library/search directly on LML — BS#1819 protected local-search path',
+  requiresAuth: false,
+  run: async (ctx): Promise<CheckResult | void> => {
+    if (!ctx.lmlApiKey) {
+      return { skipped: true, skipReason: 'no LML_API_KEY configured' };
+    }
+    const r = await canaryFetch(
+      `${ctx.lmlUrl}/api/v1/library/search?artist=${encodeURIComponent(PROBE_ARTIST)}&limit=5`,
+      { headers: { Authorization: `Bearer ${ctx.lmlApiKey}` }, timeoutMs: PROTECTED_SEARCH_TIMEOUT_MS }
+    );
+    if (!r.ok) throw new Error(`expected 2xx, got ${r.status}: ${r.rawText.slice(0, 200)}`);
+    const body = r.body as { results?: unknown };
+    if (!body || typeof body !== 'object' || !Array.isArray(body.results)) {
+      throw new Error(`expected {results: [...]}, got: ${r.rawText.slice(0, 200)}`);
+    }
+    if (body.results.length === 0) {
+      throw new Error(`expected at least 1 hit for ${PROBE_ARTIST}, got 0 — protected local search is degraded`);
+    }
+  },
+};
+
+/**
+ * Canonical WXYC-representative fixture for `lml-enrichment-lookup` — the
+ * same artist/album/song `lml-auth` already probes (a real combination
+ * LML's Discogs cross-referencing should resolve, so the probe exercises
+ * actual matching rather than short-circuiting on empty input), but with a
+ * distinct `raw_message` tag. The two checks legitimately share both the
+ * URL and the bearer (both read `ctx.lmlApiKey`), so the tag is what lets
+ * LML-side logs — and this repo's own tests — tell the two checks' traffic
+ * apart despite the otherwise-identical request.
+ */
+const ENRICHMENT_LOOKUP_BODY = JSON.stringify({
+  artist: 'Juana Molina',
+  album: 'DOGA',
+  song: 'la paradoja',
+  raw_message: 'wxyc-canary lml-enrichment-lookup probe: Juana Molina - la paradoja (DOGA)',
+});
+
+/**
+ * Anonymous (LML-bearer-gated): direct-to-LML probe of the BS#1819
+ * "enrichment/Discogs-dependent" lane — `POST /api/v1/lookup` with a
+ * canonical WXYC fixture. Distinct by design from `lml-protected-search`
+ * above: together the pair proves the isolation contract PRD'd in BS#1819
+ * — local search must stay green while this lane degrades, and this
+ * lane's own degradation must be independently observable rather than
+ * folded into a generic timeout.
+ *
+ * Unlike `lml-auth` (which probes the same endpoint but only cares about
+ * the auth verdict, abstaining on anything else), this check's whole
+ * purpose IS the lane's health, so it reads the response differently:
+ *
+ *   - A network error/timeout, a non-2xx, or a malformed body is a HARD
+ *     fail (throws) — the enrichment lane failed to answer at all, which
+ *     pages via the shared `wxyc-canary-check-failure` alarm same as any
+ *     other check. Unlike `lml-auth`'s abstain-on-timeout posture, LML
+ *     unresponsiveness here IS the signal this check exists to catch, not
+ *     noise to filter out.
+ *   - A 2xx response with `degraded: true` or `timeout: true` — the
+ *     `LookupResponse` fields library-metadata-lookup#930 added, in part
+ *     for this canary (see LML `generated/api_models.py`'s
+ *     `degraded_reason` docstring) — is a SOFT signal: LML answered but
+ *     deliberately shed the enrichment tail (deadline/admission pressure)
+ *     or hit its internal hard cap. That is expected, occasional behavior
+ *     under real Discogs pressure (the PRD: "Discogs-dependent enrichment
+ *     may degrade when Discogs or another upstream is rate limited"), so
+ *     the check itself still `pass`es. The signal is carried entirely by
+ *     the `LookupDegraded` metric (0/1, emitted dimensioned +
+ *     dimensionless per the org convention) and a dedicated 3-of-3
+ *     `template.yaml` alarm (`wxyc-canary-lml-enrichment-degraded`),
+ *     mirroring `lml-discogs-breaker-shed`'s metric-carries-the-signal
+ *     pattern: a single degraded tick is expected noise, sustained
+ *     degradation over ~15 minutes is the page-worthy signature.
+ *   - A 2xx response with empty `results` and neither flag set is an
+ *     unexplained miss on a fixture that should always resolve — a hard
+ *     fail, matching `dj-library-search`'s "expected at least 1 hit"
+ *     precedent for the same reasoning.
+ *
+ * Skips when no LML_API_KEY is configured (operator gap, mirrors lml-auth).
+ */
+const lmlEnrichmentLookup: Check = {
+  name: 'lml-enrichment-lookup',
+  description: 'POST /api/v1/lookup directly on LML — BS#1819 Discogs-dependent enrichment lane',
+  requiresAuth: false,
+  run: async (ctx): Promise<CheckResult | void> => {
+    if (!ctx.lmlApiKey) {
+      return { skipped: true, skipReason: 'no LML_API_KEY configured' };
+    }
+    let r: FetchResult;
+    try {
+      r = await canaryFetch(`${ctx.lmlUrl}/api/v1/lookup`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${ctx.lmlApiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: ENRICHMENT_LOOKUP_BODY,
+      });
+    } catch (err) {
+      if (err instanceof CanaryFetchError) {
+        throw new Error(`LML did not answer /api/v1/lookup (${err.message}) — enrichment lane unresponsive`);
+      }
+      throw err;
+    }
+    if (!r.ok) {
+      throw new Error(`expected 2xx, got ${r.status}: ${r.rawText.slice(0, 200)}`);
+    }
+    const body = r.body as { results?: unknown; degraded?: unknown; timeout?: unknown };
+    if (!body || typeof body !== 'object' || !Array.isArray(body.results)) {
+      throw new Error(`expected {results: [...]}, got: ${r.rawText.slice(0, 200)}`);
+    }
+    const shedding = body.degraded === true || body.timeout === true;
+    if (body.results.length === 0 && !shedding) {
+      throw new Error(
+        `expected at least 1 match for the canonical fixture, got 0 (degraded=false, timeout=false) — enrichment/matching regression: ${r.rawText.slice(0, 200)}`
+      );
+    }
+    return { metrics: { LookupDegraded: shedding ? 1 : 0 } };
+  },
+};
+
+/**
  * LML `/health` values of `discogs_breaker_state` that mean the
  * saturation-protection breaker is shedding Discogs lookup traffic.
  * `half-open` still sheds every caller except the breaker's own one
@@ -875,6 +1038,8 @@ export const checks: readonly Check[] = [
   djRotation,
   djRotationPicker,
   lmlAuth,
+  lmlProtectedSearch,
+  lmlEnrichmentLookup,
   lmlDiscogsBreakerShed,
   ghaRunnerOnline,
   enrichmentQuality,

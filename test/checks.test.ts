@@ -31,6 +31,12 @@ describe('checksForSuite', () => {
       'gha-runner-online',
       'enrichment-quality',
       'lml-discogs-breaker-shed',
+      // wxyc-canary#82: direct-to-LML probes, kept Lambda-only for now (not
+      // wired into the multi-repo staging-gate CLI surface any of the other
+      // smoke-tagged checks feed). Promoting them to `smoke` is a follow-up
+      // once they've proven out against staging, not a day-one requirement.
+      'lml-protected-search',
+      'lml-enrichment-lookup',
     ]) {
       expect(smokeNames).not.toContain(name);
     }
@@ -99,10 +105,19 @@ describe('pagesOncall — paging-tier classification', () => {
     // DiscogsBreakerShedding metric + a dedicated alarm), but the
     // classification still routes it into the user-facing tier, not infra.
     expect(paging).toContain('lml-discogs-breaker-shed');
+    // lml-protected-search + lml-enrichment-lookup (wxyc-canary#82, the
+    // BS#1819 isolation-contract pair) both page by default: a hard failure
+    // on either is a real DJ/listener-facing degradation, just routed
+    // through two distinctly-named checks so the dimensioned CheckFailure
+    // drill-down (and, for the enrichment side, a dedicated alarm) tells
+    // the operator which user experience broke.
+    expect(paging).toContain('lml-protected-search');
+    expect(paging).toContain('lml-enrichment-lookup');
     // The 10 user-facing checks + enrichment-quality (writes; pages by
-    // default though it skips in prod) all page; only the 2 infra checks
-    // are excluded. `oidc-authorize` (wxyc-canary#60) is user-facing —
-    // login is the DJ-on-air gate for every OIDC client.
+    // default though it skips in prod) + the 2 wxyc-canary#82 checks all
+    // page; only the 2 infra checks are excluded. `oidc-authorize`
+    // (wxyc-canary#60) is user-facing — login is the DJ-on-air gate for
+    // every OIDC client.
     expect(checks.length - paging.size).toBe(2);
     expect(paging.has('gha-runner-online')).toBe(false);
     expect(paging.has('semantic-index-freshness')).toBe(false);
