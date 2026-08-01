@@ -210,10 +210,10 @@ describe('runCanary — anonymous-only configuration', () => {
     vi.unstubAllGlobals();
   });
 
-  it('passes the 4 truly-anonymous checks and skips the 9 conditional checks when no credentials are configured', async () => {
+  it('passes the 4 truly-anonymous checks and skips the 11 conditional checks when no credentials are configured', async () => {
     const outcomes = await runCanary(baseConfig);
 
-    expect(outcomes).toHaveLength(13);
+    expect(outcomes).toHaveLength(15);
     const byName = Object.fromEntries(outcomes.map((o) => [o.name, o]));
     expect(byName['backend-healthcheck'].status).toBe('pass');
     expect(byName['semantic-index-search'].status).toBe('pass');
@@ -237,6 +237,13 @@ describe('runCanary — anonymous-only configuration', () => {
     // `baseConfig` fixture leaves `lmlApiKey` undefined.
     expect(byName['lml-auth'].status).toBe('skipped');
     expect(byName['lml-auth'].message).toMatch(/no LML_API_KEY configured/);
+    // `lml-protected-search` + `lml-enrichment-lookup` (wxyc-canary#82)
+    // share the same LML_API_KEY config knob as `lml-auth` and skip for the
+    // same operator-gap reason.
+    expect(byName['lml-protected-search'].status).toBe('skipped');
+    expect(byName['lml-protected-search'].message).toMatch(/no LML_API_KEY configured/);
+    expect(byName['lml-enrichment-lookup'].status).toBe('skipped');
+    expect(byName['lml-enrichment-lookup'].message).toMatch(/no LML_API_KEY configured/);
     // `gha-runner-online` skips when no GitHub PAT + runner id are
     // configured (operator gap, mirrors lml-auth/DJ-creds). The probe
     // exists to alarm when the EC2-hosted staging-gate runner stops
@@ -863,7 +870,16 @@ describe('runCanary — lml-auth check (BS#1094 layer 1)', () => {
 
     await runCanary(lmlAuthConfig);
 
-    const lmlCalls = fetchMock.mock.calls.filter(([url]) => String(url).includes('lml.example.test/api/v1/lookup'));
+    const lmlCalls = fetchMock.mock.calls.filter(([url, init]) => {
+      if (!String(url).includes('lml.example.test/api/v1/lookup')) return false;
+      // `lml-enrichment-lookup` (wxyc-canary#82) shares this exact URL and
+      // bearer with lml-auth's good-bearer probe — both read
+      // `ctx.lmlApiKey`. Exclude its call by its distinct `raw_message` tag
+      // so this assertion stays scoped to lml-auth's own two probes; see
+      // `ENRICHMENT_LOOKUP_BODY` in src/checks.ts.
+      const body = JSON.parse((init as RequestInit).body as string) as { raw_message?: string };
+      return body.raw_message === 'Juana Molina - la paradoja (DOGA)';
+    });
     // Two probes per tick: one with the configured bearer, one with the
     // synthetic known-bad bearer.
     expect(lmlCalls).toHaveLength(2);
@@ -902,6 +918,372 @@ describe('runCanary — lml-auth check (BS#1094 layer 1)', () => {
 
     expect(lml.status).toBe('skipped');
     expect(lml.message).toMatch(/no LML_API_KEY configured/);
+  });
+});
+
+/**
+ * `lml-protected-search` + `lml-enrichment-lookup` (wxyc-canary#82) are the
+ * BS#1819 isolation-contract pair: a direct-to-LML probe of the "protected
+ * local-search" path (`GET /api/v1/library/search`, LML#929) that must stay
+ * green while enrichment/upstream is degraded, and a separate direct-to-LML
+ * probe of the Discogs-dependent enrichment lane (`POST /api/v1/lookup`)
+ * whose degradation must be independently observable rather than hidden
+ * inside a generic BS-proxy timeout. Both go straight to LML (not through
+ * Backend-Service) because BS#1826 PR 2 made `/proxy/library/search`
+ * degrade to `{results: [], total: 0}` on any LML error instead of
+ * surfacing it — a deliberate DJ-facing UX contract, but one that means the
+ * existing `proxy-library-search` canary check can no longer detect an
+ * LML-side local-search regression on its own.
+ *
+ * `lml-protected-search` is a plain throw-on-fail check (like
+ * `dj-library-search`): non-2xx, a malformed body, or zero hits for the
+ * canonical probe artist all fail and page via the shared
+ * `wxyc-canary-check-failure` alarm, drill-down by the `Check` dimension.
+ *
+ * `lml-enrichment-lookup` follows the `lml-discogs-breaker-shed` metric-
+ * carries-the-signal pattern for the *expected* degradation case: a 2xx
+ * response with `degraded: true` or `timeout: true` (the `LookupResponse`
+ * fields LML#930 added specifically for this canary — see
+ * library-metadata-lookup `generated/api_models.py`) still `pass`es the
+ * check, carrying the signal in the `LookupDegraded` metric (0/1) and a
+ * dedicated `wxyc-canary-lml-enrichment-degraded` alarm instead — a single
+ * degraded tick is expected Discogs-side noise, sustained degradation is
+ * the page-worthy signature. A hard failure (network error/timeout,
+ * non-2xx, malformed body, or an unexplained zero-result miss on the
+ * canonical fixture) still throws and pages via the shared alarm, same as
+ * any other check — the enrichment lane failing to answer at all is a
+ * different, and differently-actionable, signal than it answering with a
+ * deliberate shed.
+ */
+describe('runCanary — lml-protected-search + lml-enrichment-lookup (BS#1819 isolation contract, wxyc-canary#82)', () => {
+  const lmlIsolationConfig: CanaryConfig = {
+    ...baseConfig,
+    lmlUrl: 'https://lml.example.test',
+    lmlApiKey: 'fake-lml-bearer',
+  };
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  describe('lml-protected-search', () => {
+    it('passes when LML returns at least one hit for the probe artist', async () => {
+      setUpFetchMock({
+        '/healthcheck': { status: 200, body: { ok: true } },
+        '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+        '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
+        'lml.example.test/api/v1/library/search': {
+          status: 200,
+          body: { results: stereolabSearchResults, total: 1, query: 'artist=Stereolab' },
+        },
+      });
+
+      const outcomes = await runCanary(lmlIsolationConfig);
+      const search = outcomes.find((o) => o.name === 'lml-protected-search')!;
+
+      expect(search.status).toBe('pass');
+    });
+
+    it('fails when LML returns a non-2xx (protected search itself degraded)', async () => {
+      setUpFetchMock({
+        '/healthcheck': { status: 200, body: { ok: true } },
+        '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+        '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
+        'lml.example.test/api/v1/library/search': {
+          status: 503,
+          body: { detail: 'Service Unavailable' },
+        },
+      });
+
+      const outcomes = await runCanary(lmlIsolationConfig);
+      const search = outcomes.find((o) => o.name === 'lml-protected-search')!;
+
+      expect(search.status).toBe('fail');
+      expect(search.message).toMatch(/503/);
+    });
+
+    it('fails when LML returns zero hits for the probe artist (silent zero-hit regression)', async () => {
+      setUpFetchMock({
+        '/healthcheck': { status: 200, body: { ok: true } },
+        '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+        '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
+        'lml.example.test/api/v1/library/search': {
+          status: 200,
+          body: { results: [], total: 0, query: 'artist=Stereolab' },
+        },
+      });
+
+      const outcomes = await runCanary(lmlIsolationConfig);
+      const search = outcomes.find((o) => o.name === 'lml-protected-search')!;
+
+      expect(search.status).toBe('fail');
+      expect(search.message).toMatch(/at least 1 hit/);
+    });
+
+    it('fails when the response body is missing the results array (shape regression)', async () => {
+      setUpFetchMock({
+        '/healthcheck': { status: 200, body: { ok: true } },
+        '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+        '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
+        'lml.example.test/api/v1/library/search': {
+          status: 200,
+          body: { total: 0 },
+        },
+      });
+
+      const outcomes = await runCanary(lmlIsolationConfig);
+      const search = outcomes.find((o) => o.name === 'lml-protected-search')!;
+
+      expect(search.status).toBe('fail');
+      expect(search.message).toMatch(/expected \{results: \[\.\.\.\]\}/);
+    });
+
+    it('skips when no LML_API_KEY is configured (operator gap, mirrors lml-auth)', async () => {
+      setUpFetchMock({
+        '/healthcheck': { status: 200, body: { ok: true } },
+        '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+        '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
+      });
+
+      const outcomes = await runCanary({ ...baseConfig, lmlUrl: 'https://lml.example.test' });
+      const search = outcomes.find((o) => o.name === 'lml-protected-search')!;
+
+      expect(search.status).toBe('skipped');
+      expect(search.message).toMatch(/no LML_API_KEY configured/);
+    });
+
+    it('sends the bearer and probe artist as query params, direct to LML (not through BS)', async () => {
+      const fetchMock = setUpFetchMock({
+        '/healthcheck': { status: 200, body: { ok: true } },
+        '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+        '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
+        'lml.example.test/api/v1/library/search': {
+          status: 200,
+          body: { results: stereolabSearchResults, total: 1, query: 'artist=Stereolab' },
+        },
+      });
+
+      await runCanary(lmlIsolationConfig);
+
+      const [url, init] = fetchMock.mock.calls.find(([u]) =>
+        String(u).includes('lml.example.test/api/v1/library/search')
+      ) as unknown as [string, RequestInit];
+      expect(url).toContain('artist=Stereolab');
+      const headers = init.headers as Record<string, string>;
+      expect(headers.Authorization).toBe('Bearer fake-lml-bearer');
+    });
+  });
+
+  describe('lml-enrichment-lookup', () => {
+    it('passes with LookupDegraded=0 when the lookup succeeds with matches and no degraded/timeout flag', async () => {
+      setUpFetchMock({
+        '/healthcheck': { status: 200, body: { ok: true } },
+        '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+        '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
+        'lml.example.test/api/v1/lookup': {
+          status: 200,
+          body: { results: [{ artist: 'Juana Molina' }], degraded: false, timeout: false },
+        },
+      });
+
+      const outcomes = await runCanary(lmlIsolationConfig);
+      const lookup = outcomes.find((o) => o.name === 'lml-enrichment-lookup')!;
+
+      expect(lookup.status).toBe('pass');
+      expect(lookup.metrics?.LookupDegraded).toBe(0);
+    });
+
+    it('passes (soft) with LookupDegraded=1 when the response is degraded: true (deliberate shed, not a page-worthy single tick)', async () => {
+      setUpFetchMock({
+        '/healthcheck': { status: 200, body: { ok: true } },
+        '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+        '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
+        'lml.example.test/api/v1/lookup': {
+          status: 200,
+          body: { results: [], degraded: true, degraded_reason: 'upstream_unavailable', timeout: false },
+        },
+      });
+
+      const outcomes = await runCanary(lmlIsolationConfig);
+      const lookup = outcomes.find((o) => o.name === 'lml-enrichment-lookup')!;
+
+      expect(lookup.status).toBe('pass');
+      expect(lookup.metrics?.LookupDegraded).toBe(1);
+    });
+
+    it('passes (soft) with LookupDegraded=1 when the response is timeout: true (internal hard cap fired)', async () => {
+      setUpFetchMock({
+        '/healthcheck': { status: 200, body: { ok: true } },
+        '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+        '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
+        'lml.example.test/api/v1/lookup': {
+          status: 200,
+          body: { results: [], degraded: false, timeout: true },
+        },
+      });
+
+      const outcomes = await runCanary(lmlIsolationConfig);
+      const lookup = outcomes.find((o) => o.name === 'lml-enrichment-lookup')!;
+
+      expect(lookup.status).toBe('pass');
+      expect(lookup.metrics?.LookupDegraded).toBe(1);
+    });
+
+    it('fails (hard) when LML returns a non-2xx — the enrichment lane failed to answer', async () => {
+      setUpFetchMock({
+        '/healthcheck': { status: 200, body: { ok: true } },
+        '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+        '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
+        'lml.example.test/api/v1/lookup': {
+          status: 500,
+          body: { detail: 'Internal Server Error' },
+        },
+      });
+
+      const outcomes = await runCanary(lmlIsolationConfig);
+      const lookup = outcomes.find((o) => o.name === 'lml-enrichment-lookup')!;
+
+      expect(lookup.status).toBe('fail');
+      expect(lookup.message).toMatch(/500/);
+    });
+
+    it('fails (hard) when the request times out — network-level unresponsiveness is a real page, not an abstain', async () => {
+      const abortError = new Error('The operation was aborted');
+      abortError.name = 'AbortError';
+      const fetchMock = vi.fn(async (input: string | URL | Request) => {
+        const urlString = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+        if (urlString.includes('/healthcheck')) return new Response(JSON.stringify({ ok: true }), { status: 200 });
+        if (urlString.includes('/proxy/library/search'))
+          return new Response(JSON.stringify(proxyLibrarySearchResponse), { status: 200 });
+        if (urlString.includes('/graph/artists/search'))
+          return new Response(JSON.stringify({ results: [{ id: 1 }] }), { status: 200 });
+        if (urlString.includes('lml.example.test/api/v1/lookup')) throw abortError;
+        return new Response(`unmatched mock for ${urlString}`, { status: 599 });
+      });
+      vi.stubGlobal('fetch', fetchMock);
+
+      const outcomes = await runCanary(lmlIsolationConfig);
+      const lookup = outcomes.find((o) => o.name === 'lml-enrichment-lookup')!;
+
+      expect(lookup.status).toBe('fail');
+      expect(lookup.message).toMatch(/timed out|unresponsive/);
+    });
+
+    it('fails (hard) when results are empty and neither degraded nor timeout is set (unexplained matching regression)', async () => {
+      setUpFetchMock({
+        '/healthcheck': { status: 200, body: { ok: true } },
+        '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+        '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
+        'lml.example.test/api/v1/lookup': {
+          status: 200,
+          body: { results: [], degraded: false, timeout: false },
+        },
+      });
+
+      const outcomes = await runCanary(lmlIsolationConfig);
+      const lookup = outcomes.find((o) => o.name === 'lml-enrichment-lookup')!;
+
+      expect(lookup.status).toBe('fail');
+      expect(lookup.message).toMatch(/expected at least 1 match/);
+    });
+
+    it('skips when no LML_API_KEY is configured (operator gap, mirrors lml-auth)', async () => {
+      setUpFetchMock({
+        '/healthcheck': { status: 200, body: { ok: true } },
+        '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+        '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
+      });
+
+      const outcomes = await runCanary({ ...baseConfig, lmlUrl: 'https://lml.example.test' });
+      const lookup = outcomes.find((o) => o.name === 'lml-enrichment-lookup')!;
+
+      expect(lookup.status).toBe('skipped');
+      expect(lookup.message).toMatch(/no LML_API_KEY configured/);
+    });
+
+    it('sends the bearer and a canonical WXYC fixture body, direct to LML (not through BS)', async () => {
+      const fetchMock = setUpFetchMock({
+        '/healthcheck': { status: 200, body: { ok: true } },
+        '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+        '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
+        'lml.example.test/api/v1/lookup': {
+          status: 200,
+          body: { results: [{ artist: 'Juana Molina' }], degraded: false, timeout: false },
+        },
+      });
+
+      await runCanary(lmlIsolationConfig);
+
+      const [, init] = fetchMock.mock.calls.find(([u]) =>
+        String(u).includes('lml.example.test/api/v1/lookup')
+      ) as unknown as [string, RequestInit];
+      expect(init.method).toBe('POST');
+      const headers = init.headers as Record<string, string>;
+      expect(headers.Authorization).toBe('Bearer fake-lml-bearer');
+      expect(headers['Content-Type']).toBe('application/json');
+      const body = JSON.parse(init.body as string);
+      expect(body.artist).toBeTypeOf('string');
+      expect(body.artist.length).toBeGreaterThan(0);
+    });
+  });
+
+  // The direct proof this issue exists to pin: a hard failure/degradation on
+  // the enrichment lane must not drag down the protected local-search
+  // check, and vice versa. The two checks hit different LML endpoints and
+  // are evaluated independently by the runner's per-check try/catch
+  // (already true by construction), but this test pins the actual BS#1819
+  // claim in one scenario rather than relying on that structural guarantee
+  // alone — a future refactor that accidentally routed local search through
+  // the same lookup pipeline would trip this.
+  it('proves the BS#1819 isolation contract: protected search stays green while the enrichment lane is failing', async () => {
+    setUpFetchMock({
+      '/healthcheck': { status: 200, body: { ok: true } },
+      '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+      '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
+      'lml.example.test/api/v1/library/search': {
+        status: 200,
+        body: { results: stereolabSearchResults, total: 1, query: 'artist=Stereolab' },
+      },
+      'lml.example.test/api/v1/lookup': {
+        status: 503,
+        body: { detail: 'Discogs semaphore saturated' },
+      },
+    });
+
+    const outcomes = await runCanary(lmlIsolationConfig);
+    const search = outcomes.find((o) => o.name === 'lml-protected-search')!;
+    const lookup = outcomes.find((o) => o.name === 'lml-enrichment-lookup')!;
+
+    expect(search.status).toBe('pass');
+    expect(lookup.status).toBe('fail');
+    expect(lookup.message).toMatch(/503/);
+  });
+
+  it('proves the isolation contract also holds for a soft (degraded, not hard-failed) enrichment shed', async () => {
+    setUpFetchMock({
+      '/healthcheck': { status: 200, body: { ok: true } },
+      '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+      '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
+      'lml.example.test/api/v1/library/search': {
+        status: 200,
+        body: { results: stereolabSearchResults, total: 1, query: 'artist=Stereolab' },
+      },
+      'lml.example.test/api/v1/lookup': {
+        status: 200,
+        body: { results: [], degraded: true, degraded_reason: 'upstream_unavailable', timeout: false },
+      },
+    });
+
+    const outcomes = await runCanary(lmlIsolationConfig);
+    const search = outcomes.find((o) => o.name === 'lml-protected-search')!;
+    const lookup = outcomes.find((o) => o.name === 'lml-enrichment-lookup')!;
+
+    expect(search.status).toBe('pass');
+    // The enrichment check's own status stays `pass` (metric-carries-the-
+    // signal, matching lml-discogs-breaker-shed) — the degradation is
+    // visible in the metric, not the outcome status.
+    expect(lookup.status).toBe('pass');
+    expect(lookup.metrics?.LookupDegraded).toBe(1);
   });
 });
 
@@ -1987,9 +2369,9 @@ describe('publishMetrics — dimensioned + dimensionless emit-twice', () => {
     const dimensioned = checkFailureData.filter((d) => d.Dimensions && d.Dimensions.length > 0);
     const dimensionless = checkFailureData.filter((d) => !d.Dimensions || d.Dimensions.length === 0);
 
-    // Thirteen checks, each contributes one dimensioned and one dimensionless datapoint.
-    expect(dimensioned).toHaveLength(13);
-    expect(dimensionless).toHaveLength(13);
+    // Fifteen checks, each contributes one dimensioned and one dimensionless datapoint.
+    expect(dimensioned).toHaveLength(15);
+    expect(dimensionless).toHaveLength(15);
     // Without an inducer, every value is 0 (passes + skips).
     expect(dimensioned.every((d) => d.Value === 0)).toBe(true);
     expect(dimensionless.every((d) => d.Value === 0)).toBe(true);
@@ -2027,7 +2409,7 @@ describe('publishMetrics — dimensioned + dimensionless emit-twice', () => {
     // isn't enough — `Statistic: Maximum` on the alarm needs at least one
     // `1` in the window, so this asserts the count of 1s explicitly.
     expect(dimensionless.filter((d) => d.Value === 1)).toHaveLength(1);
-    expect(dimensionless.filter((d) => d.Value === 0)).toHaveLength(12);
+    expect(dimensionless.filter((d) => d.Value === 0)).toHaveLength(14);
   });
 
   // `CheckSkipped` and `CheckLatency` are dashboard data, not alarm inputs.
@@ -2052,8 +2434,8 @@ describe('publishMetrics — dimensioned + dimensionless emit-twice', () => {
     expect(metricData.filter((d) => d.MetricName === 'CheckSkipped' && isDimensionless(d))).toHaveLength(0);
     expect(metricData.filter((d) => d.MetricName === 'CheckLatency' && isDimensionless(d))).toHaveLength(0);
     // Sanity: the dimensioned series for each is present (one per check).
-    expect(metricData.filter((d) => d.MetricName === 'CheckSkipped')).toHaveLength(13);
-    expect(metricData.filter((d) => d.MetricName === 'CheckLatency')).toHaveLength(13);
+    expect(metricData.filter((d) => d.MetricName === 'CheckSkipped')).toHaveLength(15);
+    expect(metricData.filter((d) => d.MetricName === 'CheckLatency')).toHaveLength(15);
   });
 
   // wxyc-canary#84: DiscogsLiveRequestsTotal follows the same custom-metric
@@ -2413,10 +2795,11 @@ describe('publishMetrics — tier split (UserFacingCheckFailure / InfraCheckFail
     await handler();
     const metrics = getPublishedMetrics();
 
-    // 11 paging checks (10 user-facing + enrichment-quality), 2 infra checks
-    // (gha-runner-online, semantic-index-freshness); every aggregate datum is
-    // dimensionless and 0.
-    expect(tierValues(metrics, 'UserFacingCheckFailure')).toHaveLength(11);
+    // 13 paging checks (10 user-facing + enrichment-quality +
+    // lml-protected-search + lml-enrichment-lookup, wxyc-canary#82), 2 infra
+    // checks (gha-runner-online, semantic-index-freshness); every aggregate
+    // datum is dimensionless and 0.
+    expect(tierValues(metrics, 'UserFacingCheckFailure')).toHaveLength(13);
     expect(tierValues(metrics, 'InfraCheckFailure')).toHaveLength(2);
     expect(tierMax(metrics, 'UserFacingCheckFailure')).toBe(0);
     expect(tierMax(metrics, 'InfraCheckFailure')).toBe(0);
@@ -2541,6 +2924,12 @@ describe('template.yaml ↔ publishMetrics contract', () => {
     process.env.CANARY_ENABLE_WRITE_PROBE = 'true';
     process.env.CANARY_ENRICHMENT_POLL_INTERVAL_MS = '5';
     process.env.CANARY_ENRICHMENT_POLL_TIMEOUT_MS = '500';
+    // Also required so this happy-path run actually emits `LookupDegraded`
+    // (wxyc-canary#82) — without a bearer, lml-auth, lml-protected-search,
+    // and lml-enrichment-lookup all skip, and the contract test has nothing
+    // to match the new dedicated alarm against. `setUpEnrichmentHappyPathMock`
+    // now stubs the direct-to-LML routes this activates.
+    process.env.CANARY_LML_API_KEY = 'fake-lml-bearer';
     delete process.env.CANARY_DJ_SECRET_ARN;
     setUpEnrichmentHappyPathMock();
   });
@@ -2560,6 +2949,7 @@ describe('template.yaml ↔ publishMetrics contract', () => {
     delete process.env.CANARY_ENABLE_WRITE_PROBE;
     delete process.env.CANARY_ENRICHMENT_POLL_INTERVAL_MS;
     delete process.env.CANARY_ENRICHMENT_POLL_TIMEOUT_MS;
+    delete process.env.CANARY_LML_API_KEY;
   });
 
   it('every WXYC/Canary alarm points at a (MetricName, Dimensions-shape) tuple the handler actually emits', async () => {
@@ -2682,6 +3072,42 @@ function setUpEnrichmentHappyPathMock(): ReturnType<typeof setUpMethodAwareMock>
       responses: [
         { status: 200, body: { status: 'ok', discogs_breaker_state: 'closed', discogs_live_requests_total: 128 } },
       ],
+    },
+    // lml-protected-search (wxyc-canary#82) — direct to LML, same default
+    // production host as the /health routes above (no CANARY_LML_URL
+    // override in this suite).
+    {
+      method: 'GET',
+      pattern: 'library-metadata-lookup-production.up.railway.app/api/v1/library/search',
+      responses: [{ status: 200, body: { results: stereolabSearchResults, total: 1, query: 'artist=Stereolab' } }],
+    },
+    // lml-auth (2 probes: good bearer, then the synthetic known-bad bearer)
+    // and lml-enrichment-lookup (wxyc-canary#82) all POST to the same
+    // `/api/v1/lookup` URL on the default production LML host. A static
+    // response queue can't tell the calls apart (and Promise.all gives no
+    // ordering guarantee across checks), so this route is bearer-aware:
+    // the synthetic known-bad bearer gets a clean 401 (satisfies lml-auth's
+    // second probe); every other bearer gets a 2xx with a real match and
+    // degraded/timeout both false (satisfies lml-auth's first probe AND
+    // lml-enrichment-lookup, which additionally reads degraded/timeout).
+    {
+      method: 'POST',
+      pattern: 'library-metadata-lookup-production.up.railway.app/api/v1/lookup',
+      dynamic: (_url, init) => {
+        const headers = (init?.headers ?? {}) as Record<string, string>;
+        const auth = headers.Authorization ?? headers.authorization ?? '';
+        if (auth.includes('wxyc-canary-probe-not-a-real-key')) {
+          return { status: 401, body: { detail: 'Missing or invalid API key' } };
+        }
+        return {
+          status: 200,
+          body: {
+            results: [{ artist: 'Juana Molina', album: 'DOGA', song: 'la paradoja' }],
+            degraded: false,
+            timeout: false,
+          },
+        };
+      },
     },
     { method: 'GET', pattern: '/proxy/library/search', responses: [{ status: 200, body: proxyLibrarySearchResponse }] },
     {

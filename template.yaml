@@ -411,6 +411,54 @@ Resources:
       OKActions:
         - !Ref AlertTopic
 
+  # BS#1819 isolation-contract pair (wxyc-canary#82): a dedicated alarm for
+  # the SOFT half of `lml-enrichment-lookup`'s signal. The check's own
+  # status stays `pass` when LML answers with `degraded: true` or
+  # `timeout: true` (a deliberate shed under Discogs/upstream pressure, or
+  # the internal hard cap firing) — that's the `lml-discogs-breaker-shed`
+  # metric-carries-the-signal pattern (wxyc-canary#79), so a single degraded
+  # tick does not page via `wxyc-canary-check-failure`. This alarm targets
+  # the dimensionless `LookupDegraded` series instead, and pages only when
+  # it is sustained for 3 consecutive 5-minute evaluations (~15 min) — the
+  # same "clears small Discogs-side latency spikes without delaying the
+  # on-air paging window" rationale as `EnrichmentLagAlarm` above, since
+  # both watch the same Discogs-dependent enrichment lane. A hard failure of
+  # the check (network error, non-2xx, or an unexplained zero-result miss)
+  # is a separate, harder signal and still pages via the shared
+  # `wxyc-canary-check-failure` alarm — this alarm exists specifically so
+  # the *expected occasional degradation* case is observable and
+  # distinguishable from that hard-failure case, and from a
+  # `lml-protected-search` failure, so an operator can tell from the alarm
+  # name alone which user experience (local search vs. enrichment) is
+  # unhealthy. `notBreaching` on missing data: with no `LML_API_KEY`
+  # configured the check skips and the metric is simply absent, and the
+  # alarm must sit at OK.
+  LmlEnrichmentDegradedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: wxyc-canary-lml-enrichment-degraded
+      AlarmDescription: >
+        LML's Discogs-dependent /api/v1/lookup lane has been answering with
+        degraded: true or timeout: true for 3 consecutive 5-minute checks
+        (~15 min). This is expected occasional behavior under real Discogs
+        pressure and is distinct from a hard lml-enrichment-lookup failure
+        (which pages via wxyc-canary-check-failure) and from
+        lml-protected-search (local catalog search — expected to stay green
+        through this). See CLAUDE.md and docs/adding-a-check.md.
+      Namespace: WXYC/Canary
+      MetricName: LookupDegraded
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+      OKActions:
+        - !Ref AlertTopic
+
   # Discogs-breaker sustained-shed alarm (wxyc-canary#79), volume-gated
   # (wxyc-canary#84). Pages only when BOTH hold for 3 consecutive 5-minute
   # ticks (~15 min): the breaker is shedding (the dimensionless
