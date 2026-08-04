@@ -1,10 +1,11 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
   GitHub Actions OIDC provider + least-privilege deploy role for the wxyc-canary
-  SAM stack. The OIDC provider is account-global — extract it to a shared stack
-  when a second WXYC repo adopts OIDC. Future tightening: split the deploy role
-  so it holds only cloudformation:* + iam:PassRole on a dedicated CFN service
-  role that carries the broad service perms below.
+  SAM stack. The OIDC provider is account-global and this stack owns it; it now
+  has a second consumer, so deleting this stack breaks WXYC/discogs-etl's CI
+  deploy too (see the GitHubOidcProvider comment below). Future tightening:
+  split the deploy role so it holds only cloudformation:* + iam:PassRole on a
+  dedicated CFN service role that carries the broad service perms below.
 
 Parameters:
   GitHubOrg: { Type: String, Default: WXYC }
@@ -14,6 +15,15 @@ Parameters:
     Default: aws-sam-cli-managed-default-samclisourcebucket-v0kc5deo10yi
 
 Resources:
+  # Account-global and unique per URL, so exactly one stack in the account may
+  # declare it and that stack is this one. Consumers as of 2026-08-04:
+  #   - wxyc-canary          (this stack's CanaryDeployRole, below)
+  #   - WXYC/discogs-etl     infra/bootstrap/deploy-role.yaml, which takes the
+  #                          ARN as a parameter rather than re-declaring the
+  #                          resource (WXYC/discogs-etl#353)
+  # Deleting this stack therefore breaks discogs-etl's CI deploy, not only this
+  # repo's. Extracting the provider to a shared stack is still the right end
+  # state; it now requires a coordinated change in discogs-etl.
   GitHubOidcProvider:
     Type: AWS::IAM::OIDCProvider
     Properties:
