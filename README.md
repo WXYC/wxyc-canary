@@ -294,7 +294,13 @@ aws cloudformation deploy \
   --capabilities CAPABILITY_NAMED_IAM
 ```
 
-Take the stack's `DeployRoleArn` output and set it as the `AWS_DEPLOY_ROLE_ARN` GitHub variable. The OIDC provider is account-global (unique per URL) — when a second WXYC repo adopts OIDC, move the provider into its own shared stack and leave only per-repo roles in each repo's bootstrap.
+Take the stack's `DeployRoleArn` output and set it as the `AWS_DEPLOY_ROLE_ARN` GitHub variable.
+
+> **The OIDC provider is account-global (unique per URL) and this stack owns it. It now has a second consumer.** [`WXYC/discogs-etl`](https://github.com/WXYC/discogs-etl) adopted OIDC in this account on 2026-08-04 ([discogs-etl#353](https://github.com/WXYC/discogs-etl/issues/353)) and references the provider by ARN from its own `infra/bootstrap/deploy-role.yaml` rather than re-declaring it — a second `AWS::IAM::OIDCProvider` for the same URL fails with `EntityAlreadyExists`.
+>
+> Two consequences. **Deleting the `wxyc-canary-deploy` stack now breaks discogs-etl's CI deploy**, not just this repo's; the provider goes with it. And the "move the provider into its own shared stack" refactor below is no longer hypothetical work for a future repo — it is deferred work with a live cross-repo dependency. Doing it means updating discogs-etl's `OidcProviderArn` parameter in the same change.
+
+When a third WXYC repo adopts OIDC, move the provider into its own shared stack and leave only per-repo roles in each repo's bootstrap.
 
 Required GitHub variables:
 
