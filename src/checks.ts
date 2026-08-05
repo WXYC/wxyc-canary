@@ -225,15 +225,30 @@ const semanticIndexFreshness: Check = {
 
 /**
  * Per-request budget for the legacy-bridge probe, in milliseconds. Sourced
- * from the TIGHTEST real client deadline rather than the canary's 8 s
- * default: `WXYC-Android`'s `AppModule.provideWxycApi` builds Retrofit
- * without calling `.client(...)`, so Retrofit constructs a default
- * `OkHttpClient`, whose connect/read/write timeouts are 10 s each and whose
- * overall call timeout is disabled. A response that takes longer than this
- * is not "slow" — it is an Android poll that already failed. (iOS is looser:
- * `PlaylistDataSourceV1.swift` sets `timeoutInterval: 30`.)
+ * from the tightest PER-HOP budget in the fleet, and deliberately stricter
+ * than any client's actual behaviour.
+ *
+ * `WXYC-Android`'s `AppModule.provideWxycApi` builds Retrofit without calling
+ * `.client(...)`, so Retrofit constructs a default `OkHttpClient`: connect /
+ * read / write timeouts of 10 s each. Note what that does NOT mean — OkHttp's
+ * `callTimeout` (the only knob bounding a whole call) defaults to 0, i.e.
+ * disabled, and `readTimeout` carries `Socket.setSoTimeout` semantics, so its
+ * clock restarts on every successful read. A server dripping bytes every 9 s
+ * never trips it. iOS is no stricter: `URLRequest.timeoutInterval` (30 s in
+ * `PlaylistDataSourceV1.swift`) is likewise an inactivity timer, not a
+ * deadline.
+ *
+ * So NO client in the fleet enforces a wall-clock deadline, and this budget
+ * is a canary-side choice, not a client-mirroring one. That asymmetry is
+ * intentional and safe in the right direction: the canary gives up while a
+ * real client would still be waiting, so it reports trouble early rather than
+ * late. Do not restate this as "a timeout here means an Android poll already
+ * failed" — that is the claim the numbers do not support.
+ *
+ * Exported so `test/checks.test.ts` can pin it: five artifacts cite this
+ * number's provenance, and a silent edit would leave all of them lying.
  */
-const RECENT_ENTRIES_TIMEOUT_MS = 10_000;
+export const RECENT_ENTRIES_TIMEOUT_MS = 10_000;
 
 /**
  * Top-level keys iOS's `Playlist.init(from:)` decodes with `try
@@ -289,7 +304,12 @@ function isUpstreamUnavailableBody(body: unknown): boolean {
  * `v` selects the response projection: `v=2` is a grouped object, absent-or-1
  * is a flat array. The 2026-08-02→05 access logs put iOS at 86.0% of this
  * route's traffic and the iOS NowPlayingWidget at 10.7%, both on `v=2`;
- * Android (`?n=35`, `JsonImporter.kt:11`) is 2.7% on the flat array. This
+ * Android is 2.7% on the flat array, and its `n` is a good reminder that
+ * source is not deployment: `JsonImporter.kt:11` reads `getRecentEntries(35)`
+ * today, but the logs show `?n=12` — the value that line held before
+ * WXYC-Android commit 4fd22a1 (2025-12-12) changed it, so the build in the
+ * field predates the bump. Prefer the logs over the source when the question
+ * is what the fleet actually sends. This
  * check exercises the 96.7% shape. The flat projection is a RECORDED GAP:
  * both shapes traverse an identical bridge hop and diverge only in Backend's
  * own JSON projection, so a second request here would double the run's

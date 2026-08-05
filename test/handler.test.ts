@@ -1799,6 +1799,25 @@ describe('runCanary — wxyc-info-recent-entries check (bridge measurement, wxyc
   });
 
   it.each([
+    { label: 'a 500', status: 500 },
+    { label: 'a 404', status: 404 },
+  ])('fails on the fail-soft sentinel body arriving with $label instead of a 503', async ({ status }) => {
+    // The mirror image of the test above, and the other half of what makes
+    // the discriminator a CONJUNCTION. Only tubafrenzy's `sendUpstreamUnavailable`
+    // pairs this body with a 503; the same body under any other status means
+    // something is synthesizing it — a misconfigured intermediary, or a future
+    // servlet change — and routing that to the quiet upstream lane would hide a
+    // bridge fault behind "Backend is down". Without this case, dropping the
+    // `r.status === 503` conjunct entirely survives the suite.
+    const { outcome } = runWithLegacy({ status, body: { error: 'upstream_unavailable' } });
+    const result = await outcome;
+
+    expect(result.status).toBe('fail');
+    expect(result.message).toMatch(new RegExp(String(status)));
+    expect(result.metrics).toBeUndefined();
+  });
+
+  it.each([
     { label: 'a 500 from the bridge', status: 500, body: { error: 'boom' } },
     { label: 'a 404 (servlet unmapped)', status: 404, body: { error: 'not found' } },
   ])('fails on $label', async ({ status, body }) => {
@@ -1843,6 +1862,12 @@ describe('runCanary — wxyc-info-recent-entries check (bridge measurement, wxyc
     { field: 'artistName', label: 'a missing string field' },
     { field: 'songTitle', label: 'a second missing string field' },
     { field: 'chronOrderID', label: 'a missing numeric field' },
+    // `hour` is doubly load-bearing on iOS: non-optional `UInt64` in its own
+    // right, AND the fallback source for `timeCreated`
+    // (`decodeIfPresent(.timeCreated) ?? container.decode(UInt64.self, forKey: .hour)`),
+    // so losing it breaks two fields. Without this row, deleting `hour` from
+    // PLAYCUT_REQUIRED_FIELDS survives the suite.
+    { field: 'hour', label: 'the timestamp every entry sorts by' },
   ])('fails when a playcut drops $field ($label)', async ({ field }) => {
     // iOS decodes `[Playcut].self` for the WHOLE array, so one malformed
     // entry anywhere throws the entire decode — which is why the check walks
