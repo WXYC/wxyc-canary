@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { checks, checksForSuite, VALID_SUITES } from '../src/checks.js';
+import { checks, checksForSuite, RECENT_ENTRIES_TIMEOUT_MS, VALID_SUITES } from '../src/checks.js';
 
 describe('checksForSuite', () => {
   it('returns the BS+LML smoke set in the expected order', () => {
@@ -55,6 +55,25 @@ describe('checksForSuite', () => {
     for (const c of checksForSuite('smoke')) {
       expect(fullNames).toContain(c.name);
     }
+  });
+});
+
+describe('RECENT_ENTRIES_TIMEOUT_MS', () => {
+  it('stays pinned to OkHttp default read timeout (10s)', () => {
+    // Deliberately a value pin, i.e. a speed bump rather than a behavioural
+    // test. Five artifacts — this constant's docstring, the
+    // `wxyc-canary-recent-entries-latency` alarm comment in template.yaml
+    // (whose 5000ms threshold is derived as HALF this number), README,
+    // CLAUDE.md, and a comment on WXYC/wiki#88 — all cite this value's
+    // provenance. Editing it silently would leave every one of them lying,
+    // and mutating 10_000 -> 30_000 otherwise survives the whole suite.
+    //
+    // Source: `WXYC-Android` `AppModule.provideWxycApi` builds Retrofit
+    // without `.client(...)`, so OkHttp's defaults apply — 10s connect/read/
+    // write. NOT a wall-clock deadline (`callTimeout` defaults to 0 and
+    // `readTimeout` restarts per successful read); see the docstring for why
+    // the canary is deliberately stricter than any real client.
+    expect(RECENT_ENTRIES_TIMEOUT_MS).toBe(10_000);
   });
 });
 

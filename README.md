@@ -192,13 +192,15 @@ Leave `EnableWriteProbe=false` for the first deploy. Once the DJ test account is
 
 `wxyc-info-recent-entries` measures a host that is scheduled to stop existing. When the `wxyc.info` DNS flip lands, **delete** the check from `src/checks.ts`, its two alarms (`RecentEntriesLatencyAlarm`, `RecentEntriesUpstreamUnavailableAlarm`) and the `LegacyPlaylistUrl` parameter from `template.yaml`, and the `legacyPlaylistUrl` field from `src/types.ts` — a probe left pointing at a dead host pages forever and trains on-call to ignore the alarm that replaced it.
 
-The transition lever, for the window where DNS has moved but the code PR hasn't merged, is a redeploy with an empty parameter:
+The transition lever, for the window where DNS has moved but the code PR hasn't merged, is a redeploy with the probe disabled:
 
 ```bash
-sam deploy --parameter-overrides LegacyPlaylistUrl=''
+sam deploy --parameter-overrides EnableLegacyBridgeProbe=false
 ```
 
 The check then downgrades to `skipped` and both alarms park at no-data/OK. That is a pause, not a retirement — it leaves dead code and two dead alarms in the stack.
+
+It's a boolean rather than a blank `LegacyPlaylistUrl` for a reason worth remembering: **`sam deploy` cannot forward an empty override value.** The shorthand `Key=Value` form rejects `LegacyPlaylistUrl=` at the CLI's own argument parser, before CloudFormation ever sees it — and a shell strips the quotes from `LegacyPlaylistUrl=''`, so the obvious-looking incantation produces exactly the rejected form. This repo already paid for that lesson once in commit `581f74b` (`GhaRunnerTokenSsmParamName= is not a valid format`), which is why `.github/workflows/deploy.yml` builds its optional args in a shell array. `false` is an ordinary non-empty token, so the lever works as written.
 
 ### Verifying the write canary in staging
 
@@ -369,7 +371,7 @@ A page here means the enrichment lane has been shedding for a sustained window w
 
 ### Alarm fires: `wxyc-canary-recent-entries-upstream-unavailable`
 
-A **separate page alarm** from `wxyc-canary-check-failure`, and the whole reason the `wxyc-info-recent-entries` check does not fail on a fail-soft 503: tubafrenzy's `recentEntries` bridge (WXYC/tubafrenzy#620) has answered `503` + `{"error":"upstream_unavailable"}` for **3 consecutive** 5-minute evaluations (~15 min), meaning the servlet could not get a usable response out of Backend. The check itself keeps `pass`ing and carries the signal in the dimensionless `RecentEntriesUpstreamUnavailable` metric, so this never shows up as a `CheckFailure`/`UserFacingCheckFailure` datapoint.
+A **separate page alarm** from `wxyc-canary-check-failure`, and the whole reason the `wxyc-info-recent-entries` check does not fail on a fail-soft 503: tubafrenzy's `recentEntries` bridge (WXYC/tubafrenzy#620) has answered `503` + `{"error":"upstream_unavailable"}` for **3 of the last 6** five-minute evaluations, meaning the servlet could not get a usable response out of Backend. The check itself keeps `pass`ing and carries the signal in the dimensionless `RecentEntriesUpstreamUnavailable` metric, so this never shows up as a `CheckFailure`/`UserFacingCheckFailure` datapoint.
 
 **The first thing to check is whether `backend-healthcheck` is green.** That's the diagnostic this split exists to give you:
 
@@ -381,11 +383,11 @@ A **separate page alarm** from `wxyc-canary-check-failure`, and the whole reason
   curl -s -o /dev/null -w '%{http_code} %{time_starttransfer}\n' 'https://api.wxyc.org/playlists/recentEntries?v=2&n=50'
   ```
 
-3-of-3 (not the shared alarm's 2-of-3) is deliberate and measured. The fail-soft 503 has a **~0.76% baseline** (275 of 36,392 requests, 2026-08-02 → 05) driven by ETL-cron contention on the prod EC2 box — 143 failures in `:00–:04` and 33 in `:30–:34`, i.e. 64% of failures in 17% of the clock, matching 4 concurrent container starts at `:00` and 3 at `:30`. Outside those windows the residual is ~0.33%, which at 2-of-3 would put a spurious page roughly every 100 days. If you are considering loosening this window, re-measure that baseline first — and note the cron contention itself is a live, unresolved finding (mechanism not yet separated between Postgres contention and host CPU/IO).
+3-of-6 is deliberate and measured, and it is a _sliding_ window rather than a consecutive run for a specific reason. Because the fail-soft lane returns `pass`, this alarm is the **only** detector — the shared page never covers for it — so requiring 3 consecutive breaching ticks would detect only a _total_ bridge outage. Intermittent is the normal shape of a network partition: at a 10% fault rate, 3-of-3 takes ~4 days to page (simulated mean 92.5 h) while 3-of-6 takes ~14 h. In the other direction, the fail-soft 503 has a **~0.76% baseline** (275 of 36,392 requests, 2026-08-02 → 05) driven by ETL-cron contention on the prod EC2 box — 143 failures in `:00–:04` and 33 in `:30–:34`, i.e. 64% of failures in 17% of the clock, matching 4 concurrent container starts at `:00` and 3 at `:30`. 3-of-6 dominates on both axes: a spurious page every ~400 days at that baseline (~4,900 at the ~0.33% off-peak residual), better than the 2-of-3 that was rejected for ~20 days. The clustering argument survives the wider window — a 30-minute span holds at most one `:00–:04` and one `:30–:34` burst, so the known pattern tops out at 2 breaching ticks and can never reach 3. If you are considering changing this window, re-measure that baseline first — and note the cron contention itself is a live, unresolved finding (mechanism not yet separated between Postgres contention and host CPU/IO).
 
 ### Alarm fires: `wxyc-canary-recent-entries-latency`
 
-The bridge has been answering slower than **5 s** for 2 of 3 consecutive checks. Listeners are not necessarily seeing errors yet — this is the early-warning half of the objective, and the threshold is half of the tightest real client deadline (Android's 10 s OkHttp default read timeout; `WXYC-Android` `AppModule.kt` builds Retrofit without `.client(...)`). Measured 2026-08-05, the check's own end-to-end time ran 559–775 ms (raw keep-alive ttfb was 218–251 ms; the rest is the 20 KB body read and the JSON parse of ~50 playcuts), so the threshold sits ~6.5× above the slowest observed real run. Those figures came from a laptop, not from us-east-1 Lambda — re-baseline off the real `CheckLatency` series after a week in production before tightening.
+The bridge has been answering slower than **5 s** for 2 of 3 consecutive checks. Listeners are not necessarily seeing errors yet — this is the early-warning half of the objective, and the threshold is half the canary's own 10 s request budget, which is in turn OkHttp's default per-socket read timeout (`WXYC-Android` `AppModule.kt` builds Retrofit without `.client(...)`). Note that's a per-hop budget, not a deadline: OkHttp's `callTimeout` defaults to disabled and `readTimeout` restarts on every successful read, and iOS's 30 s `timeoutInterval` is likewise an inactivity timer. No client enforces a wall-clock deadline, so the canary is deliberately stricter than any of them and reports early rather than late. Measured 2026-08-05, the check's own end-to-end time ran 559–775 ms (raw keep-alive ttfb was 218–251 ms; the rest is the 20 KB body read and the JSON parse of ~50 playcuts), so the threshold sits ~6.5× above the slowest observed real run. Those figures came from a laptop, not from us-east-1 Lambda — re-baseline off the real `CheckLatency` series after a week in production before tightening.
 
 1. Compare the bridge against the origin with the two `curl`s above. **Measure warm** — both real clients hold keep-alive connections, and a cold sample pays ~130 ms of TLS + network-distance setup that no client actually pays per poll. A cold-vs-cold comparison is what produced the bogus "the proxy is faster than its own origin" reading in WXYC/tubafrenzy#626.
 2. If the origin is also slow, this is a Backend latency incident — work it there.

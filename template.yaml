@@ -28,7 +28,7 @@ Parameters:
   LegacyPlaylistUrl:
     Type: String
     Default: http://wxyc.info
-    AllowedPattern: '^(|https?://.+)$'
+    AllowedPattern: '^https?://.+'
     Description: >
       Base URL of the legacy tubafrenzy host the mobile fleet still polls for
       the flowsheet. The `wxyc-info-recent-entries` check (wxyc-canary#93)
@@ -39,13 +39,31 @@ Parameters:
       is the scheme both shipped clients hardcode, so probing https:// would
       measure a path no user takes.
 
-      Set to the empty string to retire the probe ahead of the WXYC/wiki#100
-      DNS flip without waiting on a code deploy — the check then downgrades to
-      skipped and both alarms below go to no-data/OK. That is the TRANSITION
-      lever; retirement proper is deleting the check, its two alarms, and this
-      parameter. `AllowedPattern` permits empty for exactly that reason and
-      otherwise requires an http(s) prefix, so a malformed value fails at
-      deploy rather than failing every tick at runtime.
+      To pause the probe, flip `EnableLegacyBridgeProbe` below — do NOT try to
+      blank this parameter. `sam deploy`'s shorthand `Key=Value` override
+      rejects an empty value at the CLI layer before CloudFormation ever sees
+      it (commit 581f74b hit exactly that with `GhaRunnerTokenSsmParamName=`),
+      so an empty-string lever here would be a documented command that errors
+      out. `AllowedPattern` therefore requires an http(s) prefix outright,
+      which also fails a malformed value at deploy rather than at every tick.
+  EnableLegacyBridgeProbe:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >
+      Whether to run the `wxyc-info-recent-entries` bridge probe. Set to
+      'false' to retire it ahead of the WXYC/wiki#100 DNS flip without waiting
+      on a code deploy — the env var is then forced empty, the check
+      downgrades to skipped, and both bridge alarms go to no-data/OK.
+
+      This exists as a boolean rather than an empty `LegacyPlaylistUrl`
+      because `sam deploy` cannot forward an empty override value (see that
+      parameter's note); 'false' is an ordinary non-empty token the CLI
+      accepts. Same shape as `EnableWriteProbe`, and the same
+      condition-forces-the-env-var-empty mechanism as `HasGhaRunnerProbe`.
+
+      This is the TRANSITION lever, not retirement: retirement proper is
+      deleting the check, its two alarms, and both of these parameters.
   LmlApiKeySecretArn:
     Type: String
     Default: ''
@@ -208,6 +226,7 @@ Conditions:
   HasGitHubReporter: !And
     - !Not [!Equals [!Ref GitHubTokenSsmParamName, '']]
     - !Not [!Equals [!Ref GitHubIssuesRepo, '']]
+  HasLegacyBridgeProbe: !Equals [!Ref EnableLegacyBridgeProbe, 'true']
   HasGhaRunnerProbe: !And
     - !Not [!Equals [!Ref GhaRunnerTokenSsmParamName, '']]
     # !Ref on a Number parameter returns the value as a string ("0"), so the
@@ -233,10 +252,16 @@ Resources:
           CANARY_AUTH_URL: !Ref AuthUrl
           CANARY_SEMANTIC_INDEX_URL: !Ref SemanticIndexUrl
           CANARY_LML_URL: !Ref LmlUrl
-          # Threaded unconditionally, INCLUDING when empty: the handler reads
-          # this with `??` (not `||`), so an empty string survives as the
-          # "skip the probe" signal rather than falling back to the default.
-          CANARY_LEGACY_PLAYLIST_URL: !Ref LegacyPlaylistUrl
+          # Forced to empty-string when the probe is disabled, so the handler
+          # sees a falsy value and the check downgrades to skipped (no alarm) —
+          # the same mechanism CANARY_GHA_RUNNER_ID uses below. The handler
+          # reads this with `??` (not `||`) precisely so an empty string
+          # survives as the skip signal instead of falling back to the default.
+          # CloudFormation and Lambda both accept an empty env-var VALUE; it is
+          # only `sam deploy`'s CLI-layer override parser that rejects an empty
+          # one, which is why the operator lever is the boolean parameter
+          # rather than a blank URL.
+          CANARY_LEGACY_PLAYLIST_URL: !If [HasLegacyBridgeProbe, !Ref LegacyPlaylistUrl, '']
           CANARY_LML_API_KEY_SECRET_ARN: !If [HasLmlApiKey, !Ref LmlApiKeySecretArn, '']
           CANARY_DJ_SECRET_ARN: !If [HasDjCredentials, !Ref DjCredentialsSecretArn, '']
           CANARY_ENABLE_WRITE_PROBE: !Ref EnableWriteProbe
@@ -610,19 +635,23 @@ Resources:
   # against companions for non-alarm-input metrics still holds: the
   # dimensioned series IS the input here).
   #
-  # THRESHOLD, 5000 ms = half of Android's 10 s deadline. Source:
+  # THRESHOLD, 5000 ms = half the canary's own 10 s request budget, which is
+  # in turn OkHttp's default per-socket READ timeout. Source:
   # `WXYC-Android/app/src/main/java/org/wxyc/wxycapp/di/AppModule.kt` builds
   # Retrofit without calling `.client(...)`, so Retrofit constructs a default
   # OkHttpClient, whose connect/read/write timeouts are 10 s each. That is the
-  # tightest real client deadline in the fleet (iOS is looser at 30 s —
-  # `PlaylistDataSourceV1.swift` `timeoutInterval: 30`), and the canary's own
-  # per-request budget is pinned to that same 10 s in `src/checks.ts`. Half of
-  # it is the "one bad hop from failing outright" line, with room to spare:
+  # tightest PER-HOP budget in the fleet, NOT a wall-clock deadline: OkHttp's
+  # `callTimeout` defaults to 0 (disabled) and `readTimeout` restarts on every
+  # successful read, and iOS's 30 s `timeoutInterval` is an inactivity timer
+  # too. NO client enforces a deadline, so this threshold is deliberately
+  # stricter than any client's real behaviour — erring toward reporting early.
+  # See the `RECENT_ENTRIES_TIMEOUT_MS` docstring in `src/checks.ts`. Half the
+  # budget is the "one bad hop from failing outright" line, with room to spare:
   # measured 2026-08-05, the check's own end-to-end time (connect + ttfb +
   # 20 KB body read + JSON parse of ~50 playcuts) was 559-775 ms, and raw
   # keep-alive ttfb was 218-251 ms. So the threshold sits ~6.5x above the
   # slowest observed real run — enough that normal variance cannot reach it,
-  # tight enough to fire well before Android's 10 s cliff. Both figures were
+  # tight enough to fire well before the 10 s per-hop budget. Both figures were
   # taken from a laptop, not from us-east-1 Lambda; re-baseline from
   # `CheckLatency` after a week in production before tightening this.
   #
@@ -667,26 +696,53 @@ Resources:
   # required to tell them apart. (Same metric-carries-the-signal shape as
   # DiscogsBreakerShedAlarm above; see docs/adding-a-check.md.)
   #
-  # 3-of-3 (~15 min), not the shared page's 2-of-3, and the arithmetic is the
-  # whole reason this lane exists. The fail-soft 503 has a measured ~0.76%
-  # baseline (275 of 36,392 requests, 2026-08-02 -> 05) driven by ETL-cron
-  # contention on the prod EC2 box: 143 failures in `:00-:04` and 33 in
-  # `:30-:34` — 64% of failures in 17% of the clock, matching the 4 concurrent
-  # container starts at `:00` and 3 at `:30`. Outside those windows the
-  # residual rate is ~0.33%, which at 2-of-3 would put a spurious page roughly
-  # every 100 days; at 3-of-3 it is effectively never. Detection of a real
-  # partition is not meaningfully delayed: a Backend outage proper already
-  # pages in ~10 min via `backend-healthcheck`. The diagnostic case this alarm
-  # uniquely covers is THIS alarm firing while `backend-healthcheck` stays
-  # green — Backend is up but unreachable FROM Kattare.
+  # 3-of-6 (a 30-minute sliding window), and the arithmetic is the whole reason
+  # this lane exists. Two forces pull in opposite directions.
+  #
+  # Against a TIGHT window: the fail-soft 503 has a measured ~0.76% baseline
+  # (275 of 36,392 requests, 2026-08-02 -> 05) driven by ETL-cron contention on
+  # the prod EC2 box — 143 failures in `:00-:04` and 33 in `:30-:34`, i.e. 64%
+  # of failures in 17% of the clock, matching the 4 concurrent container starts
+  # at `:00` and 3 at `:30`. Outside those windows the residual is ~0.33%.
+  # A 2-of-3 window spuriously pages every ~20 days at the full baseline rate
+  # (~107 days at the residual), which is why the shared page's shape was
+  # rejected for this lane.
+  #
+  # Against a LOOSE window: because the fail-soft lane returns `pass`, THIS
+  # ALARM IS THE ONLY DETECTOR — `UserFacingCheckFailure` stays 0, so the
+  # shared page never covers for it. A CONSECUTIVE-run requirement (3-of-3)
+  # therefore only detects a TOTAL outage. Every tick emits a real 0 or 1
+  # datapoint, so CloudWatch's missing-data look-back cannot bridge the gaps
+  # either. Simulated time-to-page for an INTERMITTENT bridge fault (the normal
+  # shape of a network partition, not the exceptional one):
+  #
+  #     fault rate   3-of-3 mean   3-of-6 mean
+  #     50%          1.2 h         0.6 h
+  #     30%          4.3 h         1.3 h
+  #     20%          12.9 h        2.8 h
+  #     10%          92.5 h        14 h
+  #
+  # A bridge dropping one in ten of every phone's now-playing poll would take
+  # ~4 days to page at 3-of-3. 3-of-6 dominates on BOTH axes: a spurious page
+  # every ~400 days at the full 0.76% baseline (~4,900 days at the residual) —
+  # better than the 2-of-3 that was rejected — while cutting detection 3-6x.
+  # The clustering argument survives the wider window intact: a 30-minute span
+  # contains at most one `:00-:04` and one `:30-:34` burst, so the known
+  # contention pattern tops out at 2 breaching ticks and can never reach 3.
+  #
+  # Detection of a TOTAL outage is not what this alarm is for: a Backend
+  # outage proper already pages in ~10 min via `backend-healthcheck`. The
+  # diagnostic case this alarm uniquely covers is THIS alarm firing while
+  # `backend-healthcheck` stays green — Backend is up but unreachable FROM
+  # Kattare — and that case is disproportionately the intermittent one.
   RecentEntriesUpstreamUnavailableAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
       AlarmName: wxyc-canary-recent-entries-upstream-unavailable
       AlarmDescription: >
         tubafrenzy's recentEntries bridge has been failing soft (503
-        upstream_unavailable) for 3 consecutive 5-minute checks — it could not
-        get a usable response out of Backend. Cross-check
+        upstream_unavailable) for 3 of the last 6 five-minute checks — it could
+        not get a usable response out of Backend. Cross-check
         `wxyc-canary-check-failure` / backend-healthcheck: if Backend is green,
         the Kattare -> AWS path is the fault, not Backend. Retires with
         WXYC/wiki#100.
@@ -695,7 +751,7 @@ Resources:
       Dimensions: []
       Statistic: Maximum
       Period: 300
-      EvaluationPeriods: 3
+      EvaluationPeriods: 6
       DatapointsToAlarm: 3
       Threshold: 1
       ComparisonOperator: GreaterThanOrEqualToThreshold
