@@ -31,6 +31,12 @@ function loadConfigFromEnv(): CanaryConfig {
     authUrl: required('CANARY_AUTH_URL'),
     semanticIndexUrl: required('CANARY_SEMANTIC_INDEX_URL'),
     lmlUrl: process.env.CANARY_LML_URL ?? 'https://library-metadata-lookup-production.up.railway.app',
+    // `??` (not `||`) deliberately, unlike the runner-liveness / OIDC fields
+    // below: an explicit empty string here is a MEANINGFUL value — it retires
+    // the `wxyc-info-recent-entries` probe ahead of the WXYC/wiki#100 DNS
+    // flip without a code deploy. Falling through to the default on empty
+    // would take that lever away.
+    legacyPlaylistUrl: process.env.CANARY_LEGACY_PLAYLIST_URL ?? 'http://wxyc.info',
     lmlApiKey: process.env.CANARY_LML_API_KEY,
     originUrl: process.env.CANARY_ORIGIN_URL ?? 'https://dj.wxyc.org',
     djEmail: process.env.CANARY_DJ_EMAIL,
@@ -267,6 +273,9 @@ export async function runCanary(
     authUrl: config.authUrl,
     semanticIndexUrl: config.semanticIndexUrl,
     lmlUrl: config.lmlUrl ?? 'https://library-metadata-lookup-production.up.railway.app',
+    // `??` so a caller-supplied empty string survives as the skip signal
+    // (see the env loader above); only an absent value picks up the default.
+    legacyPlaylistUrl: config.legacyPlaylistUrl ?? 'http://wxyc.info',
     lmlApiKey,
     djAuth,
     enrichmentPollTimeoutMs: config.enrichmentPollTimeoutMs ?? DEFAULT_ENRICHMENT_POLL_TIMEOUT_MS,

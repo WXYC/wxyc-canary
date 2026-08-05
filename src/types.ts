@@ -141,6 +141,20 @@ export type CheckContext = {
    */
   lmlUrl: string;
   /**
+   * Base URL of the legacy tubafrenzy host (no trailing slash) that the
+   * mobile fleet still polls for the flowsheet — `http://wxyc.info` in
+   * production, plain HTTP because that is what the shipped clients
+   * hardcode. The `wxyc-info-recent-entries` check (wxyc-canary#93) measures
+   * `${legacyPlaylistUrl}/playlists/recentEntries`, which since
+   * WXYC/tubafrenzy#620 reverse-proxies to Backend's route of the same name.
+   *
+   * Empty string → the check downgrades to skipped, which is the transition
+   * affordance for the WXYC/wiki#100 DNS flip: an operator can retire the
+   * probe by blanking the CFN parameter without waiting on a code deploy.
+   * Retirement proper is deleting the check.
+   */
+  legacyPlaylistUrl: string;
+  /**
    * Production LML bearer (the shared service-to-service secret that BS,
    * rom, and tubafrenzy also send). Undefined when neither the
    * `CANARY_LML_API_KEY` env var nor a `CANARY_LML_API_KEY_SECRET_ARN`
@@ -236,6 +250,11 @@ export type CanaryConfig = {
    * handler when unset.
    */
   lmlUrl?: string;
+  /**
+   * See `CheckContext.legacyPlaylistUrl`. Defaults to `http://wxyc.info` in
+   * the handler when unset; an explicit empty string skips the check.
+   */
+  legacyPlaylistUrl?: string;
   /**
    * Production LML bearer (shared with BS, rom, tubafrenzy). When unset,
    * the `lml-auth` check downgrades to skipped — same operator-gap
