@@ -224,6 +224,173 @@ const semanticIndexFreshness: Check = {
 };
 
 /**
+ * Per-request budget for the legacy-bridge probe, in milliseconds. Sourced
+ * from the TIGHTEST real client deadline rather than the canary's 8 s
+ * default: `WXYC-Android`'s `AppModule.provideWxycApi` builds Retrofit
+ * without calling `.client(...)`, so Retrofit constructs a default
+ * `OkHttpClient`, whose connect/read/write timeouts are 10 s each and whose
+ * overall call timeout is disabled. A response that takes longer than this
+ * is not "slow" — it is an Android poll that already failed. (iOS is looser:
+ * `PlaylistDataSourceV1.swift` sets `timeoutInterval: 30`.)
+ */
+const RECENT_ENTRIES_TIMEOUT_MS = 10_000;
+
+/**
+ * Top-level keys iOS's `Playlist.init(from:)` decodes with `try
+ * container.decode` — i.e. non-optional. `showMarkers` and `onAir` are
+ * deliberately absent from this list: those use `decodeIfPresent` and are
+ * genuinely optional. Dropping any key below from the payload throws in
+ * every client decode, so an "omit the empty array" change upstream is an
+ * outage, not an optimization.
+ */
+const RECENT_ENTRIES_REQUIRED_GROUPS = ['playcuts', 'breakpoints', 'talksets'] as const;
+
+/**
+ * Playcut fields iOS's `Playcut.init(from:)` decodes non-optionally, with
+ * the type it decodes them as. `labelName` / `releaseTitle` / `timeCreated`
+ * use `decodeIfPresent` (or fall back to another key) and are omitted here;
+ * so is every enrichment field (`artworkURL`, streaming URLs, …), which is
+ * absent on most rows in a healthy response.
+ */
+const PLAYCUT_REQUIRED_FIELDS = [
+  { key: 'id', type: 'number' },
+  { key: 'hour', type: 'number' },
+  { key: 'chronOrderID', type: 'number' },
+  { key: 'songTitle', type: 'string' },
+  { key: 'artistName', type: 'string' },
+] as const;
+
+/**
+ * The exact fail-soft body `RecentEntriesJSONServlet.sendUpstreamUnavailable`
+ * writes when the bridge cannot get a usable response out of Backend.
+ */
+const UPSTREAM_UNAVAILABLE_SENTINEL = 'upstream_unavailable';
+
+/** True only for tubafrenzy's own documented fail-soft body. */
+function isUpstreamUnavailableBody(body: unknown): boolean {
+  return !!body && typeof body === 'object' && (body as { error?: unknown }).error === UPSTREAM_UNAVAILABLE_SENTINEL;
+}
+
+/**
+ * Anonymous: the tubafrenzy bridge path the mobile fleet actually polls
+ * (wxyc-canary#93). Since WXYC/tubafrenzy#620, a plain recent-N request to
+ * `wxyc.info/playlists/recentEntries` is reverse-proxied to Backend's route
+ * of the same name; every other canary check talks to `api.wxyc.org`
+ * directly, so nothing else measures the hop the shipped clients traverse:
+ * DNS → Kattare Tomcat → servlet → HTTPS → AWS → Express.
+ *
+ * RETIREMENT TRIGGER: WXYC/wiki#100 (the `wxyc.info` DNS flip). When that
+ * lands, the host under test stops existing and this check should be
+ * DELETED, not left to fail — along with its two alarms in `template.yaml`
+ * and the `LegacyPlaylistUrl` parameter. Blanking that parameter is only the
+ * transition affordance (the probe skips), not the retirement.
+ *
+ * URL SHAPE. `?v=2&n=50` is iOS's literal from `PlaylistEntry.swift:17`, and
+ * `v` selects the response projection: `v=2` is a grouped object, absent-or-1
+ * is a flat array. The 2026-08-02→05 access logs put iOS at 86.0% of this
+ * route's traffic and the iOS NowPlayingWidget at 10.7%, both on `v=2`;
+ * Android (`?n=35`, `JsonImporter.kt:11`) is 2.7% on the flat array. This
+ * check exercises the 96.7% shape. The flat projection is a RECORDED GAP:
+ * both shapes traverse an identical bridge hop and diverge only in Backend's
+ * own JSON projection, so a second request here would double the run's
+ * latency signal to cover a Backend-side contract this check is not scoped
+ * to.
+ *
+ * TWO LANES, TWO ALARMS. The check distinguishes a fault in the bridge from
+ * a Backend outage behind it, because an operator paged at 3am needs to know
+ * which service to open:
+ *
+ *   - BRIDGE FAULT — timeout, network error, a non-2xx that isn't the
+ *     fail-soft sentinel, or a malformed body — THROWS. That routes through
+ *     `UserFacingCheckFailure` to the shared `wxyc-canary-check-failure`
+ *     page, and no metric is emitted (we observed no upstream verdict, so
+ *     emitting `0` would assert "Backend is fine" on evidence we lack).
+ *   - BACKEND UNREACHABLE FROM THE BRIDGE — tubafrenzy's fail-soft `503` +
+ *     `{"error":"upstream_unavailable"}` — PASSES, carrying the signal in
+ *     `RecentEntriesUpstreamUnavailable: 1` to its own dedicated alarm.
+ *
+ * That second lane is the `lml-discogs-breaker-shed` metric-carries-the-
+ * signal pattern (docs/adding-a-check.md), and it is load-bearing here for a
+ * measured reason rather than a stylistic one: the fail-soft 503 has a
+ * ~0.76% baseline rate (275 of 36,392 requests, 2026-08-02→05) clustered in
+ * the `:00–:04` and `:30–:34` ETL-cron windows — 64% of failures in 17% of
+ * the clock. Routing that through the shared page would either train on-call
+ * to ignore it or force the whole page alarm to absorb a bespoke evaluation
+ * window it doesn't need.
+ *
+ * The status lane keys on the BODY sentinel, not the 503 alone: Kattare and
+ * Tomcat's own admission control answer 503 + `Retry-After: 5` too, and
+ * filing those under "Backend is down" sends the operator to the wrong
+ * service entirely.
+ */
+const wxycInfoRecentEntries: Check = {
+  name: 'wxyc-info-recent-entries',
+  description: 'GET wxyc.info/playlists/recentEntries?v=2&n=50 — the tubafrenzy bridge path the mobile fleet polls',
+  requiresAuth: false,
+  // Page tier (default). This is the listener-facing now-playing surface for
+  // both mobile apps; a sustained break here blanks every phone.
+  run: async (ctx): Promise<CheckResult | void> => {
+    if (!ctx.legacyPlaylistUrl) {
+      return { skipped: true, skipReason: 'no legacy playlist URL configured' };
+    }
+    const url = `${ctx.legacyPlaylistUrl}/playlists/recentEntries?v=2&n=50`;
+    // A CanaryFetchError (timeout / network) propagates deliberately: a poll
+    // that never completes is the failure a poller actually feels, and it is
+    // a bridge-lane fault.
+    const r = await canaryFetch(url, { timeoutMs: RECENT_ENTRIES_TIMEOUT_MS });
+
+    if (r.status === 503 && isUpstreamUnavailableBody(r.body)) {
+      return { metrics: { RecentEntriesUpstreamUnavailable: 1 } };
+    }
+    if (!r.ok) {
+      throw new Error(`expected 2xx, got ${r.status}: ${r.rawText.slice(0, 200)}`);
+    }
+
+    const body = r.body;
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      // An array here means the bridge dropped `v` on the way through and
+      // Backend served the flat projection — a silent break of every iOS
+      // client behind a plausible-looking 200.
+      throw new Error(`expected the v2 grouped object, got: ${r.rawText.slice(0, 200)}`);
+    }
+    const grouped = body as Record<string, unknown>;
+    for (const group of RECENT_ENTRIES_REQUIRED_GROUPS) {
+      if (!Array.isArray(grouped[group])) {
+        throw new Error(
+          `v2 response is missing the required \`${group}\` array — the iOS Playlist decoder declares it non-optional, so every client decode would throw`
+        );
+      }
+    }
+
+    const playcuts = grouped.playcuts as unknown[];
+    if (playcuts.length === 0) {
+      // Structurally valid but empty is the shape a truncated or failed
+      // upstream read produces, and it renders as a blank now-playing screen.
+      // Same class as `semantic-index-freshness`'s artist_count floor.
+      throw new Error('v2 response carries zero playcuts — the flowsheet read returned nothing');
+    }
+    // Walk every entry, not just the first: iOS decodes `[Playcut].self` for
+    // the whole array, so one malformed row anywhere throws the entire decode.
+    for (const [index, entry] of playcuts.entries()) {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+        throw new Error(`playcuts[${index}] is not an object`);
+      }
+      const row = entry as Record<string, unknown>;
+      const violations = PLAYCUT_REQUIRED_FIELDS.filter((f) => typeof row[f.key] !== f.type).map(
+        (f) => `${f.key} (expected ${f.type}, got ${row[f.key] === undefined ? 'nothing' : typeof row[f.key]})`
+      );
+      if (violations.length > 0) {
+        throw new Error(
+          `playcuts[${index}] violates the iOS Playcut decoder contract: ${violations.join(', ')} — the whole [Playcut] decode would throw`
+        );
+      }
+    }
+
+    return { metrics: { RecentEntriesUpstreamUnavailable: 0 } };
+  },
+};
+
+/**
  * DJ-authenticated: the catalog-search endpoint dj-site uses for
  * autocomplete. This is the exact path that 503'd on 2026-04-30 because of
  * the cached `library.artist_name` precondition. Hitting it under a real
@@ -1033,6 +1200,7 @@ export const checks: readonly Check[] = [
   proxyLibrarySearch,
   semanticIndexSearch,
   semanticIndexFreshness,
+  wxycInfoRecentEntries,
   djLibrarySearch,
   djFlowsheetRead,
   djRotation,

@@ -37,6 +37,11 @@ describe('checksForSuite', () => {
       // once they've proven out against staging, not a day-one requirement.
       'lml-protected-search',
       'lml-enrichment-lookup',
+      // wxyc-canary#93: probes the production `wxyc.info` bridge host, which
+      // has no staging counterpart — the CLI's smoke suite gates staging
+      // deploys, so a production-only probe there would either fail the gate
+      // or measure prod from a staging run. Lambda-only by construction.
+      'wxyc-info-recent-entries',
     ]) {
       expect(smokeNames).not.toContain(name);
     }
@@ -105,6 +110,11 @@ describe('pagesOncall — paging-tier classification', () => {
     // DiscogsBreakerShedding metric + a dedicated alarm), but the
     // classification still routes it into the user-facing tier, not infra.
     expect(paging).toContain('lml-discogs-breaker-shed');
+    // wxyc-canary#93 — the listener-facing now-playing path for both mobile
+    // apps. Its fail-soft-503 lane deliberately does NOT fail the check (the
+    // signal rides `RecentEntriesUpstreamUnavailable` to a dedicated alarm),
+    // but a genuine bridge fault still pages through this tier.
+    expect(paging).toContain('wxyc-info-recent-entries');
     // lml-protected-search + lml-enrichment-lookup (wxyc-canary#82, the
     // BS#1819 isolation-contract pair) both page by default: a hard failure
     // on either is a real DJ/listener-facing degradation, just routed

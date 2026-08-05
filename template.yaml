@@ -25,6 +25,27 @@ Parameters:
       library-metadata-lookup base URL. The `lml-auth` check POSTs
       directly to `${LmlUrl}/api/v1/lookup` with `LML_API_KEY` to detect
       bearer rotation drift in isolation from the BS proxy path.
+  LegacyPlaylistUrl:
+    Type: String
+    Default: http://wxyc.info
+    AllowedPattern: '^(|https?://.+)$'
+    Description: >
+      Base URL of the legacy tubafrenzy host the mobile fleet still polls for
+      the flowsheet. The `wxyc-info-recent-entries` check (wxyc-canary#93)
+      appends `/playlists/recentEntries?v=2&n=50` to it — the
+      only probe in this canary that traverses the WXYC/tubafrenzy#620 bridge
+      (DNS -> Kattare Tomcat -> servlet -> HTTPS -> AWS -> Express) rather
+      than talking to api.wxyc.org directly. Plain `http://` on purpose: that
+      is the scheme both shipped clients hardcode, so probing https:// would
+      measure a path no user takes.
+
+      Set to the empty string to retire the probe ahead of the WXYC/wiki#100
+      DNS flip without waiting on a code deploy — the check then downgrades to
+      skipped and both alarms below go to no-data/OK. That is the TRANSITION
+      lever; retirement proper is deleting the check, its two alarms, and this
+      parameter. `AllowedPattern` permits empty for exactly that reason and
+      otherwise requires an http(s) prefix, so a malformed value fails at
+      deploy rather than failing every tick at runtime.
   LmlApiKeySecretArn:
     Type: String
     Default: ''
@@ -212,6 +233,10 @@ Resources:
           CANARY_AUTH_URL: !Ref AuthUrl
           CANARY_SEMANTIC_INDEX_URL: !Ref SemanticIndexUrl
           CANARY_LML_URL: !Ref LmlUrl
+          # Threaded unconditionally, INCLUDING when empty: the handler reads
+          # this with `??` (not `||`), so an empty string survives as the
+          # "skip the probe" signal rather than falling back to the default.
+          CANARY_LEGACY_PLAYLIST_URL: !Ref LegacyPlaylistUrl
           CANARY_LML_API_KEY_SECRET_ARN: !If [HasLmlApiKey, !Ref LmlApiKeySecretArn, '']
           CANARY_DJ_SECRET_ARN: !If [HasDjCredentials, !Ref DjCredentialsSecretArn, '']
           CANARY_ENABLE_WRITE_PROBE: !Ref EnableWriteProbe
@@ -549,6 +574,127 @@ Resources:
           Expression: 'IF(shed >= 1 AND liveDelta > 0, 1, 0)'
           Label: DiscogsBreakerSheddingWithTraffic
           ReturnData: true
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+      OKActions:
+        - !Ref AlertTopic
+
+  # ==== wxyc-canary#93: the tubafrenzy bridge path the mobile fleet polls ====
+  #
+  # Both alarms below RETIRE WITH WXYC/wiki#100 (the wxyc.info DNS flip),
+  # alongside the `wxyc-info-recent-entries` check and the LegacyPlaylistUrl
+  # parameter. Blanking that parameter parks both at no-data/OK in the
+  # meantime.
+  #
+  # WHY TWO ALARMS AND NOT A p95 GATE. wxyc-canary#93 replaced WXYC/wiki#88's
+  # proposed `p95 <= 150ms` acceptance criterion, which was wrong in three
+  # ways: it measured the api.wxyc.org origin span while claiming a
+  # user-experience property; it was pinned to `?n=100`, a shape no client
+  # issues; and its denominator shrinks as `playlist_api_version` rolls iOS to
+  # v2 and off this route entirely. A fixed p95 is also the wrong INSTRUMENT
+  # for this consumer set — both clients are 30-second pollers with
+  # multi-second timeouts, so the difference between 80 ms and 400 ms is
+  # invisible to a listener. What hurts them is a poll that does not complete.
+  # Hence: an availability signal (the check's own throw -> the shared page)
+  # plus a tail-latency alarm, with every threshold derived from a client
+  # constant rather than from a percentile of our own history.
+
+  # Tail-latency alarm. Reads the `Check`-DIMENSIONED `CheckLatency` series
+  # directly — a fully-specified simple-form alarm is legal and precise, so
+  # this needs no dimensionless companion and none is emitted (the org rule
+  # against companions for non-alarm-input metrics still holds: the
+  # dimensioned series IS the input here).
+  #
+  # THRESHOLD, 5000 ms = half of Android's 10 s deadline. Source:
+  # `WXYC-Android/app/src/main/java/org/wxyc/wxycapp/di/AppModule.kt` builds
+  # Retrofit without calling `.client(...)`, so Retrofit constructs a default
+  # OkHttpClient, whose connect/read/write timeouts are 10 s each. That is the
+  # tightest real client deadline in the fleet (iOS is looser at 30 s —
+  # `PlaylistDataSourceV1.swift` `timeoutInterval: 30`), and the canary's own
+  # per-request budget is pinned to that same 10 s in `src/checks.ts`. Half of
+  # it is the "one bad hop from failing outright" line, with room to spare:
+  # measured 2026-08-05, the check's own end-to-end time (connect + ttfb +
+  # 20 KB body read + JSON parse of ~50 playcuts) was 559-775 ms, and raw
+  # keep-alive ttfb was 218-251 ms. So the threshold sits ~6.5x above the
+  # slowest observed real run — enough that normal variance cannot reach it,
+  # tight enough to fire well before Android's 10 s cliff. Both figures were
+  # taken from a laptop, not from us-east-1 Lambda; re-baseline from
+  # `CheckLatency` after a week in production before tightening this.
+  #
+  # 2-of-3 (not 1-of-1): the pre-flip baseline in WXYC/wiki#88 observed a
+  # 5.5 s single-sample max. A one-off tail excursion is precisely what the
+  # issue says NOT to page on; two of three consecutive ticks above 5 s is
+  # sustained degradation.
+  RecentEntriesLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: wxyc-canary-recent-entries-latency
+      AlarmDescription: >
+        The wxyc.info -> Backend flowsheet bridge has been answering slower
+        than half of Android's 10 s OkHttp deadline for 2 of 3 consecutive
+        5-minute checks. Listeners are not necessarily seeing errors yet;
+        Android polls are one bad hop from timing out. Retires with
+        WXYC/wiki#100.
+      Namespace: WXYC/Canary
+      MetricName: CheckLatency
+      Dimensions:
+        - Name: Check
+          Value: wxyc-info-recent-entries
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      Threshold: 5000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+      OKActions:
+        - !Ref AlertTopic
+
+  # Upstream-unavailable alarm — the lane that keeps a Backend outage
+  # distinguishable from a bridge fault (wxyc-canary#93). The check does NOT
+  # fail when tubafrenzy returns its documented fail-soft (`503` +
+  # `{"error":"upstream_unavailable"}`, WXYC/tubafrenzy#620); it passes and
+  # carries the signal here, so a bridge fault pages via
+  # `wxyc-canary-check-failure` and a Backend outage behind the bridge pages
+  # via THIS alarm. Two alarm names, two runbook entries, no log-reading
+  # required to tell them apart. (Same metric-carries-the-signal shape as
+  # DiscogsBreakerShedAlarm above; see docs/adding-a-check.md.)
+  #
+  # 3-of-3 (~15 min), not the shared page's 2-of-3, and the arithmetic is the
+  # whole reason this lane exists. The fail-soft 503 has a measured ~0.76%
+  # baseline (275 of 36,392 requests, 2026-08-02 -> 05) driven by ETL-cron
+  # contention on the prod EC2 box: 143 failures in `:00-:04` and 33 in
+  # `:30-:34` — 64% of failures in 17% of the clock, matching the 4 concurrent
+  # container starts at `:00` and 3 at `:30`. Outside those windows the
+  # residual rate is ~0.33%, which at 2-of-3 would put a spurious page roughly
+  # every 100 days; at 3-of-3 it is effectively never. Detection of a real
+  # partition is not meaningfully delayed: a Backend outage proper already
+  # pages in ~10 min via `backend-healthcheck`. The diagnostic case this alarm
+  # uniquely covers is THIS alarm firing while `backend-healthcheck` stays
+  # green — Backend is up but unreachable FROM Kattare.
+  RecentEntriesUpstreamUnavailableAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: wxyc-canary-recent-entries-upstream-unavailable
+      AlarmDescription: >
+        tubafrenzy's recentEntries bridge has been failing soft (503
+        upstream_unavailable) for 3 consecutive 5-minute checks — it could not
+        get a usable response out of Backend. Cross-check
+        `wxyc-canary-check-failure` / backend-healthcheck: if Backend is green,
+        the Kattare -> AWS path is the fault, not Backend. Retires with
+        WXYC/wiki#100.
+      Namespace: WXYC/Canary
+      MetricName: RecentEntriesUpstreamUnavailable
+      Dimensions: []
+      Statistic: Maximum
+      Period: 300
       EvaluationPeriods: 3
       DatapointsToAlarm: 3
       Threshold: 1

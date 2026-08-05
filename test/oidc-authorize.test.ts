@@ -23,6 +23,11 @@ function baseCtx(overrides: Partial<CheckContext>): CheckContext {
     authUrl: 'https://auth.example.test',
     semanticIndexUrl: 'https://explore.example.test',
     lmlUrl: 'https://lml.example.test',
+    // Empty: this file drives `oidcAuthorize.run` directly, so the legacy
+    // bridge probe never runs — but the field is non-optional on
+    // `CheckContext`, and a synthetic host would be a live-looking value in a
+    // context that never uses it.
+    legacyPlaylistUrl: '',
     lmlApiKey: undefined,
     djAuth: {
       kind: 'signed-in',

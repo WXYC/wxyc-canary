@@ -4,7 +4,7 @@ import { dirname, resolve } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import YAML from 'yaml';
 import { handler, runCanary } from '../src/handler.js';
-import type { CanaryConfig } from '../src/types.js';
+import type { CanaryConfig, CheckOutcome } from '../src/types.js';
 
 // Module-mock hoisting: vi.mock is hoisted above imports, so the mock factory
 // must use vi.hoisted() to share the spy with test assertions. Placing the
@@ -52,6 +52,79 @@ const stereolabSearchResults = [
 ];
 
 const proxyLibrarySearchResponse = { results: stereolabSearchResults, total: 1, query: 'Stereolab' };
+
+/**
+ * A shape-complete `?v=2` grouped response, trimmed to two playcuts. Mirrors
+ * what `http://wxyc.info/playlists/recentEntries?v=2&n=50` actually returned
+ * when probed on 2026-08-05 — including the detail that `artworkURL` is
+ * present on some entries and absent on others, so the check must not treat
+ * enrichment fields as required. Artists are WXYC-representative per the org
+ * fixture convention (`wxyc-shared` example data).
+ */
+const recentEntriesV2Body = {
+  playcuts: [
+    {
+      id: 5303877,
+      chronOrderID: 5303877,
+      hour: 1785949200000,
+      timeCreated: 1785952490192,
+      songTitle: 'la paradoja',
+      artistName: 'Juana Molina',
+      releaseTitle: 'DOGA',
+      labelName: 'Sonamos',
+      rotation: 'true',
+      request: 'false',
+    },
+    {
+      id: 5303876,
+      chronOrderID: 5303876,
+      hour: 1785949200000,
+      timeCreated: 1785952208502,
+      songTitle: 'Back, Baby',
+      artistName: 'Jessica Pratt',
+      releaseTitle: 'On Your Own Love Again',
+      labelName: 'Drag City',
+      rotation: 'false',
+      request: 'false',
+      artworkURL: 'https://i.discogs.com/example/artwork.jpeg',
+    },
+  ],
+  // Empty in the live sample, and deliberately kept empty here: the check
+  // must require the KEY, not a non-empty array. Only `playcuts` carries a
+  // content floor.
+  breakpoints: [],
+  talksets: [{ id: 5303873, chronOrderID: 5303873, hour: 1785949200000, timeCreated: 1785951689972 }],
+};
+
+/**
+ * Happy-path stub for the legacy-bridge probe (`wxyc-info-recent-entries`).
+ *
+ * Every block whose assertions depend on a full green run must stitch this
+ * in: `baseConfig` and the env loader both default `legacyPlaylistUrl` to
+ * `http://wxyc.info`, so an unstubbed block hits `setUpFetchMock`'s
+ * deliberate 599 fallback and takes a page-tier failure. Keyed on the path
+ * alone so it matches both the production host and the synthetic host the
+ * check's own describe block uses.
+ */
+const RECENT_ENTRIES_STUB: Record<string, StubEntry> = {
+  '/playlists/recentEntries': { status: 200, body: recentEntriesV2Body },
+};
+
+/** The same fixture as a `setUpMethodAwareMock` route. */
+const RECENT_ENTRIES_ROUTE = {
+  method: 'GET',
+  pattern: '/playlists/recentEntries',
+  responses: [{ status: 200, body: recentEntriesV2Body }],
+};
+
+/** Pluck one outcome by check name; throws (rather than returning undefined) if absent. */
+function byNameOf(name: string) {
+  return (outcomes: CheckOutcome[]): CheckOutcome => {
+    const found = outcomes.find((o) => o.name === name);
+    if (!found) throw new Error(`no outcome for check ${name}; got ${outcomes.map((o) => o.name).join(', ')}`);
+    return found;
+  };
+}
 
 /**
  * A single stub entry: either a static `{status, body, headers?}` (the
@@ -184,6 +257,7 @@ function setUpFetchMock(responses: Record<string, StubEntry>) {
 describe('runCanary — anonymous-only configuration', () => {
   beforeEach(() => {
     setUpFetchMock({
+      ...RECENT_ENTRIES_STUB,
       '/healthcheck': { status: 200, body: { ok: true } },
       '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
       '/graph/artists/search': { status: 200, body: { results: [{ id: 97426, canonical_name: 'stereolab' }] } },
@@ -210,10 +284,10 @@ describe('runCanary — anonymous-only configuration', () => {
     vi.unstubAllGlobals();
   });
 
-  it('passes the 4 truly-anonymous checks and skips the 11 conditional checks when no credentials are configured', async () => {
+  it('passes the 5 truly-anonymous checks and skips the 11 conditional checks when no credentials are configured', async () => {
     const outcomes = await runCanary(baseConfig);
 
-    expect(outcomes).toHaveLength(15);
+    expect(outcomes).toHaveLength(16);
     const byName = Object.fromEntries(outcomes.map((o) => [o.name, o]));
     expect(byName['backend-healthcheck'].status).toBe('pass');
     expect(byName['semantic-index-search'].status).toBe('pass');
@@ -223,6 +297,11 @@ describe('runCanary — anonymous-only configuration', () => {
     // than in the check's own status (see src/checks.ts docstring).
     expect(byName['lml-discogs-breaker-shed'].status).toBe('pass');
     expect(byName['lml-discogs-breaker-shed'].metrics?.DiscogsBreakerShedding).toBe(0);
+    // `wxyc-info-recent-entries` (wxyc-canary#93) needs no auth either — the
+    // bridge route is public and unauthenticated, which is exactly why it is
+    // reachable from a canary at all.
+    expect(byName['wxyc-info-recent-entries'].status).toBe('pass');
+    expect(byName['wxyc-info-recent-entries'].metrics?.RecentEntriesUpstreamUnavailable).toBe(0);
     expect(byName['proxy-library-search'].status).toBe('skipped');
     expect(byName['dj-library-search'].status).toBe('skipped');
     expect(byName['dj-flowsheet-read'].status).toBe('skipped');
@@ -260,6 +339,7 @@ describe('runCanary — failure surfaces (regression coverage for the 2026-04-30
 
   it('catches catalog-search returning 503 (the actual incident shape)', async () => {
     setUpFetchMock({
+      ...RECENT_ENTRIES_STUB,
       '/healthcheck': { status: 200, body: { ok: true } },
       '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
       '/graph/artists/search': { status: 200, body: { results: [{ id: 1, canonical_name: 'stereolab' }] } },
@@ -284,6 +364,7 @@ describe('runCanary — failure surfaces (regression coverage for the 2026-04-30
 
   it('catches semantic-index returning a wrapped object missing the results key', async () => {
     setUpFetchMock({
+      ...RECENT_ENTRIES_STUB,
       '/healthcheck': { status: 200, body: { ok: true } },
       '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
       '/graph/artists/search': { status: 200, body: { something_else: [] } },
@@ -298,6 +379,7 @@ describe('runCanary — failure surfaces (regression coverage for the 2026-04-30
 
   it('catches LML/proxy returning 504 (LML degradation)', async () => {
     setUpFetchMock({
+      ...RECENT_ENTRIES_STUB,
       '/healthcheck': { status: 200, body: { ok: true } },
       '/sign-in/email': { status: 200, body: { token: 'fake-session-token', user: { id: 'u1' } } },
       '/token': { status: 200, body: { token: 'fake-jwt' } },
@@ -318,6 +400,7 @@ describe('runCanary — failure surfaces (regression coverage for the 2026-04-30
 
   it('catches catalog-search succeeding but returning zero rows (silent regression)', async () => {
     setUpFetchMock({
+      ...RECENT_ENTRIES_STUB,
       '/healthcheck': { status: 200, body: { ok: true } },
       '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
       '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
@@ -346,6 +429,7 @@ describe('runCanary — failure surfaces (regression coverage for the 2026-04-30
   // ~5 min instead of waiting for someone to spot the spinner.
   it('catches the rotation picker returning 502 (BS#1030 cascade-to-502 regression class)', async () => {
     setUpFetchMock({
+      ...RECENT_ENTRIES_STUB,
       '/healthcheck': { status: 200, body: { ok: true } },
       '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
       '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
@@ -367,6 +451,7 @@ describe('runCanary — failure surfaces (regression coverage for the 2026-04-30
 
   it('passes the picker probe when the rotation list yields an id and /tracks returns an array', async () => {
     setUpFetchMock({
+      ...RECENT_ENTRIES_STUB,
       '/healthcheck': { status: 200, body: { ok: true } },
       '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
       '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
@@ -387,6 +472,7 @@ describe('runCanary — failure surfaces (regression coverage for the 2026-04-30
 
   it('skips the picker probe when the rotation list is empty (cannot synthesize a probe target)', async () => {
     setUpFetchMock({
+      ...RECENT_ENTRIES_STUB,
       '/healthcheck': { status: 200, body: { ok: true } },
       '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
       '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
@@ -407,6 +493,7 @@ describe('runCanary — failure surfaces (regression coverage for the 2026-04-30
 
   it('does not short-circuit other checks when one fails', async () => {
     setUpFetchMock({
+      ...RECENT_ENTRIES_STUB,
       '/healthcheck': { status: 500, body: { error: 'oops' } },
       '/sign-in/email': { status: 200, body: { token: 'fake-session-token', user: { id: 'u1' } } },
       '/token': { status: 200, body: { token: 'fake-jwt' } },
@@ -427,6 +514,7 @@ describe('runCanary — failure surfaces (regression coverage for the 2026-04-30
 
   it('downgrades DJ-auth checks to fail (not skipped) when sign-in itself errors', async () => {
     setUpFetchMock({
+      ...RECENT_ENTRIES_STUB,
       '/healthcheck': { status: 200, body: { ok: true } },
       '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
       '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
@@ -442,6 +530,7 @@ describe('runCanary — failure surfaces (regression coverage for the 2026-04-30
 
   it('downgrades DJ-auth checks to fail when the session→JWT exchange errors (regression: cookie-style token alone gets 401 on backend routes)', async () => {
     setUpFetchMock({
+      ...RECENT_ENTRIES_STUB,
       '/healthcheck': { status: 200, body: { ok: true } },
       '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
       '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
@@ -482,6 +571,7 @@ describe('runCanary — semantic-index-freshness check (silent stale-graph backs
   // 599s shadowing the freshness result.
   function setUpHealthMock(health: { status: number; body: unknown }) {
     return setUpFetchMock({
+      ...RECENT_ENTRIES_STUB,
       '/healthcheck': { status: 200, body: { ok: true } },
       '/graph/artists/search': { status: 200, body: { results: [{ id: 1, canonical_name: 'stereolab' }] } },
       'explore.example.test/health': health,
@@ -908,6 +998,7 @@ describe('runCanary — lml-auth check (BS#1094 layer 1)', () => {
 
   it('skips when no LML_API_KEY is configured (operator gap, not regression)', async () => {
     setUpFetchMock({
+      ...RECENT_ENTRIES_STUB,
       '/healthcheck': { status: 200, body: { ok: true } },
       '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
       '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
@@ -969,6 +1060,7 @@ describe('runCanary — lml-protected-search + lml-enrichment-lookup (BS#1819 is
   describe('lml-protected-search', () => {
     it('passes when LML returns at least one hit for the probe artist', async () => {
       setUpFetchMock({
+        ...RECENT_ENTRIES_STUB,
         '/healthcheck': { status: 200, body: { ok: true } },
         '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
         '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
@@ -986,6 +1078,7 @@ describe('runCanary — lml-protected-search + lml-enrichment-lookup (BS#1819 is
 
     it('fails when LML returns a non-2xx (protected search itself degraded)', async () => {
       setUpFetchMock({
+        ...RECENT_ENTRIES_STUB,
         '/healthcheck': { status: 200, body: { ok: true } },
         '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
         '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
@@ -1004,6 +1097,7 @@ describe('runCanary — lml-protected-search + lml-enrichment-lookup (BS#1819 is
 
     it('fails when LML returns zero hits for the probe artist (silent zero-hit regression)', async () => {
       setUpFetchMock({
+        ...RECENT_ENTRIES_STUB,
         '/healthcheck': { status: 200, body: { ok: true } },
         '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
         '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
@@ -1022,6 +1116,7 @@ describe('runCanary — lml-protected-search + lml-enrichment-lookup (BS#1819 is
 
     it('fails when the response body is missing the results array (shape regression)', async () => {
       setUpFetchMock({
+        ...RECENT_ENTRIES_STUB,
         '/healthcheck': { status: 200, body: { ok: true } },
         '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
         '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
@@ -1040,6 +1135,7 @@ describe('runCanary — lml-protected-search + lml-enrichment-lookup (BS#1819 is
 
     it('skips when no LML_API_KEY is configured (operator gap, mirrors lml-auth)', async () => {
       setUpFetchMock({
+        ...RECENT_ENTRIES_STUB,
         '/healthcheck': { status: 200, body: { ok: true } },
         '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
         '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
@@ -1054,6 +1150,7 @@ describe('runCanary — lml-protected-search + lml-enrichment-lookup (BS#1819 is
 
     it('sends the bearer and probe artist as query params, direct to LML (not through BS)', async () => {
       const fetchMock = setUpFetchMock({
+        ...RECENT_ENTRIES_STUB,
         '/healthcheck': { status: 200, body: { ok: true } },
         '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
         '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
@@ -1077,6 +1174,7 @@ describe('runCanary — lml-protected-search + lml-enrichment-lookup (BS#1819 is
   describe('lml-enrichment-lookup', () => {
     it('passes with LookupDegraded=0 when the lookup succeeds with matches and no degraded/timeout flag', async () => {
       setUpFetchMock({
+        ...RECENT_ENTRIES_STUB,
         '/healthcheck': { status: 200, body: { ok: true } },
         '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
         '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
@@ -1095,6 +1193,7 @@ describe('runCanary — lml-protected-search + lml-enrichment-lookup (BS#1819 is
 
     it('passes (soft) with LookupDegraded=1 when the response is degraded: true (deliberate shed, not a page-worthy single tick)', async () => {
       setUpFetchMock({
+        ...RECENT_ENTRIES_STUB,
         '/healthcheck': { status: 200, body: { ok: true } },
         '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
         '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
@@ -1113,6 +1212,7 @@ describe('runCanary — lml-protected-search + lml-enrichment-lookup (BS#1819 is
 
     it('passes (soft) with LookupDegraded=1 when the response is timeout: true (internal hard cap fired)', async () => {
       setUpFetchMock({
+        ...RECENT_ENTRIES_STUB,
         '/healthcheck': { status: 200, body: { ok: true } },
         '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
         '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
@@ -1131,6 +1231,7 @@ describe('runCanary — lml-protected-search + lml-enrichment-lookup (BS#1819 is
 
     it('fails (hard) when LML returns a non-2xx — the enrichment lane failed to answer', async () => {
       setUpFetchMock({
+        ...RECENT_ENTRIES_STUB,
         '/healthcheck': { status: 200, body: { ok: true } },
         '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
         '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
@@ -1171,6 +1272,7 @@ describe('runCanary — lml-protected-search + lml-enrichment-lookup (BS#1819 is
 
     it('fails (hard) when results are empty and neither degraded nor timeout is set (unexplained matching regression)', async () => {
       setUpFetchMock({
+        ...RECENT_ENTRIES_STUB,
         '/healthcheck': { status: 200, body: { ok: true } },
         '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
         '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
@@ -1189,6 +1291,7 @@ describe('runCanary — lml-protected-search + lml-enrichment-lookup (BS#1819 is
 
     it('skips when no LML_API_KEY is configured (operator gap, mirrors lml-auth)', async () => {
       setUpFetchMock({
+        ...RECENT_ENTRIES_STUB,
         '/healthcheck': { status: 200, body: { ok: true } },
         '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
         '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
@@ -1203,6 +1306,7 @@ describe('runCanary — lml-protected-search + lml-enrichment-lookup (BS#1819 is
 
     it('sends the bearer and a canonical WXYC fixture body, direct to LML (not through BS)', async () => {
       const fetchMock = setUpFetchMock({
+        ...RECENT_ENTRIES_STUB,
         '/healthcheck': { status: 200, body: { ok: true } },
         '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
         '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
@@ -1237,6 +1341,7 @@ describe('runCanary — lml-protected-search + lml-enrichment-lookup (BS#1819 is
   // the same lookup pipeline would trip this.
   it('proves the BS#1819 isolation contract: protected search stays green while the enrichment lane is failing', async () => {
     setUpFetchMock({
+      ...RECENT_ENTRIES_STUB,
       '/healthcheck': { status: 200, body: { ok: true } },
       '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
       '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
@@ -1261,6 +1366,7 @@ describe('runCanary — lml-protected-search + lml-enrichment-lookup (BS#1819 is
 
   it('proves the isolation contract also holds for a soft (degraded, not hard-failed) enrichment shed', async () => {
     setUpFetchMock({
+      ...RECENT_ENTRIES_STUB,
       '/healthcheck': { status: 200, body: { ok: true } },
       '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
       '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
@@ -1592,6 +1698,251 @@ describe('runCanary — lml-discogs-breaker-shed check (wxyc-canary#79)', () => 
 });
 
 /**
+ * `wxyc-info-recent-entries` (wxyc-canary#93) — the tubafrenzy bridge path
+ * the mobile fleet actually polls.
+ *
+ * Two lanes, deliberately routed to two different alarms so an operator can
+ * tell a bridge fault from a Backend outage without reading a log:
+ *
+ *   - BRIDGE FAULT (timeout, non-sentinel non-2xx, malformed body) → the
+ *     check FAILS → `UserFacingCheckFailure` → `wxyc-canary-check-failure`.
+ *   - BACKEND UNREACHABLE FROM THE BRIDGE → tubafrenzy's documented fail-soft
+ *     (`503` + `{"error":"upstream_unavailable"}`) → the check PASSES and
+ *     carries the signal in `RecentEntriesUpstreamUnavailable: 1` →
+ *     `wxyc-canary-recent-entries-upstream-unavailable`.
+ *
+ * The metric-carries-the-signal lane is the `lml-discogs-breaker-shed`
+ * pattern (see docs/adding-a-check.md) and is load-bearing here for a
+ * measured reason: the fail-soft 503 has a ~0.76% baseline rate clustered in
+ * the `:00–:04` / `:30–:34` ETL-cron windows, so routing it through the
+ * shared 2-of-3 page would trade a real signal for recurring noise.
+ */
+describe('runCanary — wxyc-info-recent-entries check (bridge measurement, wxyc-canary#93)', () => {
+  const LEGACY_URL = 'http://legacy.example.test';
+  const legacyConfig: CanaryConfig = { ...baseConfig, legacyPlaylistUrl: LEGACY_URL };
+
+  /** Stub every OTHER anonymous check so only this one's outcome varies. */
+  const otherAnonymousStubs: Record<string, StubEntry> = {
+    '/healthcheck': { status: 200, body: { ok: true } },
+    '/graph/artists/search': { status: 200, body: { results: [{ id: 1, canonical_name: 'stereolab' }] } },
+    'explore.example.test/health': {
+      status: 200,
+      body: { status: 'healthy', artist_count: 136_702, graph_db_age_seconds: 3_600 },
+    },
+    'library-metadata-lookup-production.up.railway.app/health': {
+      status: 200,
+      body: { status: 'ok', discogs_breaker_state: 'closed' },
+    },
+  };
+
+  function runWithLegacy(legacy: StubEntry) {
+    const fetchMock = setUpFetchMock({ ...otherAnonymousStubs, '/playlists/recentEntries': legacy });
+    return { fetchMock, outcome: runCanary(legacyConfig).then(byNameOf('wxyc-info-recent-entries')) };
+  }
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('requests the exact URL iOS polls and passes on a well-formed v2 body', async () => {
+    const { fetchMock, outcome } = runWithLegacy({ status: 200, body: recentEntriesV2Body });
+    const result = await outcome;
+
+    expect(result.status).toBe('pass');
+    // The gauge's 0 is a real reading ("the bridge reached Backend"), not an
+    // abstain — see docs/adding-a-check.md on gauge-vs-counter abstain rules.
+    expect(result.metrics?.RecentEntriesUpstreamUnavailable).toBe(0);
+
+    // The URL is pinned to iOS's literal, not the `?n=50` the issue drafted:
+    // `PlaylistEntry.swift:17` is `?v=2&n=50`, and `v` selects a different
+    // response projection. A `?n=50` probe would validate the shape 2.7% of
+    // traffic reads (Android's flat array) while claiming to measure the 96.7%.
+    const url = String(fetchMock.mock.calls.find((c) => String(c[0]).includes('/playlists/recentEntries'))?.[0]);
+    expect(url).toBe(`${LEGACY_URL}/playlists/recentEntries?v=2&n=50`);
+  });
+
+  it('fails soft without paging when tubafrenzy reports the upstream unavailable', async () => {
+    // tubafrenzy#620's documented fail-soft: a fast 503 with a tiny static
+    // body so a slow Backend cannot wedge Tomcat worker threads.
+    const { outcome } = runWithLegacy({
+      status: 503,
+      body: { error: 'upstream_unavailable' },
+      headers: { 'Retry-After': '5' },
+    });
+    const result = await outcome;
+
+    // PASS, not fail: the bridge did its job. The signal rides the metric to
+    // its own alarm so a Backend outage and a bridge fault never share one.
+    expect(result.status).toBe('pass');
+    expect(result.metrics?.RecentEntriesUpstreamUnavailable).toBe(1);
+  });
+
+  it('fails on a 503 that is NOT the fail-soft sentinel', async () => {
+    // Kattare/Tomcat shedding (AdmissionControlFilter and friends) also
+    // answers 503 + `Retry-After: 5`. Keying the upstream lane on the STATUS
+    // alone would file a Kattare-side fault under "Backend is down" and send
+    // the operator to the wrong service. The body sentinel is the
+    // discriminator; the status alone is not.
+    const { outcome } = runWithLegacy({
+      status: 503,
+      body: '<html><body>Service Unavailable</body></html>',
+      headers: { 'Retry-After': '5', 'Content-Type': 'text/html' },
+    });
+    const result = await outcome;
+
+    expect(result.status).toBe('fail');
+    expect(result.message).toMatch(/503/);
+    // No metric on the bridge-fault lane: we did not observe a determinate
+    // upstream verdict, so emitting `0` would assert "Backend is fine" on
+    // evidence we do not have.
+    expect(result.metrics).toBeUndefined();
+  });
+
+  it.each([
+    { label: 'a 500 from the bridge', status: 500, body: { error: 'boom' } },
+    { label: 'a 404 (servlet unmapped)', status: 404, body: { error: 'not found' } },
+  ])('fails on $label', async ({ status, body }) => {
+    const { outcome } = runWithLegacy({ status, body });
+    const result = await outcome;
+
+    expect(result.status).toBe('fail');
+    expect(result.message).toMatch(new RegExp(String(status)));
+  });
+
+  it.each([
+    { group: 'playcuts' },
+    // `breakpoints` and `talksets` are NOT decorative. iOS's
+    // `Playlist.init(from:)` decodes all three with `try container.decode`
+    // (non-optional); only `showMarkers` and `onAir` use `decodeIfPresent`.
+    // Dropping an empty array from the payload — a plausible Backend-side
+    // "optimization" — throws in every client decode and blanks the app.
+    { group: 'breakpoints' },
+    { group: 'talksets' },
+  ])('fails when the v2 body omits the required `$group` array', async ({ group }) => {
+    const partial: Record<string, unknown> = { ...recentEntriesV2Body };
+    delete partial[group];
+    const { outcome } = runWithLegacy({ status: 200, body: partial });
+    const result = await outcome;
+
+    expect(result.status).toBe('fail');
+    expect(result.message).toMatch(new RegExp(group));
+  });
+
+  it('fails when playcuts is present but empty', async () => {
+    // Same class as the `artist_count` floor on semantic-index-freshness: a
+    // structurally valid but empty read is the shape a truncated/failed
+    // upstream query produces, and it renders as a blank now-playing screen.
+    const { outcome } = runWithLegacy({ status: 200, body: { ...recentEntriesV2Body, playcuts: [] } });
+    const result = await outcome;
+
+    expect(result.status).toBe('fail');
+    expect(result.message).toMatch(/zero playcuts/);
+  });
+
+  it.each([
+    { field: 'artistName', label: 'a missing string field' },
+    { field: 'songTitle', label: 'a second missing string field' },
+    { field: 'chronOrderID', label: 'a missing numeric field' },
+  ])('fails when a playcut drops $field ($label)', async ({ field }) => {
+    // iOS decodes `[Playcut].self` for the WHOLE array, so one malformed
+    // entry anywhere throws the entire decode — which is why the check walks
+    // every playcut rather than sampling the first.
+    const playcuts = recentEntriesV2Body.playcuts.map((p, i) => {
+      if (i !== 1) return p;
+      const damaged: Record<string, unknown> = { ...p };
+      delete damaged[field];
+      return damaged;
+    });
+    const { outcome } = runWithLegacy({ status: 200, body: { ...recentEntriesV2Body, playcuts } });
+    const result = await outcome;
+
+    expect(result.status).toBe('fail');
+    expect(result.message).toMatch(new RegExp(field));
+    // Names the offending index so the operator can pull the row.
+    expect(result.message).toMatch(/playcuts\[1\]/);
+  });
+
+  it('fails when a playcut carries the right key with the wrong type', async () => {
+    // A `UInt64` field arriving as a string throws in the iOS decoder just as
+    // hard as an absent one, and a presence-only check would sail past it.
+    const playcuts = [{ ...recentEntriesV2Body.playcuts[0], id: '5303877' }];
+    const { outcome } = runWithLegacy({ status: 200, body: { ...recentEntriesV2Body, playcuts } });
+    const result = await outcome;
+
+    expect(result.status).toBe('fail');
+    expect(result.message).toMatch(/id/);
+  });
+
+  it('fails on a 200 carrying a non-JSON body', async () => {
+    // Tomcat serving an error JSP through the proxy path, or a captive-portal
+    // interception on the plaintext-HTTP hop.
+    const { outcome } = runWithLegacy({
+      status: 200,
+      body: '<html>error</html>',
+      headers: { 'Content-Type': 'text/html' },
+    });
+    const result = await outcome;
+
+    expect(result.status).toBe('fail');
+    expect(result.metrics).toBeUndefined();
+  });
+
+  it('fails when the array arrives where the v2 object was expected', async () => {
+    // The `v=1` flat-array projection reaching a `v=2` request means the
+    // bridge dropped the `v` parameter — silently breaking every iOS client
+    // while still returning 200 with plausible-looking JSON.
+    const { outcome } = runWithLegacy({ status: 200, body: recentEntriesV2Body.playcuts });
+    const result = await outcome;
+
+    expect(result.status).toBe('fail');
+  });
+
+  it('skips (does not fail) when no legacy playlist URL is configured', async () => {
+    // The wiki#100 DNS-flip transition window: blanking the parameter retires
+    // the probe without a redeploy. Retirement proper is deleting the check.
+    setUpFetchMock(otherAnonymousStubs);
+    const outcomes = await runCanary({ ...baseConfig, legacyPlaylistUrl: '' });
+    const result = byNameOf('wxyc-info-recent-entries')(outcomes);
+
+    expect(result.status).toBe('skipped');
+    expect(result.message).toMatch(/no legacy playlist URL configured/);
+  });
+
+  it('emits the upstream-unavailable gauge dimensioned AND dimensionless', async () => {
+    // The alarm reads the dimensionless series (plain-form alarms cannot
+    // aggregate across dimension values — org CLAUDE.md / wxyc-canary#13).
+    process.env.CANARY_BACKEND_URL = 'https://api.example.test';
+    process.env.CANARY_AUTH_URL = 'https://auth.example.test';
+    process.env.CANARY_SEMANTIC_INDEX_URL = 'https://explore.example.test';
+    process.env.CANARY_LEGACY_PLAYLIST_URL = LEGACY_URL;
+    process.env.CANARY_PUBLISH_METRICS = 'true';
+    cloudWatchSendMock.mockClear();
+    setUpFetchMock({
+      ...RECENT_ENTRIES_STUB,
+      ...otherAnonymousStubs,
+      '/playlists/recentEntries': { status: 503, body: { error: 'upstream_unavailable' } },
+    });
+
+    await handler().catch(() => undefined);
+    const emitted = getPublishedMetrics().filter((d) => d.MetricName === 'RecentEntriesUpstreamUnavailable');
+    const dimensioned = emitted.filter((d) => (d.Dimensions ?? []).length > 0);
+    const dimensionless = emitted.filter((d) => (d.Dimensions ?? []).length === 0);
+
+    expect(dimensioned).toHaveLength(1);
+    expect(dimensionless).toHaveLength(1);
+    expect(dimensioned[0].Value).toBe(1);
+    expect(dimensionless[0].Value).toBe(1);
+    expect(dimensioned[0].Dimensions?.[0]).toEqual({ Name: 'Check', Value: 'wxyc-info-recent-entries' });
+
+    delete process.env.CANARY_BACKEND_URL;
+    delete process.env.CANARY_AUTH_URL;
+    delete process.env.CANARY_SEMANTIC_INDEX_URL;
+    delete process.env.CANARY_LEGACY_PLAYLIST_URL;
+    delete process.env.CANARY_PUBLISH_METRICS;
+  });
+});
+
+/**
  * `gha-runner-online` is the liveness probe for the EC2-hosted self-hosted
  * GitHub Actions runner that backs the staging-gate suites (Backend-Service,
  * library-metadata-lookup, dj-site). Wired up as part of WXYC/wiki#80
@@ -1737,6 +2088,7 @@ describe('runCanary — gha-runner-online check (runner liveness probe, wiki#80 
 
   it('skips when no GitHub PAT is configured (operator gap, not regression)', async () => {
     setUpFetchMock({
+      ...RECENT_ENTRIES_STUB,
       '/healthcheck': { status: 200, body: { ok: true } },
       '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
       '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
@@ -1757,6 +2109,7 @@ describe('runCanary — gha-runner-online check (runner liveness probe, wiki#80 
 
   it('skips when no runner id is configured (operator gap)', async () => {
     setUpFetchMock({
+      ...RECENT_ENTRIES_STUB,
       '/healthcheck': { status: 200, body: { ok: true } },
       '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
       '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
@@ -1811,6 +2164,7 @@ describe('runCanary — gha-runner-online check (runner liveness probe, wiki#80 
     // the check would URL-template NaN and 404, then misroute as 'runner was
     // likely replaced'. Skip instead — operator-visible config error.
     setUpFetchMock({
+      ...RECENT_ENTRIES_STUB,
       '/healthcheck': { status: 200, body: { ok: true } },
       '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
     });
@@ -1835,6 +2189,7 @@ describe('runCanary — gha-runner-online check (runner liveness probe, wiki#80 
     // non-CFN deploy paths (local invoke, manual env override, future
     // template refactor) cannot bypass the sentinel.
     setUpFetchMock({
+      ...RECENT_ENTRIES_STUB,
       '/healthcheck': { status: 200, body: { ok: true } },
       '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
     });
@@ -2036,6 +2391,7 @@ describe('runCanary — gha-runner-online check (runner liveness probe, wiki#80 
     // observable consequence.
     ssmSendMock.mockClear();
     setUpFetchMock({
+      ...RECENT_ENTRIES_STUB,
       '/healthcheck': { status: 200, body: { ok: true } },
       '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
     });
@@ -2354,6 +2710,7 @@ describe('publishMetrics — dimensioned + dimensionless emit-twice', () => {
 
   it('emits each CheckFailure datapoint twice — once with the Check dimension and once dimensionless', async () => {
     setUpFetchMock({
+      ...RECENT_ENTRIES_STUB,
       '/healthcheck': { status: 200, body: { ok: true } },
       '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
       '/graph/artists/search': { status: 200, body: { results: [{ id: 97426, canonical_name: 'stereolab' }] } },
@@ -2370,8 +2727,8 @@ describe('publishMetrics — dimensioned + dimensionless emit-twice', () => {
     const dimensionless = checkFailureData.filter((d) => !d.Dimensions || d.Dimensions.length === 0);
 
     // Fifteen checks, each contributes one dimensioned and one dimensionless datapoint.
-    expect(dimensioned).toHaveLength(15);
-    expect(dimensionless).toHaveLength(15);
+    expect(dimensioned).toHaveLength(16);
+    expect(dimensionless).toHaveLength(16);
     // Without an inducer, every value is 0 (passes + skips).
     expect(dimensioned.every((d) => d.Value === 0)).toBe(true);
     expect(dimensionless.every((d) => d.Value === 0)).toBe(true);
@@ -2384,6 +2741,7 @@ describe('publishMetrics — dimensioned + dimensionless emit-twice', () => {
   // dimensioned-vs-dimensionless value parity the dashboards rely on.
   it('flows the failure value (1) into both the dimensioned and dimensionless emission for the failing check', async () => {
     setUpFetchMock({
+      ...RECENT_ENTRIES_STUB,
       // backend-healthcheck fails; everything else passes (DJ-auth checks
       // skip with no creds — skipped is not a failure).
       '/healthcheck': { status: 500, body: { error: 'oops' } },
@@ -2409,7 +2767,7 @@ describe('publishMetrics — dimensioned + dimensionless emit-twice', () => {
     // isn't enough — `Statistic: Maximum` on the alarm needs at least one
     // `1` in the window, so this asserts the count of 1s explicitly.
     expect(dimensionless.filter((d) => d.Value === 1)).toHaveLength(1);
-    expect(dimensionless.filter((d) => d.Value === 0)).toHaveLength(14);
+    expect(dimensionless.filter((d) => d.Value === 0)).toHaveLength(15);
   });
 
   // `CheckSkipped` and `CheckLatency` are dashboard data, not alarm inputs.
@@ -2418,6 +2776,7 @@ describe('publishMetrics — dimensioned + dimensionless emit-twice', () => {
   // misconfigured alarm being added against them — pin the contract.
   it('emits CheckSkipped and CheckLatency dimensioned-only (no dimensionless companion)', async () => {
     setUpFetchMock({
+      ...RECENT_ENTRIES_STUB,
       '/healthcheck': { status: 200, body: { ok: true } },
       '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
       '/graph/artists/search': { status: 200, body: { results: [{ id: 97426, canonical_name: 'stereolab' }] } },
@@ -2434,8 +2793,8 @@ describe('publishMetrics — dimensioned + dimensionless emit-twice', () => {
     expect(metricData.filter((d) => d.MetricName === 'CheckSkipped' && isDimensionless(d))).toHaveLength(0);
     expect(metricData.filter((d) => d.MetricName === 'CheckLatency' && isDimensionless(d))).toHaveLength(0);
     // Sanity: the dimensioned series for each is present (one per check).
-    expect(metricData.filter((d) => d.MetricName === 'CheckSkipped')).toHaveLength(15);
-    expect(metricData.filter((d) => d.MetricName === 'CheckLatency')).toHaveLength(15);
+    expect(metricData.filter((d) => d.MetricName === 'CheckSkipped')).toHaveLength(16);
+    expect(metricData.filter((d) => d.MetricName === 'CheckLatency')).toHaveLength(16);
   });
 
   // wxyc-canary#84: DiscogsLiveRequestsTotal follows the same custom-metric
@@ -2445,6 +2804,7 @@ describe('publishMetrics — dimensioned + dimensionless emit-twice', () => {
   // any alarm targets (see CLAUDE.md / template.yaml comment).
   it('emits DiscogsLiveRequestsTotal dimensioned + dimensionless when /health returns a numeric field', async () => {
     setUpFetchMock({
+      ...RECENT_ENTRIES_STUB,
       '/healthcheck': { status: 200, body: { ok: true } },
       '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
       '/graph/artists/search': { status: 200, body: { results: [{ id: 97426, canonical_name: 'stereolab' }] } },
@@ -2478,6 +2838,7 @@ describe('publishMetrics — dimensioned + dimensionless emit-twice', () => {
   // traffic reading.
   it('does NOT emit DiscogsLiveRequestsTotal when /health omits the field (older LML, backward-compatible abstain)', async () => {
     setUpFetchMock({
+      ...RECENT_ENTRIES_STUB,
       '/healthcheck': { status: 200, body: { ok: true } },
       '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
       '/graph/artists/search': { status: 200, body: { results: [{ id: 97426, canonical_name: 'stereolab' }] } },
@@ -2570,6 +2931,7 @@ describe('publishMetrics — tier split (UserFacingCheckFailure / InfraCheckFail
     process.env.CANARY_GHA_RUNNER_ID = '250';
     process.env.CANARY_GHA_RUNNER_TOKEN = 'fake-gha-pat';
     setUpFetchMock({
+      ...RECENT_ENTRIES_STUB,
       '/healthcheck': { status: 200, body: { ok: true } },
       '/graph/artists/search': { status: 200, body: { results: [{ id: 1, canonical_name: 'stereolab' }] } },
       // semantic-index-freshness is also infra-tier; keep it passing so the
@@ -2604,6 +2966,7 @@ describe('publishMetrics — tier split (UserFacingCheckFailure / InfraCheckFail
   // now trip the user-facing page, not the low-urgency infra alarm.
   it('pages when only semantic-index-search fails (shape regression → UserFacingCheckFailure)', async () => {
     setUpFetchMock({
+      ...RECENT_ENTRIES_STUB,
       '/healthcheck': { status: 200, body: { ok: true } },
       // Missing `results` envelope — the shape regression the check catches.
       '/graph/artists/search': { status: 200, body: { something_else: [] } },
@@ -2631,6 +2994,7 @@ describe('publishMetrics — tier split (UserFacingCheckFailure / InfraCheckFail
   // than throwing.
   it('does not page and does not throw when only semantic-index-freshness fails (stale graph → InfraCheckFailure only, exit 0)', async () => {
     setUpFetchMock({
+      ...RECENT_ENTRIES_STUB,
       '/healthcheck': { status: 200, body: { ok: true } },
       '/graph/artists/search': { status: 200, body: { results: [{ id: 1, canonical_name: 'stereolab' }] } },
       // 37 h stale — one missed nightly sync.
@@ -2680,6 +3044,7 @@ describe('publishMetrics — tier split (UserFacingCheckFailure / InfraCheckFail
     process.env.CANARY_DJ_EMAIL = 'canary@wxyc.org';
     process.env.CANARY_DJ_PASSWORD = 'pw';
     setUpFetchMock({
+      ...RECENT_ENTRIES_STUB,
       '/healthcheck': { status: 200, body: { ok: true } },
       '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
       '/graph/artists/search': { status: 200, body: { results: [{ id: 1, canonical_name: 'stereolab' }] } },
@@ -2714,6 +3079,7 @@ describe('publishMetrics — tier split (UserFacingCheckFailure / InfraCheckFail
   // user-facing surface 5xx'd → the page MUST fire.
   it('pages when a user-facing check fails (backend-healthcheck 500 → UserFacingCheckFailure)', async () => {
     setUpFetchMock({
+      ...RECENT_ENTRIES_STUB,
       '/healthcheck': { status: 500, body: { error: 'oops' } },
       '/graph/artists/search': { status: 200, body: { results: [{ id: 1, canonical_name: 'stereolab' }] } },
       // Freshness passes so the infra series stays flat — only the user-facing
@@ -2744,6 +3110,7 @@ describe('publishMetrics — tier split (UserFacingCheckFailure / InfraCheckFail
     process.env.CANARY_GHA_RUNNER_ID = '250';
     process.env.CANARY_GHA_RUNNER_TOKEN = 'fake-gha-pat';
     setUpFetchMock({
+      ...RECENT_ENTRIES_STUB,
       // Page-tier failure.
       '/healthcheck': { status: 500, body: { error: 'oops' } },
       '/graph/artists/search': { status: 200, body: { results: [{ id: 1, canonical_name: 'stereolab' }] } },
@@ -2784,6 +3151,7 @@ describe('publishMetrics — tier split (UserFacingCheckFailure / InfraCheckFail
   // contributions must be 0 (CheckSkipped semantics preserved).
   it('emits 0 on both tiers when every check passes or skips', async () => {
     setUpFetchMock({
+      ...RECENT_ENTRIES_STUB,
       '/healthcheck': { status: 200, body: { ok: true } },
       '/graph/artists/search': { status: 200, body: { results: [{ id: 1, canonical_name: 'stereolab' }] } },
       'explore.example.test/health': {
@@ -2799,7 +3167,7 @@ describe('publishMetrics — tier split (UserFacingCheckFailure / InfraCheckFail
     // lml-protected-search + lml-enrichment-lookup, wxyc-canary#82), 2 infra
     // checks (gha-runner-online, semantic-index-freshness); every aggregate
     // datum is dimensionless and 0.
-    expect(tierValues(metrics, 'UserFacingCheckFailure')).toHaveLength(13);
+    expect(tierValues(metrics, 'UserFacingCheckFailure')).toHaveLength(14);
     expect(tierValues(metrics, 'InfraCheckFailure')).toHaveLength(2);
     expect(tierMax(metrics, 'UserFacingCheckFailure')).toBe(0);
     expect(tierMax(metrics, 'InfraCheckFailure')).toBe(0);
@@ -3049,6 +3417,7 @@ const ENRICHED_SENTINEL_ROW = {
  */
 function setUpEnrichmentHappyPathMock(): ReturnType<typeof setUpMethodAwareMock> {
   return setUpMethodAwareMock([
+    RECENT_ENTRIES_ROUTE,
     // Read-side checks (other anonymous + DJ checks).
     { method: 'GET', pattern: '/healthcheck', responses: [{ status: 200, body: { ok: true } }] },
     // semantic-index-freshness — fresh + above-floor so it passes. Host-
@@ -3244,6 +3613,7 @@ describe('enrichment-quality write canary', () => {
 
   it('skips with a meaningful reason when another DJ is on-air', async () => {
     const { fetchMock } = setUpMethodAwareMock([
+      RECENT_ENTRIES_ROUTE,
       { method: 'GET', pattern: '/healthcheck', responses: [{ status: 200, body: { ok: true } }] },
       {
         method: 'GET',
@@ -3290,6 +3660,7 @@ describe('enrichment-quality write canary', () => {
 
   it('fails on insert error WITHOUT attempting cleanup (no row was created)', async () => {
     const { fetchMock } = setUpMethodAwareMock([
+      RECENT_ENTRIES_ROUTE,
       { method: 'GET', pattern: '/healthcheck', responses: [{ status: 200, body: { ok: true } }] },
       {
         method: 'GET',
@@ -3337,6 +3708,7 @@ describe('enrichment-quality write canary', () => {
 
   it('fails on polling timeout AND still cleans up the row and ends the show', async () => {
     const { fetchMock } = setUpMethodAwareMock([
+      RECENT_ENTRIES_ROUTE,
       { method: 'GET', pattern: '/healthcheck', responses: [{ status: 200, body: { ok: true } }] },
       {
         method: 'GET',
@@ -3406,6 +3778,7 @@ describe('enrichment-quality write canary', () => {
     // independently of the timeout path.
     const nullPoll = { status: 200, body: [{ ...ENRICHED_SENTINEL_ROW, youtube_music_url: null }] };
     setUpMethodAwareMock([
+      RECENT_ENTRIES_ROUTE,
       { method: 'GET', pattern: '/healthcheck', responses: [{ status: 200, body: { ok: true } }] },
       {
         method: 'GET',
@@ -3520,6 +3893,7 @@ describe('enrichment-quality write canary', () => {
     delete process.env.CANARY_ENABLE_WRITE_PROBE;
     try {
       setUpFetchMock({
+        ...RECENT_ENTRIES_STUB,
         '/healthcheck': { status: 200, body: { ok: true } },
         '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
         '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
@@ -3633,6 +4007,7 @@ describe('runCanary — oidc-authorize check (wxyc-canary#60)', () => {
     // `/oauth2/authorize`. The check runs (sign-in succeeds, session token
     // is available) and hits the 599 fallback.
     setUpFetchMock({
+      ...RECENT_ENTRIES_STUB,
       '/healthcheck': { status: 200, body: { ok: true } },
       '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
       '/graph/artists/search': { status: 200, body: { results: [{ id: 1, canonical_name: 'stereolab' }] } },
@@ -3886,6 +4261,7 @@ describe('runCanary — oidc-authorize check (wxyc-canary#60)', () => {
     // retries are 429-only). See the "real 429" test below for the
     // transient retry-succeeds path.
     setUpFetchMock({
+      ...RECENT_ENTRIES_STUB,
       '/healthcheck': { status: 200, body: { ok: true } },
       '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
       '/graph/artists/search': { status: 200, body: { results: [{ id: 1, canonical_name: 'stereolab' }] } },
@@ -5049,6 +5425,7 @@ describe('handler — GitHub issue reporting dispatch', () => {
     process.env.CANARY_GITHUB_TOKEN_SSM_PARAM = '/wxyc-canary/github-token';
     process.env.CANARY_GITHUB_ISSUES_REPO = 'WXYC/wxyc-canary';
     setUpFetchMock({
+      ...RECENT_ENTRIES_STUB,
       '/healthcheck': { status: 200, body: { ok: true } },
       '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
       '/graph/artists/search': { status: 200, body: { results: [{ id: 1, canonical_name: 'stereolab' }] } },
@@ -5077,6 +5454,7 @@ describe('handler — GitHub issue reporting dispatch', () => {
 
   it('does not fetch SSM or call the reporter when CANARY_GITHUB_TOKEN_SSM_PARAM is unset', async () => {
     setUpFetchMock({
+      ...RECENT_ENTRIES_STUB,
       '/healthcheck': { status: 200, body: { ok: true } },
       '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
       '/graph/artists/search': { status: 200, body: { results: [{ id: 1, canonical_name: 'stereolab' }] } },
@@ -5097,6 +5475,7 @@ describe('handler — GitHub issue reporting dispatch', () => {
     process.env.CANARY_GITHUB_ISSUES_REPO = 'WXYC/wxyc-canary';
     reportOutcomesToGitHubMock.mockRejectedValueOnce(new Error('github API rate limited'));
     setUpFetchMock({
+      ...RECENT_ENTRIES_STUB,
       '/healthcheck': { status: 500, body: { error: 'oops' } },
       '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
       '/graph/artists/search': { status: 200, body: { results: [{ id: 1, canonical_name: 'stereolab' }] } },
