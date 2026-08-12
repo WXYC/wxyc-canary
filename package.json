@@ -30,7 +30,7 @@
     "monitoring",
     "lambda"
   ],
-  "license": "ISC",
+  "license": "PolyForm-Noncommercial-1.0.0",
   "dependencies": {
     "@aws-sdk/client-cloudwatch": "^3.700.0",
     "@aws-sdk/client-secrets-manager": "^3.700.0",
