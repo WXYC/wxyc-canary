@@ -75,7 +75,15 @@ Resources:
               - Sid: Lambda
                 Effect: Allow
                 Action: lambda:*
-                Resource: !Sub arn:aws:lambda:us-east-1:${AWS::AccountId}:function:wxyc-canary
+                # Prefix, not an exact ARN: this stack now deploys more than one
+                # function (the canary itself plus wxyc-canary-stream-listener-sampler),
+                # and an exact ARN meant adding a second function rolled the whole
+                # stack back on `lambda:GetFunction` AccessDenied. Every other
+                # name-scoped statement here (role/, rule/, alarm/) already uses
+                # the `wxyc-canary*` prefix the README documents; this aligns
+                # Lambda and Logs with it, so a future function in this stack does
+                # not require an out-of-band IAM deploy to land.
+                Resource: !Sub arn:aws:lambda:us-east-1:${AWS::AccountId}:function:wxyc-canary*
               - Sid: Scheduler
                 Effect: Allow
                 Action: events:*
@@ -101,7 +109,7 @@ Resources:
                     logs:TagResource,
                     logs:ListTagsForResource,
                   ]
-                Resource: !Sub arn:aws:logs:us-east-1:${AWS::AccountId}:log-group:/aws/lambda/wxyc-canary:*
+                Resource: !Sub arn:aws:logs:us-east-1:${AWS::AccountId}:log-group:/aws/lambda/wxyc-canary*:*
               - Sid: ExecRoleLifecycle # SAM-generated Lambda exec role: wxyc-canary-CanaryFunctionRole-*
                 Effect: Allow
                 Action:

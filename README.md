@@ -309,6 +309,8 @@ aws cloudformation deploy \
   --capabilities CAPABILITY_NAMED_IAM
 ```
 
+**Name new resources into the `wxyc-canary*` namespace.** The deploy role is least-privilege and scoped by name prefix — `function:wxyc-canary*`, `log-group:/aws/lambda/wxyc-canary*`, `role/wxyc-canary-*`, `rule/wxyc-canary-*`, `alarm:wxyc-canary-*`. A resource named outside that prefix cannot be created by CI: the deploy fails `AccessDenied` mid-changeset and CloudFormation rolls the whole stack back. That is what happened on the stream sampler's first deploy, when it was named `wxyc-stream-listener-sampler`. Adding a resource whose name does not start with `wxyc-canary` requires an out-of-band redeploy of this bootstrap stack with IAM-capable credentials — so prefer the prefix.
+
 Take the stack's `DeployRoleArn` output and set it as the `AWS_DEPLOY_ROLE_ARN` GitHub variable. The OIDC provider is account-global (unique per URL) — when a second WXYC repo adopts OIDC, move the provider into its own shared stack and leave only per-repo roles in each repo's bootstrap.
 
 Required GitHub variables:
@@ -419,7 +421,7 @@ Add a new entry to the `checks` array in `src/checks.ts`. The check name becomes
 
 ## Stream listener sampler
 
-A second Lambda in this stack, `wxyc-stream-listener-sampler`, records how many people are connected to WXYC's Icecast stream. It is **audience measurement, not monitoring**: it owns no alarms, publishes no CloudWatch metrics, and cannot page. See [`docs/scope.md`](docs/scope.md) for why it deliberately inverts several canary conventions.
+A second Lambda in this stack, `wxyc-canary-stream-listener-sampler`, records how many people are connected to WXYC's Icecast stream. It is **audience measurement, not monitoring**: it owns no alarms, publishes no CloudWatch metrics, and cannot page. See [`docs/scope.md`](docs/scope.md) for why it deliberately inverts several canary conventions.
 
 ### What it does
 

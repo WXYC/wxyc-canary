@@ -32,7 +32,7 @@ Read the relevant topic doc before doing work in that area.
 
 ## Stream listener sampler
 
-A second Lambda in this repo, `wxyc-stream-listener-sampler`, samples WXYC's Icecast concurrent-listener count into PostHog every 5 minutes. It is **audience measurement, not monitoring** — read [`docs/scope.md`](docs/scope.md) before touching it, because several of this repo's conventions deliberately invert for it (it retries, it owns no alarms, it publishes no CloudWatch metrics).
+A second Lambda in this repo, `wxyc-canary-stream-listener-sampler`, samples WXYC's Icecast concurrent-listener count into PostHog every 5 minutes. It is **audience measurement, not monitoring** — read [`docs/scope.md`](docs/scope.md) before touching it, because several of this repo's conventions deliberately invert for it (it retries, it owns no alarms, it publishes no CloudWatch metrics).
 
 - **Why the number matters.** Concurrent listeners are the streaming analogue of Nielsen's AQH (Average Quarter-Hour) persons, which makes it the one online metric comparable to a broadcast rating. Cume is deliberately NOT derived: Icecast counts connections, Nielsen counts people. Only AQH and total listening hours survive a broadcast-vs-stream comparison honestly.
 - **Cost is fixed by construction.** One HTTP GET and at most one PostHog event per invocation pins ingestion at 288 events/day regardless of traffic or how many mounts appear upstream. This invariant is the whole reason the design is one summary event per tick rather than one per mount — a per-mount shape would make a billing-relevant number depend on config we do not control, which is the shape that took org analytics dark on 2026-08-04. Treat any change that raises the event rate as a billing decision.
