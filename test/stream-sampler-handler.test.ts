@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { loadConfig, runSampler, type SamplerConfig } from '../src/stream-sampler-handler.js';
+import { handler, loadConfig, runSampler, type SamplerConfig } from '../src/stream-sampler-handler.js';
 
 const FIXED_NOW = () => new Date('2026-08-20T03:34:00.000Z');
 
@@ -36,6 +36,7 @@ const HEALTHY_STATUS = {
 
 afterEach(() => {
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
 });
 
 describe('loadConfig', () => {
@@ -50,6 +51,21 @@ describe('loadConfig', () => {
 
   it('treats a blank api key as capture-disabled rather than substituting a default', () => {
     expect(loadConfig({ SAMPLER_POSTHOG_API_KEY: '' }).posthogApiKey).toBe('');
+  });
+
+  it('falls back to defaults for unparseable numeric env vars', () => {
+    // An unguarded Number() turns a typo into a silent outage: NaN retries
+    // skip the fetch loop entirely, and NaN into the family-attempt setter
+    // throws before any event can be emitted.
+    const config = loadConfig({
+      SAMPLER_READ_RETRIES: 'on',
+      SAMPLER_TIMEOUT_MS: 'fast',
+      SAMPLER_FAMILY_ATTEMPT_TIMEOUT_MS: '',
+    });
+
+    expect(config.readRetries).toBe(1);
+    expect(config.timeoutMs).toBe(8000);
+    expect(config.familyAttemptTimeoutMs).toBe(3000);
   });
 });
 
@@ -131,6 +147,9 @@ describe('runSampler', () => {
     expect(result.captured).toBe(false);
     expect(result.totalListeners).toBe(28);
     expect(fetchSpy).toHaveBeenCalledTimes(1);
+    // Must name the lever that actually fired — the operator note tells
+    // readers that "no api key" means a CloudFormation problem.
+    expect(result.reason).toContain('SAMPLER_CAPTURE_ENABLED=false');
   });
 
   it('does not contact PostHog when no api key is configured', async () => {
@@ -202,5 +221,31 @@ describe('runSampler', () => {
     });
 
     await expect(runSampler(configWith(), FIXED_NOW)).rejects.toThrow(/posthog capture returned 401/);
+  });
+});
+
+describe('handler', () => {
+  it('logs a structured line even when the capture throws', async () => {
+    // This function publishes no CloudWatch metrics and owns no alarms, and
+    // the canary's lambda-errors alarm is dimensioned to CanaryFunction, so
+    // it does not cover this one. If a capture failure escaped without a log
+    // line, a rotated token would stop sampling with nothing but an
+    // unwatched stack trace to show for it.
+    vi.stubEnv('SAMPLER_ICECAST_STATUS_URL', 'https://icecast.test/status-json.xsl');
+    vi.stubEnv('SAMPLER_POSTHOG_HOST', 'https://posthog.test');
+    vi.stubEnv('SAMPLER_POSTHOG_API_KEY', 'phc_test');
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      if (String(input).includes('icecast.test')) return jsonResponse(HEALTHY_STATUS);
+      return jsonResponse({ error: 'bad key' }, 401);
+    });
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+    await expect(handler()).rejects.toThrow(/401/);
+
+    expect(logSpy).toHaveBeenCalledTimes(1);
+    const logged = JSON.parse(String(logSpy.mock.calls[0][0]));
+    expect(logged.sampler).toBe('wxyc-stream-listeners');
+    expect(logged.captured).toBe(false);
+    expect(logged.reason).toContain('401');
   });
 });

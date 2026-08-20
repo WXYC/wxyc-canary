@@ -462,6 +462,8 @@ SAMPLER_CAPTURE_ENABLED=false npm run local:sampler
 
 **Deploy secret.** `STREAM_SAMPLER_POSTHOG_API_KEY` (a `phc_` project ingestion token) is a GitHub Actions secret; the deploy workflow omits the parameter entirely when it is unset. It has no default in this public repo — a write-only token is still an invitation to inject junk events into a quota shared across every WXYC project.
 
+**Deleting the secret does not stop capture.** Omitting the parameter only produces the dry run on the stack's first _create_, where the template default applies. On an _update_, CloudFormation reuses the previous value of any parameter not passed to `--parameter-overrides`, so removing the secret and redeploying leaves the function running with the token it already had. To actually stop sampling, set `StreamSamplerState=DISABLED` (accepting that paused ticks are lost data), or rotate the token in PostHog.
+
 **If samples go missing.** The most likely cause is not the stream. `audio-mp3.ibiblio.org` is dual-stack and can take up to ~2.4s to answer, while Node's default Happy Eyeballs `autoSelectFamilyAttemptTimeout` is 250ms — which abandons healthy connections and surfaces as a bare `ETIMEDOUT` that looks like a dead host. `configureNetworking` raises it to 3s (`SAMPLER_FAMILY_ATTEMPT_TIMEOUT_MS`), and the read is retried once (`SAMPLER_READ_RETRIES`). Check the sampler's own log group before suspecting ibiblio.
 
 ## Why these specific checks

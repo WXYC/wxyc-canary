@@ -101,6 +101,31 @@ describe('sampleWxycMounts', () => {
     expect(sample.mounts.map((m) => m.mount)).toContain('wxyc-hd.mp3');
   });
 
+  it('matches the prefix case-insensitively on both sides', () => {
+    // `SAMPLER_MOUNT_PREFIX=WXYC` is the natural way to spell call letters.
+    // Lowercasing only the mount would match nothing and emit a permanent
+    // zero indistinguishable from a dropped encoder.
+    const sample = sampleWxycMounts(
+      statusWith([{ listenurl: 'http://audio-mp3.ibiblio.org:8000/WXYC.mp3', listeners: 12 }]),
+      { mountPrefix: 'WXYC', primaryMount: 'WXYC.mp3' }
+    );
+
+    expect(sample.totalListeners).toBe(12);
+    expect(sample.primaryListeners).toBe(12);
+    expect(sample.streamOnline).toBe(true);
+  });
+
+  it('accepts a numeric string listener count', () => {
+    // Icecast builds differ in which fields they quote. Reading "25" as zero
+    // would flatten the series while everything else still looked healthy.
+    const sample = sampleWxycMounts(
+      statusWith([{ listenurl: 'http://audio-mp3.ibiblio.org:8000/wxyc.mp3', listeners: '25' }])
+    );
+
+    expect(sample.totalListeners).toBe(25);
+    expect(sample.unparseableListenerCounts).toBe(0);
+  });
+
   it('reports the stream as offline when no WXYC mount is connected', () => {
     // A dropped encoder is a real observation, not an error: nobody could be
     // listening. It must stay distinguishable from a failed fetch, hence
@@ -130,6 +155,8 @@ describe('sampleWxycMounts', () => {
     expect(sample.totalListeners).toBe(0);
     // The mounts are still connected, so the stream is up even at zero listeners.
     expect(sample.streamOnline).toBe(true);
+    // ...but the anomaly is surfaced rather than silently booked as zero.
+    expect(sample.unparseableListenerCounts).toBe(2);
   });
 });
 
@@ -165,6 +192,7 @@ describe('buildCapturePayload', () => {
     expect(payload.properties.primary_listeners).toBe(25);
     expect(payload.properties.mount_count).toBe(2);
     expect(payload.properties.stream_online).toBe(true);
+    expect(payload.properties.unparseable_listener_counts).toBe(0);
     expect(payload.properties.environment).toBe('production');
   });
 

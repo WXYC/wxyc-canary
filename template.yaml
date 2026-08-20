@@ -260,6 +260,7 @@ Parameters:
   StreamSamplerPostHogApiKey:
     Type: String
     Default: ''
+    NoEcho: true
     Description: >
       PostHog project ingestion token (`phc_...`) for the wxyc.org project
       (138666). Deliberately has NO default value in this public repo: a phc_
@@ -411,10 +412,13 @@ Resources:
       Architectures:
         - arm64
       MemorySize: 128
-      # Two sequential HTTP calls with an 8s client timeout each, plus cold
-      # start. 30s is generous; the sampler must never linger, since a late
+      # Worst case is THREE HTTP calls, not two: the status read is retried
+      # once (8s + 8s) before the failure capture (8s), so 24s of client
+      # budget plus cold start and DNS. 30s left almost no margin, and
+      # overrunning it produces a Lambda timeout. 45s keeps headroom while
+      # still bounding the run — the sampler must not linger, since a late
       # sample is attributed to the wrong quarter-hour.
-      Timeout: 30
+      Timeout: 45
       Environment:
         Variables:
           SAMPLER_ICECAST_STATUS_URL: !Ref StreamSamplerStatusUrl
@@ -425,6 +429,20 @@ Resources:
       # It needs no CloudWatch PutMetricData, no Secrets Manager, no SSM — the
       # basic Lambda execution role SAM attaches (logs only) is the whole
       # permission surface.
+      #
+      # MaximumRetryAttempts: 0 is load-bearing, not a tuning knob. A Schedule
+      # event source is an EventBridge rule, and EventBridge invokes Lambda
+      # ASYNCHRONOUSLY — which retries a throwing invocation twice by default,
+      # roughly 1 and 2 minutes later. `capture()` throws on any non-2xx or
+      # timeout, so with the platform default a PostHog 502 (or a capture that
+      # timed out after the event had already landed) would re-run the whole
+      # handler and POST a second and third `stream_listener_sample` inside the
+      # same quarter-hour. That is exactly the duplicate this design forbids —
+      # a duplicated sample corrupts the average worse than a missing one — and
+      # it would also break the fixed 288-events/day cost invariant. The
+      # in-handler read retry is the only retry this function may have.
+      EventInvokeConfig:
+        MaximumRetryAttempts: 0
       Events:
         Schedule:
           Type: Schedule
