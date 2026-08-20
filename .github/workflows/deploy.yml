@@ -65,8 +65,16 @@ jobs:
           GHA_RUNNER_ORG: ${{ vars.GHA_RUNNER_ORG || 'WXYC' }}
           GHA_RUNNER_ID: ${{ vars.GHA_RUNNER_ID || '0' }}
           INFRA_ALERT_EMAIL: ${{ vars.INFRA_ALERT_EMAIL }}
+          STREAM_SAMPLER_POSTHOG_API_KEY: ${{ secrets.STREAM_SAMPLER_POSTHOG_API_KEY }}
         run: |
           OPTIONAL_ARGS=()
+          # PostHog ingestion token for the stream listener sampler. Omitted
+          # entirely when the secret is unset (same empty-value parse reason as
+          # the params below), which leaves the sampler running in its
+          # log-only dry-run posture rather than failing the deploy.
+          if [ -n "$STREAM_SAMPLER_POSTHOG_API_KEY" ]; then
+            OPTIONAL_ARGS+=("StreamSamplerPostHogApiKey=$STREAM_SAMPLER_POSTHOG_API_KEY")
+          fi
           if [ -n "$GHA_RUNNER_TOKEN_SSM_PARAM_NAME" ]; then
             OPTIONAL_ARGS+=("GhaRunnerTokenSsmParamName=$GHA_RUNNER_TOKEN_SSM_PARAM_NAME")
             OPTIONAL_ARGS+=("GhaRunnerOrg=$GHA_RUNNER_ORG")

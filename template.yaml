@@ -218,6 +218,63 @@ Parameters:
       (`Number.isInteger(id) && id > 0`) is the second line of defense
       for any non-CFN deploy path (local invoke, manual env override).
 
+  StreamSamplerState:
+    Type: String
+    Default: ENABLED
+    AllowedValues: ['ENABLED', 'DISABLED']
+    Description: >
+      Whether the stream listener sampler's EventBridge schedule fires. This
+      is a `State:` on the schedule rather than SAM's `Enabled:` boolean on
+      purpose — `Enabled` takes a real boolean and rejects the intrinsic
+      (`!Ref`) that a parameterised lever requires, so the parameterised form
+      has to go through `State` with AllowedValues.
+
+      Flip to DISABLED to pause sampling without a code deploy. Note that
+      pausing leaves a gap in a continuous time series: unlike the canary's
+      probes, a skipped tick here is lost data, not merely an unrun check.
+  StreamSamplerSchedule:
+    Type: String
+    Default: rate(5 minutes)
+    Description: >
+      EventBridge schedule for the listener sampler. 5 minutes yields 288
+      samples/day — three per quarter-hour, enough to average concurrent
+      listeners into an AQH-comparable figure — and pins PostHog ingestion at
+      a constant 288 events/day regardless of traffic. Raising the frequency
+      is a billing decision: this is a fixed-rate timer capture, the shape
+      that caused the 2026-08-04 org-wide quota cutoff when it was allowed to
+      scale with load. Anything under 5 minutes should be justified against
+      that history first.
+  StreamSamplerStatusUrl:
+    Type: String
+    Default: https://audio-mp3.ibiblio.org/status-json.xsl
+    AllowedPattern: '^https://.+'
+    Description: >
+      Icecast status endpoint carrying the WXYC mounts. HTTPS is required by
+      the pattern: plain http:// on this host answers with an empty body,
+      which would register as a parse failure on every single tick rather
+      than failing loudly once at deploy.
+
+      This is ibiblio's shared Icecast — it also serves several unrelated
+      stations. The sampler filters to WXYC mounts by prefix and never emits
+      a co-tenant's listener counts.
+  StreamSamplerPostHogApiKey:
+    Type: String
+    Default: ''
+    Description: >
+      PostHog project ingestion token (`phc_...`) for the wxyc.org project
+      (138666). Deliberately has NO default value in this public repo: a phc_
+      token is write-only, but publishing one invites junk events into a
+      project whose quota is shared org-wide, and event quota is exactly what
+      went down on 2026-08-04. CI passes it from the
+      STREAM_SAMPLER_POSTHOG_API_KEY secret.
+
+      Empty (the default) means the sampler still runs and logs but does not
+      capture — the dry-run posture for a first deploy.
+  StreamSamplerPostHogHost:
+    Type: String
+    Default: https://us.i.posthog.com
+    Description: PostHog capture-API host (US cloud).
+
 Conditions:
   HasDjCredentials: !Not [!Equals [!Ref DjCredentialsSecretArn, '']]
   HasLmlApiKey: !Not [!Equals [!Ref LmlApiKeySecretArn, '']]
@@ -328,6 +385,58 @@ Resources:
     Type: AWS::Logs::LogGroup
     Properties:
       LogGroupName: !Sub /aws/lambda/${CanaryFunction}
+      RetentionInDays: 30
+
+  # ---------------------------------------------------------------------------
+  # Stream listener sampler (audience measurement, NOT liveness monitoring)
+  #
+  # Deliberately a second function rather than another canary check. The canary
+  # asserts that the stack is up and pages when it is not; this records how many
+  # people are connected to the WXYC stream so that number can be compared with
+  # broadcast ratings. Keeping them apart means a sampling failure can never
+  # page, an alarm suppression can never silence sampling, and the canary's
+  # wall-clock budget is not spent on an unrelated third-party fetch.
+  #
+  # It publishes no CloudWatch metrics and owns no alarms — its only output is
+  # a PostHog event and a log line.
+  # ---------------------------------------------------------------------------
+  StreamSamplerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: wxyc-stream-listener-sampler
+      Description: Samples WXYC Icecast concurrent listeners every 5 minutes into PostHog.
+      CodeUri: dist/
+      Handler: stream-sampler-handler.handler
+      Runtime: nodejs24.x
+      Architectures:
+        - arm64
+      MemorySize: 128
+      # Two sequential HTTP calls with an 8s client timeout each, plus cold
+      # start. 30s is generous; the sampler must never linger, since a late
+      # sample is attributed to the wrong quarter-hour.
+      Timeout: 30
+      Environment:
+        Variables:
+          SAMPLER_ICECAST_STATUS_URL: !Ref StreamSamplerStatusUrl
+          SAMPLER_POSTHOG_HOST: !Ref StreamSamplerPostHogHost
+          SAMPLER_POSTHOG_API_KEY: !Ref StreamSamplerPostHogApiKey
+          SAMPLER_ENVIRONMENT: production
+      # No Policies block: this function talks only to the public internet.
+      # It needs no CloudWatch PutMetricData, no Secrets Manager, no SSM — the
+      # basic Lambda execution role SAM attaches (logs only) is the whole
+      # permission surface.
+      Events:
+        Schedule:
+          Type: Schedule
+          Properties:
+            Schedule: !Ref StreamSamplerSchedule
+            State: !Ref StreamSamplerState
+            Description: Sample WXYC Icecast listener counts on a fixed cadence.
+
+  StreamSamplerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${StreamSamplerFunction}
       RetentionInDays: 30
 
   AlertTopic:
