@@ -417,6 +417,53 @@ False positives on a check usually mean its assertion is too tight (e.g., expect
 
 Add a new entry to the `checks` array in `src/checks.ts`. The check name becomes a CloudWatch metric dimension, so use kebab-case and keep it stable (renaming it breaks any dashboard that pinned to the old name). Write a test in `test/handler.test.ts` covering both pass and fail shapes.
 
+## Stream listener sampler
+
+A second Lambda in this stack, `wxyc-stream-listener-sampler`, records how many people are connected to WXYC's Icecast stream. It is **audience measurement, not monitoring**: it owns no alarms, publishes no CloudWatch metrics, and cannot page. See [`docs/scope.md`](docs/scope.md) for why it deliberately inverts several canary conventions.
+
+### What it does
+
+Every 5 minutes it GETs `https://audio-mp3.ibiblio.org/status-json.xsl`, sums the listener counts across the WXYC mounts, and POSTs one event to the PostHog capture API.
+
+| Event                           | When                                  | Key properties                                                                     |
+| ------------------------------- | ------------------------------------- | ---------------------------------------------------------------------------------- |
+| `stream_listener_sample`        | The status endpoint answered          | `total_listeners`, `primary_listeners`, `mount_count`, `stream_online`, `mounts[]` |
+| `stream_listener_sample_failed` | The status endpoint could not be read | `reason` (and deliberately **no** listener count)                                  |
+
+Three states, kept distinct on purpose: a normal sample, a sample where `stream_online: false` (fetch succeeded, no encoder connected — nobody _could_ be listening), and a failure (we could not measure). Booking a failure as `total_listeners: 0` would drag the average down invisibly, since zero is a legitimate value here.
+
+### Reading the data
+
+The events land in the **wxyc.org PostHog project (138666)**. The number to chart is `avg(total_listeners)` — that is the streaming analogue of Nielsen's AQH (Average Quarter-Hour) persons, the average number of people listening at a given moment.
+
+Two analysis rules worth stating up front:
+
+- **Filter on `stream_online = true`** when you want "listeners while broadcasting". Leave the downtime zeros in when you want availability.
+- **Do not derive cume from this.** Icecast counts connections; Nielsen counts people. Only AQH and total listening hours survive a broadcast-vs-stream comparison honestly. See the org-level notes on comparing terrestrial and online audience.
+
+Note that the apps (iOS, Android, Alexa) and the web player all pull these same mounts, so `total_listeners` is the _whole_ online audience, not just the website's.
+
+### Operating
+
+| Lever                              | Effect                                                                                                |
+| ---------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| `StreamSamplerState=DISABLED`      | Pauses the schedule. **This loses data** — unlike a skipped probe, a skipped sample is unrecoverable. |
+| `StreamSamplerSchedule`            | Cadence. 5 minutes = 288 events/day. Raising the frequency is a billing decision (see below).         |
+| `StreamSamplerPostHogApiKey` empty | Sampler runs and logs but does not capture. The intended posture for a first deploy.                  |
+| `SAMPLER_CAPTURE_ENABLED=false`    | Same dry-run effect, for local runs.                                                                  |
+
+Dry-run locally without writing to PostHog:
+
+```sh
+SAMPLER_CAPTURE_ENABLED=false npm run local:sampler
+```
+
+**Cost.** One GET and at most one event per invocation pins ingestion at a constant 288 events/day regardless of traffic — under 1% of the org's 1M/month PostHog allowance. That constancy is the design's whole point: the 2026-08-04 org-wide analytics cutoff came from telemetry whose volume scaled with load. Any change that makes the event rate depend on something we don't control needs to be justified against that.
+
+**Deploy secret.** `STREAM_SAMPLER_POSTHOG_API_KEY` (a `phc_` project ingestion token) is a GitHub Actions secret; the deploy workflow omits the parameter entirely when it is unset. It has no default in this public repo — a write-only token is still an invitation to inject junk events into a quota shared across every WXYC project.
+
+**If samples go missing.** The most likely cause is not the stream. `audio-mp3.ibiblio.org` is dual-stack and can take up to ~2.4s to answer, while Node's default Happy Eyeballs `autoSelectFamilyAttemptTimeout` is 250ms — which abandons healthy connections and surfaces as a bare `ETIMEDOUT` that looks like a dead host. `configureNetworking` raises it to 3s (`SAMPLER_FAMILY_ATTEMPT_TIMEOUT_MS`), and the read is retried once (`SAMPLER_READ_RETRIES`). Check the sampler's own log group before suspecting ibiblio.
+
 ## Why these specific checks
 
 The check set is deliberately small. Each one corresponds to a real production failure mode that has happened or has plausibly close-relatives. Don't add checks speculatively — every check is an alarm risk surface, and a noisy canary gets ignored. If a new failure mode shows up that the existing checks don't catch, add a check then.
