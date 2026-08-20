@@ -404,7 +404,11 @@ Resources:
   StreamSamplerFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: wxyc-stream-listener-sampler
+      # Named into the stack's `wxyc-canary*` namespace, which is the boundary
+      # the CI deploy role is scoped to. A name outside it cannot be deployed by
+      # CI without an out-of-band IAM change — that mismatch rolled back the
+      # first deploy of this function.
+      FunctionName: wxyc-canary-stream-listener-sampler
       Description: Samples WXYC Icecast concurrent listeners every 5 minutes into PostHog.
       CodeUri: dist/
       Handler: stream-sampler-handler.handler

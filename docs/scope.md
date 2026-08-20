@@ -6,7 +6,7 @@
 
 ## The stream listener sampler is not a canary
 
-`wxyc-stream-listener-sampler` shares this repo but is a different kind of job, and the distinction is load-bearing:
+`wxyc-canary-stream-listener-sampler` shares this repo but is a different kind of job, and the distinction is load-bearing:
 
 - **It measures an audience, it does not assert liveness.** It records how many people are connected to the WXYC Icecast mounts so that number can be compared against broadcast ratings. A low number is a fact about the audience, not a fault.
 - **It owns no alarms and publishes no CloudWatch metrics.** Its only outputs are a PostHog event and a log line. It can never page, and an alarm suppression can never silence it.
