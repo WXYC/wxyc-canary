@@ -54,6 +54,12 @@ export type StreamSample = {
    * listener counts, or the downtime zeros will drag the average down.
    */
   streamOnline: boolean;
+  /**
+   * How many WXYC mounts reported a listener count we could not parse. Booked
+   * as 0 in the total (there is nothing better to do), but surfaced so the
+   * drift is visible in the data rather than silently flattening the series.
+   */
+  unparseableListenerCounts: number;
 };
 
 export type CaptureEvent = {
@@ -104,13 +110,25 @@ function normalizeSources(status: unknown): Record<string, unknown>[] {
   return [];
 }
 
-/** Icecast occasionally omits `listeners` mid-reconnect; treat anything non-numeric as 0. */
-function toCount(value: unknown): number {
-  return typeof value === 'number' && Number.isFinite(value) ? value : 0;
-}
-
-function toOptionalCount(value: unknown): number | undefined {
-  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+/**
+ * Parses a listener count, accepting both numbers and numeric strings.
+ *
+ * Icecast builds differ in which `status-json.xsl` fields they quote, so a
+ * future `"listeners":"25"` must not read as zero. That would be the worst
+ * available failure: every mount would report 0 while `mounts` and
+ * `stream_online: true` still looked healthy, permanently flattening the AQH
+ * series with no failure event and no log signal.
+ *
+ * Returns `undefined` when genuinely unparseable, so the caller can count the
+ * anomaly rather than silently booking a zero.
+ */
+function parseCount(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string' && value.trim() !== '') {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return undefined;
 }
 
 /**
@@ -128,17 +146,26 @@ export function sampleWxycMounts(
   status: unknown,
   options: { mountPrefix?: string; primaryMount?: string } = {}
 ): StreamSample {
-  const prefix = options.mountPrefix ?? DEFAULT_MOUNT_PREFIX;
-  const primaryMount = options.primaryMount ?? DEFAULT_PRIMARY_MOUNT;
+  // Both sides of every comparison are lowercased. Lowercasing only the mount
+  // would make `SAMPLER_MOUNT_PREFIX=WXYC` — the natural way to spell a
+  // station's call letters — match nothing, emitting a well-formed
+  // `total_listeners: 0` on every tick that is indistinguishable from a
+  // permanently dropped encoder. That is precisely the silent undercount
+  // prefix matching exists to prevent.
+  const prefix = (options.mountPrefix ?? DEFAULT_MOUNT_PREFIX).toLowerCase();
+  const primaryMount = (options.primaryMount ?? DEFAULT_PRIMARY_MOUNT).toLowerCase();
 
   const mounts: MountSample[] = [];
+  let unparseableListenerCounts = 0;
   for (const source of normalizeSources(status)) {
     const mount = mountPathFrom(source.listenurl);
     if (!mount || !mount.toLowerCase().startsWith(prefix)) continue;
+    const listeners = parseCount(source.listeners);
+    if (listeners === undefined) unparseableListenerCounts += 1;
     mounts.push({
       mount,
-      listeners: toCount(source.listeners),
-      peak: toOptionalCount(source.listener_peak),
+      listeners: listeners ?? 0,
+      peak: parseCount(source.listener_peak),
     });
   }
 
@@ -146,10 +173,11 @@ export function sampleWxycMounts(
 
   return {
     totalListeners: mounts.reduce((sum, m) => sum + m.listeners, 0),
-    primaryListeners: mounts.find((m) => m.mount === primaryMount)?.listeners,
+    primaryListeners: mounts.find((m) => m.mount.toLowerCase() === primaryMount)?.listeners,
     mountCount: mounts.length,
     mounts,
     streamOnline: mounts.length > 0,
+    unparseableListenerCounts,
   };
 }
 
@@ -174,6 +202,7 @@ export function buildCapturePayload(sample: StreamSample, context: PayloadContex
       primary_listeners: sample.primaryListeners,
       mount_count: sample.mountCount,
       stream_online: sample.streamOnline,
+      unparseable_listener_counts: sample.unparseableListenerCounts,
       // Per-mount detail as a nested array rather than synthesised property
       // names (`listeners_wxyc_mp3`), which would fragment the schema every
       // time a mount is renamed.

@@ -70,8 +70,14 @@ jobs:
           OPTIONAL_ARGS=()
           # PostHog ingestion token for the stream listener sampler. Omitted
           # entirely when the secret is unset (same empty-value parse reason as
-          # the params below), which leaves the sampler running in its
-          # log-only dry-run posture rather than failing the deploy.
+          # the params below) rather than failing the deploy.
+          #
+          # NOTE: omitting it only yields the log-only dry run on the FIRST
+          # create, when the template's `Default: ''` applies. On an update,
+          # CloudFormation reuses the previous value for any parameter absent
+          # from --parameter-overrides, so deleting this secret after a
+          # successful deploy leaves capture armed with the old token. The
+          # real off switch is StreamSamplerState=DISABLED.
           if [ -n "$STREAM_SAMPLER_POSTHOG_API_KEY" ]; then
             OPTIONAL_ARGS+=("StreamSamplerPostHogApiKey=$STREAM_SAMPLER_POSTHOG_API_KEY")
           fi

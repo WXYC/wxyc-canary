@@ -50,6 +50,25 @@ export function configureNetworking(config: SamplerConfig): void {
   setDefaultAutoSelectFamilyAttemptTimeout(config.familyAttemptTimeoutMs);
 }
 
+/**
+ * Reads a numeric env var, falling back to the default on anything
+ * unparseable.
+ *
+ * An unguarded `Number(...)` turns a typo into a silent, hard-to-read outage:
+ * `SAMPLER_READ_RETRIES=on` yields NaN, `attempt <= NaN` is false on the first
+ * iteration, so the fetch loop never executes and the sampler throws its
+ * uninitialised `lastError` — filling the series with failure events whose
+ * `reason` is the literal string "undefined" while no HTTP request is ever
+ * made. NaN into `setDefaultAutoSelectFamilyAttemptTimeout` is worse still: it
+ * throws a RangeError from `configureNetworking`, which runs outside the
+ * try/catch, so not even a failure event is emitted.
+ */
+function numberFromEnv(raw: string | undefined, fallback: number): number {
+  if (raw === undefined || raw.trim() === '') return fallback;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): SamplerConfig {
   return {
     statusUrl: env.SAMPLER_ICECAST_STATUS_URL ?? 'https://audio-mp3.ibiblio.org/status-json.xsl',
@@ -61,13 +80,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): SamplerConfig 
     environment: env.SAMPLER_ENVIRONMENT ?? 'production',
     mountPrefix: env.SAMPLER_MOUNT_PREFIX ?? 'wxyc',
     primaryMount: env.SAMPLER_PRIMARY_MOUNT ?? 'wxyc.mp3',
-    timeoutMs: env.SAMPLER_TIMEOUT_MS ? Number(env.SAMPLER_TIMEOUT_MS) : 8000,
+    timeoutMs: numberFromEnv(env.SAMPLER_TIMEOUT_MS, 8000),
     // Dry-run lever for local runs: parse and log without writing to PostHog.
     captureEnabled: env.SAMPLER_CAPTURE_ENABLED !== 'false',
-    familyAttemptTimeoutMs: env.SAMPLER_FAMILY_ATTEMPT_TIMEOUT_MS
-      ? Number(env.SAMPLER_FAMILY_ATTEMPT_TIMEOUT_MS)
-      : 3000,
-    readRetries: env.SAMPLER_READ_RETRIES ? Number(env.SAMPLER_READ_RETRIES) : 1,
+    familyAttemptTimeoutMs: numberFromEnv(env.SAMPLER_FAMILY_ATTEMPT_TIMEOUT_MS, 3000),
+    readRetries: numberFromEnv(env.SAMPLER_READ_RETRIES, 1),
   };
 }
 
@@ -177,7 +194,13 @@ export async function runSampler(
   }
 
   if (!config.captureEnabled || !config.posthogApiKey) {
-    return { ...result, reason: result.reason ?? 'capture disabled (no api key)' };
+    // Two distinct levers, two distinct reasons. Collapsing them sends an
+    // operator who set SAMPLER_CAPTURE_ENABLED=false chasing a CloudFormation
+    // parameter problem that does not exist.
+    const dryRunReason = !config.captureEnabled
+      ? 'capture disabled (SAMPLER_CAPTURE_ENABLED=false)'
+      : 'capture disabled (no api key)';
+    return { ...result, reason: result.reason ?? dryRunReason };
   }
 
   await capture(payload, config);
@@ -185,9 +208,21 @@ export async function runSampler(
 }
 
 export async function handler(): Promise<SamplerResult> {
-  const result = await runSampler();
-  // Structured single-line log; CloudWatch Logs is the audit trail for a job
-  // whose only other output is a write to a third party.
-  console.log(JSON.stringify({ sampler: 'wxyc-stream-listeners', ...result }));
-  return result;
+  // The structured line is this function's ONLY observable output: it emits no
+  // CloudWatch metrics and owns no alarms by design, and the canary's
+  // `wxyc-canary-lambda-errors` alarm is dimensioned to CanaryFunction, so it
+  // does not cover this one. If `runSampler` were allowed to throw past this
+  // point, a rotated `phc_` token would stop sampling with no log line at all
+  // — only a runtime stack trace nobody is watching. So the failure is logged
+  // in the same shape as a success, then rethrown so the Lambda still records
+  // an invocation error.
+  try {
+    const result = await runSampler();
+    console.log(JSON.stringify({ sampler: 'wxyc-stream-listeners', ...result }));
+    return result;
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    console.log(JSON.stringify({ sampler: 'wxyc-stream-listeners', captured: false, event: null, reason }));
+    throw err;
+  }
 }
