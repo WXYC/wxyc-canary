@@ -415,7 +415,15 @@ Resources:
       Runtime: nodejs24.x
       Architectures:
         - arm64
-      MemorySize: 128
+      # 256, not the 128 this shipped with. The first production invocation
+      # reported Max Memory Used: 113 MB against a 128 MB ceiling — 88% of the
+      # limit, with the Node 24 runtime itself accounting for most of it. An
+      # OOM here does not fail loudly: the invocation dies before the handler's
+      # structured log line, and since this function publishes no CloudWatch
+      # metrics and owns no alarms, a runtime bump that pushed it over would
+      # silently punch holes in the time series. Lambda bills GB-ms, so at 288
+      # invocations/day of ~3.6s the extra headroom costs cents per year.
+      MemorySize: 256
       # Worst case is THREE HTTP calls, not two: the status read is retried
       # once (8s + 8s) before the failure capture (8s), so 24s of client
       # budget plus cold start and DNS. 30s left almost no margin, and
