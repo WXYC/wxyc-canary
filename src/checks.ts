@@ -224,7 +224,7 @@ const semanticIndexFreshness: Check = {
 };
 
 /**
- * Per-request budget for the legacy-bridge probe, in milliseconds. Sourced
+ * Per-request budget for the legacy-fleet probe, in milliseconds. Sourced
  * from the tightest PER-HOP budget in the fleet, and deliberately stricter
  * than any client's actual behaviour.
  *
@@ -276,29 +276,37 @@ const PLAYCUT_REQUIRED_FIELDS = [
 ] as const;
 
 /**
- * The exact fail-soft body `RecentEntriesJSONServlet.sendUpstreamUnavailable`
- * writes when the bridge cannot get a usable response out of Backend.
- */
-const UPSTREAM_UNAVAILABLE_SENTINEL = 'upstream_unavailable';
-
-/** True only for tubafrenzy's own documented fail-soft body. */
-function isUpstreamUnavailableBody(body: unknown): boolean {
-  return !!body && typeof body === 'object' && (body as { error?: unknown }).error === UPSTREAM_UNAVAILABLE_SENTINEL;
-}
-
-/**
- * Anonymous: the tubafrenzy bridge path the mobile fleet actually polls
- * (wxyc-canary#93). Since WXYC/tubafrenzy#620, a plain recent-N request to
- * `wxyc.info/playlists/recentEntries` is reverse-proxied to Backend's route
- * of the same name; every other canary check talks to `api.wxyc.org`
- * directly, so nothing else measures the hop the shipped clients traverse:
- * DNS → Kattare Tomcat → servlet → HTTPS → AWS → Express.
+ * Anonymous: the `wxyc.info` path the mobile fleet actually polls
+ * (wxyc-canary#93). Every other canary check talks to `api.wxyc.org`
+ * directly; this one asks for the hostname the shipped clients have compiled
+ * in, over the scheme they compiled in, so it is the only probe that can see
+ * that surface break.
  *
- * RETIREMENT TRIGGER: WXYC/wiki#100 (the `wxyc.info` DNS flip). When that
- * lands, the host under test stops existing and this check should be
- * DELETED, not left to fail — along with its two alarms in `template.yaml`
- * and the `LegacyPlaylistUrl` parameter. Blanking that parameter is only the
- * transition affordance (the probe skips), not the retirement.
+ * WHAT IT MEASURES CHANGED ON 2026-09-16, AND THE CHECK DID NOT (wxyc-canary#104).
+ * Until then `wxyc.info` resolved to Kattare, whose Tomcat bridge servlet
+ * (WXYC/tubafrenzy#620) forwarded to Backend, and this check measured that
+ * whole chain: DNS → Kattare Tomcat → servlet → HTTPS → AWS → Express. The
+ * DNS flip moved the apex A record to the Backend EC2 host, where a dedicated
+ * `server_name wxyc.info www.wxyc.info` nginx block on plain `:80` proxies
+ * this one route to `127.0.0.1:8080`. The check kept passing across the flip
+ * and got faster (hourly mean 613-1064 ms → ~620 ms, max 2334 ms → 1043 ms).
+ *
+ * IT SURVIVES BECAUSE THAT VHOST IS OTHERWISE UNWATCHED. Three properties no
+ * other check shares: the block lives in `/etc/nginx/nginx.conf` on the box
+ * and is NOT in version control; its likeliest regression is silent, because
+ * the block ends in `location / { return 410; }` and losing the exact-match
+ * `location = /playlists/recentEntries` hands every phone a clean dead end;
+ * and the `api.wxyc.org` checks cannot cover it, since they traverse a
+ * different vhost, a different port, and TLS. `wxyc.info` is plain `:80` on
+ * purpose — the apps reach it through ATS exceptions and cannot be relied on
+ * to follow a redirect.
+ *
+ * RETIREMENT TRIGGER: the nginx block itself. Delete this check, its
+ * `LegacyPlaylistUrl` / `EnableLegacyPlaylistProbe` parameters, and
+ * `RecentEntriesLatencyAlarm` when the legacy fleet stops polling and that
+ * server block comes out — not on a date, and NOT on the DNS flip, which has
+ * already happened. `EnableLegacyPlaylistProbe=false` is the operator's off
+ * switch (the probe skips), not the retirement.
  *
  * URL SHAPE. `?v=2&n=50` is iOS's literal from `PlaylistEntry.swift:17`, and
  * `v` selects the response projection: `v=2` is a grouped object, absent-or-1
@@ -311,41 +319,35 @@ function isUpstreamUnavailableBody(body: unknown): boolean {
  * field predates the bump. Prefer the logs over the source when the question
  * is what the fleet actually sends. This
  * check exercises the 96.7% shape. The flat projection is a RECORDED GAP:
- * both shapes traverse an identical bridge hop and diverge only in Backend's
+ * both shapes traverse an identical proxy hop and diverge only in Backend's
  * own JSON projection, so a second request here would double the run's
  * latency signal to cover a Backend-side contract this check is not scoped
  * to.
  *
- * TWO LANES, TWO ALARMS. The check distinguishes a fault in the bridge from
- * a Backend outage behind it, because an operator paged at 3am needs to know
- * which service to open:
+ * ONE LANE (wxyc-canary#104). It used to be two: a Kattare-side bridge fault
+ * threw to the shared `wxyc-canary-check-failure` page, while "Backend
+ * unreachable from the bridge" — tubafrenzy's fail-soft `503` +
+ * `{"error":"upstream_unavailable"}` — PASSED and carried
+ * `RecentEntriesUpstreamUnavailable: 1` to its own alarm, so an operator paged
+ * at 3am knew which service to open. Two services, two alarms.
  *
- *   - BRIDGE FAULT — timeout, network error, a non-2xx that isn't the
- *     fail-soft sentinel, or a malformed body — THROWS. That routes through
- *     `UserFacingCheckFailure` to the shared `wxyc-canary-check-failure`
- *     page, and no metric is emitted (we observed no upstream verdict, so
- *     emitting `0` would assert "Backend is fine" on evidence we lack).
- *   - BACKEND UNREACHABLE FROM THE BRIDGE — tubafrenzy's fail-soft `503` +
- *     `{"error":"upstream_unavailable"}` — PASSES, carrying the signal in
- *     `RecentEntriesUpstreamUnavailable: 1` to its own dedicated alarm.
+ * There is only one service now. That sentinel body is written by exactly one
+ * artifact in the org, `RecentEntriesJSONServlet.sendUpstreamUnavailable`, and
+ * it is out of the path; Backend-Service emits it nowhere. nginx answers `502`
+ * or `504` when it cannot get a response out of `127.0.0.1:8080`, and a
+ * Backend outage proper already pages in ~10 min via `backend-healthcheck`.
+ * So every failure — timeout, network error, any non-2xx, a malformed body —
+ * now THROWS to the shared page, and no metric is emitted on any branch.
  *
- * That second lane is the `lml-discogs-breaker-shed` metric-carries-the-
- * signal pattern (docs/adding-a-check.md), and it is load-bearing here for a
- * measured reason rather than a stylistic one: the fail-soft 503 has a
- * ~0.76% baseline rate (275 of 36,392 requests, 2026-08-02→05) clustered in
- * the `:00–:04` and `:30–:34` ETL-cron windows — 64% of failures in 17% of
- * the clock. Routing that through the shared page would either train on-call
- * to ignore it or force the whole page alarm to absorb a bespoke evaluation
- * window it doesn't need.
- *
- * The status lane keys on the BODY sentinel, not the 503 alone: Kattare and
- * Tomcat's own admission control answer 503 + `Retry-After: 5` too, and
- * filing those under "Backend is down" sends the operator to the wrong
- * service entirely.
+ * DO NOT REINSTATE THE QUIET LANE for a 503 seen in the wild here. It only
+ * ever made sense because a *different operator's* box sat in front of ours;
+ * a 503 arriving now is Backend's own, and suppressing the page for it would
+ * hide a real outage behind a metric nothing alarms on. `test/handler.test.ts`
+ * pins this: the sentinel body must fail.
  */
 const wxycInfoRecentEntries: Check = {
   name: 'wxyc-info-recent-entries',
-  description: 'GET wxyc.info/playlists/recentEntries?v=2&n=50 — the tubafrenzy bridge path the mobile fleet polls',
+  description: 'GET wxyc.info/playlists/recentEntries?v=2&n=50 — the legacy-fleet path the mobile apps poll',
   requiresAuth: false,
   // Page tier (default). This is the listener-facing now-playing surface for
   // both mobile apps; a sustained break here blanks every phone.
@@ -355,22 +357,21 @@ const wxycInfoRecentEntries: Check = {
     }
     const url = `${ctx.legacyPlaylistUrl}/playlists/recentEntries?v=2&n=50`;
     // A CanaryFetchError (timeout / network) propagates deliberately: a poll
-    // that never completes is the failure a poller actually feels, and it is
-    // a bridge-lane fault.
+    // that never completes is the failure a poller actually feels.
     const r = await canaryFetch(url, { timeoutMs: RECENT_ENTRIES_TIMEOUT_MS });
 
-    if (r.status === 503 && isUpstreamUnavailableBody(r.body)) {
-      return { metrics: { RecentEntriesUpstreamUnavailable: 1 } };
-    }
+    // Every non-2xx fails, the retired fail-soft 503 included. A 410 here is
+    // the vhost's catch-all having swallowed the exact-match location, which
+    // is the specific silent regression this probe exists to catch.
     if (!r.ok) {
       throw new Error(`expected 2xx, got ${r.status}: ${r.rawText.slice(0, 200)}`);
     }
 
     const body = r.body;
     if (!body || typeof body !== 'object' || Array.isArray(body)) {
-      // An array here means the bridge dropped `v` on the way through and
-      // Backend served the flat projection — a silent break of every iOS
-      // client behind a plausible-looking 200.
+      // An array here means `v` was dropped on the way through and Backend
+      // served the flat projection — a silent break of every iOS client
+      // behind a plausible-looking 200.
       throw new Error(`expected the v2 grouped object, got: ${r.rawText.slice(0, 200)}`);
     }
     const grouped = body as Record<string, unknown>;
@@ -405,8 +406,6 @@ const wxycInfoRecentEntries: Check = {
         );
       }
     }
-
-    return { metrics: { RecentEntriesUpstreamUnavailable: 0 } };
   },
 };
 

@@ -141,17 +141,23 @@ export type CheckContext = {
    */
   lmlUrl: string;
   /**
-   * Base URL of the legacy tubafrenzy host (no trailing slash) that the
-   * mobile fleet still polls for the flowsheet — `http://wxyc.info` in
-   * production, plain HTTP because that is what the shipped clients
-   * hardcode. The `wxyc-info-recent-entries` check (wxyc-canary#93) measures
-   * `${legacyPlaylistUrl}/playlists/recentEntries`, which since
-   * WXYC/tubafrenzy#620 reverse-proxies to Backend's route of the same name.
+   * Base URL (no trailing slash) of the host the legacy mobile fleet still
+   * polls for the flowsheet — `http://wxyc.info` in production, plain HTTP
+   * because that is the scheme the shipped clients hardcode. The
+   * `wxyc-info-recent-entries` check (wxyc-canary#93) measures
+   * `${legacyPlaylistUrl}/playlists/recentEntries`.
    *
-   * Empty string → the check downgrades to skipped, which is the transition
-   * affordance for the WXYC/wiki#100 DNS flip: an operator can retire the
-   * probe by blanking the CFN parameter without waiting on a code deploy.
-   * Retirement proper is deleting the check.
+   * "legacy" now names the CLIENTS, not the host. Until the 2026-09-16 DNS
+   * flip this pointed at Kattare and the check traversed
+   * WXYC/tubafrenzy#620's Tomcat bridge; the apex A record now resolves to
+   * the Backend EC2 host, where a dedicated `server_name wxyc.info` nginx
+   * block proxies the one surviving route. Same URL, different machine —
+   * see the check's docstring in `src/checks.ts` (wxyc-canary#104).
+   *
+   * Empty string → the check downgrades to skipped. That is the operator's
+   * off switch (`EnableLegacyPlaylistProbe=false` forces it empty), not the
+   * retirement; retirement proper is deleting the check, and it comes when
+   * the nginx block does.
    */
   legacyPlaylistUrl: string;
   /**

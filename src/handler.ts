@@ -32,10 +32,10 @@ function loadConfigFromEnv(): CanaryConfig {
     semanticIndexUrl: required('CANARY_SEMANTIC_INDEX_URL'),
     lmlUrl: process.env.CANARY_LML_URL ?? 'https://library-metadata-lookup-production.up.railway.app',
     // `??` (not `||`) deliberately, unlike the runner-liveness / OIDC fields
-    // below: an explicit empty string here is a MEANINGFUL value — it retires
-    // the `wxyc-info-recent-entries` probe ahead of the WXYC/wiki#100 DNS
-    // flip without a code deploy. Falling through to the default on empty
-    // would take that lever away.
+    // below: an explicit empty string here is a MEANINGFUL value — it parks
+    // the `wxyc-info-recent-entries` probe (`EnableLegacyPlaylistProbe=false`)
+    // without a code deploy. Falling through to the default on empty would
+    // take that lever away.
     legacyPlaylistUrl: process.env.CANARY_LEGACY_PLAYLIST_URL ?? 'http://wxyc.info',
     lmlApiKey: process.env.CANARY_LML_API_KEY,
     originUrl: process.env.CANARY_ORIGIN_URL ?? 'https://dj.wxyc.org',

@@ -97,7 +97,7 @@ const recentEntriesV2Body = {
 };
 
 /**
- * Happy-path stub for the legacy-bridge probe (`wxyc-info-recent-entries`).
+ * Happy-path stub for the legacy-fleet probe (`wxyc-info-recent-entries`).
  *
  * Every block whose assertions depend on a full green run must stitch this
  * in: `baseConfig` and the env loader both default `legacyPlaylistUrl` to
@@ -298,10 +298,11 @@ describe('runCanary — anonymous-only configuration', () => {
     expect(byName['lml-discogs-breaker-shed'].status).toBe('pass');
     expect(byName['lml-discogs-breaker-shed'].metrics?.DiscogsBreakerShedding).toBe(0);
     // `wxyc-info-recent-entries` (wxyc-canary#93) needs no auth either — the
-    // bridge route is public and unauthenticated, which is exactly why it is
-    // reachable from a canary at all.
+    // route is public and unauthenticated, which is exactly why it is
+    // reachable from a canary at all. It emits no metrics of its own since
+    // wxyc-canary#104 retired its fail-soft lane.
     expect(byName['wxyc-info-recent-entries'].status).toBe('pass');
-    expect(byName['wxyc-info-recent-entries'].metrics?.RecentEntriesUpstreamUnavailable).toBe(0);
+    expect(byName['wxyc-info-recent-entries'].metrics).toBeUndefined();
     expect(byName['proxy-library-search'].status).toBe('skipped');
     expect(byName['dj-library-search'].status).toBe('skipped');
     expect(byName['dj-flowsheet-read'].status).toBe('skipped');
@@ -1698,26 +1699,26 @@ describe('runCanary — lml-discogs-breaker-shed check (wxyc-canary#79)', () => 
 });
 
 /**
- * `wxyc-info-recent-entries` (wxyc-canary#93) — the tubafrenzy bridge path
- * the mobile fleet actually polls.
+ * `wxyc-info-recent-entries` (wxyc-canary#93, retargeted in wxyc-canary#104)
+ * — the `wxyc.info` vhost the mobile fleet actually polls.
  *
- * Two lanes, deliberately routed to two different alarms so an operator can
- * tell a bridge fault from a Backend outage without reading a log:
+ * ONE LANE since the 2026-09-16 DNS flip. The check used to split its
+ * failures across two alarms so an operator could tell a Kattare-side bridge
+ * fault from a Backend outage behind it, with the quiet lane keyed on
+ * tubafrenzy's `503` + `{"error":"upstream_unavailable"}` — a body emitted by
+ * `RecentEntriesJSONServlet` and by nothing else in the org. That servlet is
+ * out of the path now, so the lane is unreachable and every failure routes to
+ * the shared `wxyc-canary-check-failure` page.
  *
- *   - BRIDGE FAULT (timeout, non-sentinel non-2xx, malformed body) → the
- *     check FAILS → `UserFacingCheckFailure` → `wxyc-canary-check-failure`.
- *   - BACKEND UNREACHABLE FROM THE BRIDGE → tubafrenzy's documented fail-soft
- *     (`503` + `{"error":"upstream_unavailable"}`) → the check PASSES and
- *     carries the signal in `RecentEntriesUpstreamUnavailable: 1` →
- *     `wxyc-canary-recent-entries-upstream-unavailable`.
- *
- * The metric-carries-the-signal lane is the `lml-discogs-breaker-shed`
- * pattern (see docs/adding-a-check.md) and is load-bearing here for a
- * measured reason: the fail-soft 503 has a ~0.76% baseline rate clustered in
- * the `:00–:04` / `:30–:34` ETL-cron windows, so routing it through the
- * shared 2-of-3 page would trade a real signal for recurring noise.
+ * The status cases below are not decorative. `502`/`504` are what nginx
+ * answers when it cannot get a response out of `127.0.0.1:8080` — the shapes
+ * that replaced the fail-soft `503`. `410` is the vhost's own catch-all
+ * swallowing the exact-match location, which is THE silent regression this
+ * probe now exists to catch: the fleet gets a clean dead end while
+ * `api.wxyc.org` stays green. And a `503` carrying the retired sentinel must
+ * FAIL, or the deleted lane can be reinstated without failing anything.
  */
-describe('runCanary — wxyc-info-recent-entries check (bridge measurement, wxyc-canary#93)', () => {
+describe('runCanary — wxyc-info-recent-entries check (vhost measurement, wxyc-canary#93)', () => {
   const LEGACY_URL = 'http://legacy.example.test';
   const legacyConfig: CanaryConfig = { ...baseConfig, legacyPlaylistUrl: LEGACY_URL };
 
@@ -1749,9 +1750,10 @@ describe('runCanary — wxyc-info-recent-entries check (bridge measurement, wxyc
     const result = await outcome;
 
     expect(result.status).toBe('pass');
-    // The gauge's 0 is a real reading ("the bridge reached Backend"), not an
-    // abstain — see docs/adding-a-check.md on gauge-vs-counter abstain rules.
-    expect(result.metrics?.RecentEntriesUpstreamUnavailable).toBe(0);
+    // No metrics at all now: the only gauge this check ever emitted rode the
+    // retired fail-soft lane. `CheckLatency` still comes from the runner and
+    // still feeds `wxyc-canary-recent-entries-latency`.
+    expect(result.metrics).toBeUndefined();
 
     // The URL is pinned to iOS's literal, not the `?n=50` the issue drafted:
     // `PlaylistEntry.swift:17` is `?v=2&n=50`, and `v` selects a different
@@ -1761,9 +1763,13 @@ describe('runCanary — wxyc-info-recent-entries check (bridge measurement, wxyc
     expect(url).toBe(`${LEGACY_URL}/playlists/recentEntries?v=2&n=50`);
   });
 
-  it('fails soft without paging when tubafrenzy reports the upstream unavailable', async () => {
-    // tubafrenzy#620's documented fail-soft: a fast 503 with a tiny static
-    // body so a slow Backend cannot wedge Tomcat worker threads.
+  it('fails on the retired fail-soft sentinel instead of passing on it', async () => {
+    // The regression guard for wxyc-canary#104. This exact response — the one
+    // tubafrenzy's `sendUpstreamUnavailable` produced — used to PASS and carry
+    // `RecentEntriesUpstreamUnavailable: 1` to its own alarm. The servlet that
+    // emitted it is out of the path, and Backend-Service emits the sentinel
+    // nowhere, so the body is now just an unexplained 503 like any other.
+    // Without this case the lane can be reinstated without failing anything.
     const { outcome } = runWithLegacy({
       status: 503,
       body: { error: 'upstream_unavailable' },
@@ -1771,61 +1777,46 @@ describe('runCanary — wxyc-info-recent-entries check (bridge measurement, wxyc
     });
     const result = await outcome;
 
-    // PASS, not fail: the bridge did its job. The signal rides the metric to
-    // its own alarm so a Backend outage and a bridge fault never share one.
-    expect(result.status).toBe('pass');
-    expect(result.metrics?.RecentEntriesUpstreamUnavailable).toBe(1);
-  });
-
-  it('fails on a 503 that is NOT the fail-soft sentinel', async () => {
-    // Kattare/Tomcat shedding (AdmissionControlFilter and friends) also
-    // answers 503 + `Retry-After: 5`. Keying the upstream lane on the STATUS
-    // alone would file a Kattare-side fault under "Backend is down" and send
-    // the operator to the wrong service. The body sentinel is the
-    // discriminator; the status alone is not.
-    const { outcome } = runWithLegacy({
-      status: 503,
-      body: '<html><body>Service Unavailable</body></html>',
-      headers: { 'Retry-After': '5', 'Content-Type': 'text/html' },
-    });
-    const result = await outcome;
-
     expect(result.status).toBe('fail');
     expect(result.message).toMatch(/503/);
-    // No metric on the bridge-fault lane: we did not observe a determinate
-    // upstream verdict, so emitting `0` would assert "Backend is fine" on
-    // evidence we do not have.
     expect(result.metrics).toBeUndefined();
   });
 
   it.each([
-    { label: 'a 500', status: 500 },
-    { label: 'a 404', status: 404 },
-  ])('fails on the fail-soft sentinel body arriving with $label instead of a 503', async ({ status }) => {
-    // The mirror image of the test above, and the other half of what makes
-    // the discriminator a CONJUNCTION. Only tubafrenzy's `sendUpstreamUnavailable`
-    // pairs this body with a 503; the same body under any other status means
-    // something is synthesizing it — a misconfigured intermediary, or a future
-    // servlet change — and routing that to the quiet upstream lane would hide a
-    // bridge fault behind "Backend is down". Without this case, dropping the
-    // `r.status === 503` conjunct entirely survives the suite.
-    const { outcome } = runWithLegacy({ status, body: { error: 'upstream_unavailable' } });
-    const result = await outcome;
-
-    expect(result.status).toBe('fail');
-    expect(result.message).toMatch(new RegExp(String(status)));
-    expect(result.metrics).toBeUndefined();
-  });
-
-  it.each([
-    { label: 'a 500 from the bridge', status: 500, body: { error: 'boom' } },
-    { label: 'a 404 (servlet unmapped)', status: 404, body: { error: 'not found' } },
+    // nginx's shape when it cannot get a response out of `127.0.0.1:8080` —
+    // what replaced tubafrenzy's fail-soft 503, and what the host actually
+    // produces (api.wxyc.org logged 36-458 of these a day through Sept 2026).
+    {
+      label: 'a 502 (nginx cannot reach Backend)',
+      status: 502,
+      body: '<html><head><title>502 Bad Gateway</title></head></html>',
+    },
+    {
+      label: 'a 504 (upstream timed out)',
+      status: 504,
+      body: '<html><head><title>504 Gateway Time-out</title></head></html>',
+    },
+    // The vhost's own catch-all. If the exact-match
+    // `location = /playlists/recentEntries` is ever dropped, reordered, or
+    // shadowed, `location / { return 410; }` answers instead and every phone
+    // gets a clean dead end while api.wxyc.org stays green. Nothing else on
+    // that host would notice, which is the whole reason this probe survives.
+    {
+      label: 'a 410 (catch-all swallowed the exact-match location)',
+      status: 410,
+      body: '<html><head><title>410 Gone</title></head></html>',
+    },
+    { label: 'a 500', status: 500, body: { error: 'boom' } },
+    { label: 'a 404 (route unmapped)', status: 404, body: { error: 'not found' } },
   ])('fails on $label', async ({ status, body }) => {
     const { outcome } = runWithLegacy({ status, body });
     const result = await outcome;
 
     expect(result.status).toBe('fail');
     expect(result.message).toMatch(new RegExp(String(status)));
+    // No metrics on any failure branch: a thrown check's metrics are dropped
+    // by the runner, and no lane reports through one any more.
+    expect(result.metrics).toBeUndefined();
   });
 
   it.each([
@@ -1914,8 +1905,8 @@ describe('runCanary — wxyc-info-recent-entries check (bridge measurement, wxyc
 
   it('fails when the array arrives where the v2 object was expected', async () => {
     // The `v=1` flat-array projection reaching a `v=2` request means the
-    // bridge dropped the `v` parameter — silently breaking every iOS client
-    // while still returning 200 with plausible-looking JSON.
+    // query string was dropped on the way through — silently breaking every
+    // iOS client while still returning 200 with plausible-looking JSON.
     const { outcome } = runWithLegacy({ status: 200, body: recentEntriesV2Body.playcuts });
     const result = await outcome;
 
@@ -1923,8 +1914,10 @@ describe('runCanary — wxyc-info-recent-entries check (bridge measurement, wxyc
   });
 
   it('skips (does not fail) when no legacy playlist URL is configured', async () => {
-    // The wiki#100 DNS-flip transition window: blanking the parameter retires
-    // the probe without a redeploy. Retirement proper is deleting the check.
+    // The operator's off switch: `EnableLegacyPlaylistProbe=false` forces the
+    // env var empty, no redeploy of code required. Retirement proper is
+    // deleting the check, and that comes when the nginx vhost goes — i.e.
+    // when the legacy fleet finally stops polling.
     setUpFetchMock(otherAnonymousStubs);
     const outcomes = await runCanary({ ...baseConfig, legacyPlaylistUrl: '' });
     const result = byNameOf('wxyc-info-recent-entries')(outcomes);
@@ -1933,31 +1926,32 @@ describe('runCanary — wxyc-info-recent-entries check (bridge measurement, wxyc
     expect(result.message).toMatch(/no legacy playlist URL configured/);
   });
 
-  it('emits the upstream-unavailable gauge dimensioned AND dimensionless', async () => {
-    // The alarm reads the dimensionless series (plain-form alarms cannot
-    // aggregate across dimension values — org CLAUDE.md / wxyc-canary#13).
+  it('publishes no metric of its own on a green run', async () => {
+    // wxyc-canary#104 deleted the only metric this check ever emitted. The
+    // guard is here rather than in the unit-level assertions because the
+    // emission path being asserted is the handler's publish step: a metric
+    // resurrected in `src/checks.ts` would reach CloudWatch through here.
     process.env.CANARY_BACKEND_URL = 'https://api.example.test';
     process.env.CANARY_AUTH_URL = 'https://auth.example.test';
     process.env.CANARY_SEMANTIC_INDEX_URL = 'https://explore.example.test';
     process.env.CANARY_LEGACY_PLAYLIST_URL = LEGACY_URL;
     process.env.CANARY_PUBLISH_METRICS = 'true';
     cloudWatchSendMock.mockClear();
-    setUpFetchMock({
-      ...RECENT_ENTRIES_STUB,
-      ...otherAnonymousStubs,
-      '/playlists/recentEntries': { status: 503, body: { error: 'upstream_unavailable' } },
-    });
+    setUpFetchMock({ ...RECENT_ENTRIES_STUB, ...otherAnonymousStubs });
 
     await handler().catch(() => undefined);
-    const emitted = getPublishedMetrics().filter((d) => d.MetricName === 'RecentEntriesUpstreamUnavailable');
-    const dimensioned = emitted.filter((d) => (d.Dimensions ?? []).length > 0);
-    const dimensionless = emitted.filter((d) => (d.Dimensions ?? []).length === 0);
+    const names = new Set(getPublishedMetrics().map((d) => d.MetricName));
 
-    expect(dimensioned).toHaveLength(1);
-    expect(dimensionless).toHaveLength(1);
-    expect(dimensioned[0].Value).toBe(1);
-    expect(dimensionless[0].Value).toBe(1);
-    expect(dimensioned[0].Dimensions?.[0]).toEqual({ Name: 'Check', Value: 'wxyc-info-recent-entries' });
+    expect(names.has('RecentEntriesUpstreamUnavailable')).toBe(false);
+    // The latency series the surviving alarm reads is still published,
+    // dimensioned by check name — deleting the metric must not take it out.
+    expect(
+      getPublishedMetrics().some(
+        (d) =>
+          d.MetricName === 'CheckLatency' &&
+          (d.Dimensions ?? []).some((dim) => dim.Name === 'Check' && dim.Value === 'wxyc-info-recent-entries')
+      )
+    ).toBe(true);
 
     delete process.env.CANARY_BACKEND_URL;
     delete process.env.CANARY_AUTH_URL;
