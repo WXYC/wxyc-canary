@@ -334,10 +334,23 @@ const PLAYCUT_REQUIRED_FIELDS = [
  * There is only one service now. That sentinel body is written by exactly one
  * artifact in the org, `RecentEntriesJSONServlet.sendUpstreamUnavailable`, and
  * it is out of the path; Backend-Service emits it nowhere. nginx answers `502`
- * or `504` when it cannot get a response out of `127.0.0.1:8080`, and a
- * Backend outage proper already pages in ~10 min via `backend-healthcheck`.
- * So every failure — timeout, network error, any non-2xx, a malformed body —
- * now THROWS to the shared page, and no metric is emitted on any branch.
+ * when it cannot reach `127.0.0.1:8080`, and a Backend outage proper already
+ * pages in ~10 min via `backend-healthcheck`. So every failure — timeout,
+ * network error, any non-2xx, a malformed body — now THROWS to the shared
+ * page, and no metric is emitted on any branch.
+ *
+ * ONE CONSEQUENCE WORTH KNOWING, because it recovers part of what the second
+ * lane gave up. `RECENT_ENTRIES_TIMEOUT_MS` is a whole-request abort, and the
+ * vhost sets `proxy_read_timeout 10s`. A Backend that is DOWN refuses the
+ * connection, nginx answers `502` immediately, and only the shared page fires.
+ * A Backend that is HUNG accepts and stops answering, so nginx holds the
+ * request and the probe burns its full budget — the tick then emits both a
+ * failure AND `CheckLatency: 10000`, tripping `wxyc-canary-recent-entries-latency`
+ * after two of three. Two alarms for one incident, but the PAIRING is the
+ * diagnostic: both together means hung, the shared page alone means down. Do
+ * not "fix" the double-page by lowering the timeout — the 10 s is Android's
+ * OkHttp per-socket read budget, and shrinking it would stop measuring the
+ * thing the clients actually experience.
  *
  * DO NOT REINSTATE THE QUIET LANE for a 503 seen in the wild here. It only
  * ever made sense because a *different operator's* box sat in front of ours;

@@ -1791,6 +1791,11 @@ describe('runCanary — wxyc-info-recent-entries check (vhost measurement, wxyc-
       status: 502,
       body: '<html><head><title>502 Bad Gateway</title></head></html>',
     },
+    // A contract case, not an expected observation: the vhost's
+    // `proxy_read_timeout` and the probe's budget are both 10 s, but the
+    // probe's clock starts before connect, so in practice it aborts first and
+    // a hung Backend surfaces as a CanaryFetchError. Pinned anyway — nginx
+    // does emit this, and a shorter upstream timeout would make it routine.
     {
       label: 'a 504 (upstream timed out)',
       status: 504,
@@ -1942,16 +1947,23 @@ describe('runCanary — wxyc-info-recent-entries check (vhost measurement, wxyc-
     await handler().catch(() => undefined);
     const names = new Set(getPublishedMetrics().map((d) => d.MetricName));
 
+    // Anchor the run's outcome FIRST. `CheckLatency` and `CheckSkipped` are
+    // published identically for pass, fail and skipped, and the deleted metric
+    // is absent from `src/` outright — so without this the other two assertions
+    // hold even if the stub broke and the check started failing, and the test
+    // would not be testing the green run in its name.
+    const dimensionedFor = (name: string) =>
+      getPublishedMetrics().filter(
+        (d) =>
+          d.MetricName === name &&
+          (d.Dimensions ?? []).some((dim) => dim.Name === 'Check' && dim.Value === 'wxyc-info-recent-entries')
+      );
+    expect(dimensionedFor('CheckFailure')[0]?.Value).toBe(0);
+
     expect(names.has('RecentEntriesUpstreamUnavailable')).toBe(false);
     // The latency series the surviving alarm reads is still published,
     // dimensioned by check name — deleting the metric must not take it out.
-    expect(
-      getPublishedMetrics().some(
-        (d) =>
-          d.MetricName === 'CheckLatency' &&
-          (d.Dimensions ?? []).some((dim) => dim.Name === 'Check' && dim.Value === 'wxyc-info-recent-entries')
-      )
-    ).toBe(true);
+    expect(dimensionedFor('CheckLatency')).toHaveLength(1);
 
     delete process.env.CANARY_BACKEND_URL;
     delete process.env.CANARY_AUTH_URL;

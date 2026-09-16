@@ -830,11 +830,16 @@ Resources:
       AlarmDescription: >
         http://wxyc.info/playlists/recentEntries has been answering slower than
         half of Android's 10 s OkHttp deadline for 2 of 3 consecutive 5-minute
-        checks. Listeners are not necessarily seeing errors yet; Android polls
-        are one bad hop from timing out. Since the 2026-09-16 DNS flip this
-        route is served by the `server_name wxyc.info` nginx block on the
-        Backend EC2 host, so look at Backend and at that host — there is no
-        longer a Kattare hop to blame.
+        checks. Alone, that is early warning: listeners are not necessarily
+        seeing errors yet, but Android polls are one bad hop from timing out.
+        FIRING ALONGSIDE wxyc-canary-check-failure it means something different
+        — Backend is hung rather than down, since nginx holds the request
+        against its 10 s proxy_read_timeout while the probe burns its whole 10 s
+        budget, so the tick reports a failure AND a 10,000 ms latency. A Backend
+        that is down gives a fast 502 and the check-failure page alone. Since
+        the 2026-09-16 DNS flip this route is served by the `server_name
+        wxyc.info` nginx block on the Backend EC2 host, so look at Backend and
+        at that host — there is no longer a Kattare hop to blame.
       Namespace: WXYC/Canary
       MetricName: CheckLatency
       Dimensions:
