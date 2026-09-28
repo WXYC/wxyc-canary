@@ -86,10 +86,14 @@ export type Check = {
  *     dashboards) and once dimensionless (so a plain-form alarm can target
  *     it without a `SUM(SEARCH(...))` expression CloudWatch rejects) — the
  *     convention pinned in CLAUDE.md and wxyc-canary#13. Use this when the
- *     dimensioned copy has dashboard value beyond what an alarm needs.
+ *     dimensioned copy has dashboard value beyond what an alarm needs. This
+ *     repo has no CloudWatch dashboards today, so no current metric actually
+ *     uses this shape — it stays documented as the default for the metric
+ *     that eventually needs a real dimensioned reader, but reach for
+ *     dimensionless-only below unless you can name that reader.
  *   - **dimensionless-only** for a metric whose ONLY CloudWatch consumer is
- *     a dedicated alarm reading the dimensionless series (e.g.
- *     `DiscogsBreakerShedding`, `DiscogsLiveRequestsTotal`, `LookupDegraded`)
+ *     a dedicated alarm reading the dimensionless series (`DiscogsBreakerShedding`,
+ *     `DiscogsLiveRequestsTotal`, `LookupDegraded`, `EnrichmentLagSeconds`)
  *     — the dimensioned copy would be cardinality with no reader.
  *   - **not published to CloudWatch at all** for a metric that's
  *     dashboard-trend-only with no alarm of any shape (e.g.

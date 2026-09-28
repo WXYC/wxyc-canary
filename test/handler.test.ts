@@ -3064,6 +3064,79 @@ describe('publishMetrics — CloudWatch cardinality contract', () => {
 });
 
 /**
+ * wxyc-canary#78: since `CheckLatency` no longer reaches CloudWatch for
+ * every check but `wxyc-info-recent-entries`, the logged outcome JSON (one
+ * `console.log(JSON.stringify({ outcomes, ... }))` line per invocation, in
+ * `src/handler.ts`) is the only place most checks' latency survives —
+ * README's "Reading latency trends from logs" section queries it via a
+ * CloudWatch Logs Insights regex anchored on a literal check name:
+ * `parse @message /"name":"dj-library-search","status":"(?<status>[^"]+)","latencyMs":(?<latencyMs>\d+)/`.
+ * That regex depends on each outcome object serializing its keys in
+ * exactly this order — `name`, then `status`, then `latencyMs`, adjacent
+ * with no field in between. This test pins that order directly against a
+ * multi-check `console.log` payload (the `outcomes` array packs every
+ * check's triple into one line, which is what breaks a glob-style `parse`
+ * that binds to the first occurrence regardless of which check is filtered
+ * for afterward — the regex form doesn't have that problem because it
+ * anchors on the literal name).
+ */
+describe('logged outcome JSON — field order the Logs Insights query depends on', () => {
+  const LOGS_INSIGHTS_QUERY_REGEX = /"name":"dj-library-search","status":"([^"]+)","latencyMs":(\d+)/;
+
+  beforeEach(() => {
+    process.env.CANARY_BACKEND_URL = 'https://api.example.test';
+    process.env.CANARY_AUTH_URL = 'https://auth.example.test';
+    process.env.CANARY_SEMANTIC_INDEX_URL = 'https://explore.example.test';
+    process.env.CANARY_PUBLISH_METRICS = 'false';
+    process.env.CANARY_DJ_EMAIL = 'canary@wxyc.org';
+    process.env.CANARY_DJ_PASSWORD = 'pw';
+    delete process.env.CANARY_DJ_SECRET_ARN;
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    delete process.env.CANARY_BACKEND_URL;
+    delete process.env.CANARY_AUTH_URL;
+    delete process.env.CANARY_SEMANTIC_INDEX_URL;
+    delete process.env.CANARY_PUBLISH_METRICS;
+    delete process.env.CANARY_DJ_EMAIL;
+    delete process.env.CANARY_DJ_PASSWORD;
+  });
+
+  it('serializes name, status, latencyMs adjacent and in that order, matching the README query regex', async () => {
+    const consoleLogSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    try {
+      setUpFetchMock({
+        ...RECENT_ENTRIES_STUB,
+        '/healthcheck': { status: 200, body: { ok: true } },
+        '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+        '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
+        '/sign-in/email': { status: 200, body: { token: 'fake-session-token', user: { id: 'u1' } } },
+        '/token': { status: 200, body: { token: 'fake-jwt' } },
+        '/library/?artist_name=': { status: 200, body: stereolabSearchResults },
+        '/flowsheet': { status: 200, body: [] },
+        '/library/rotation': { status: 200, body: [] },
+        '/oauth2/authorize': AUTHORIZE_ECHO_STATE_STUB,
+      });
+
+      await handler().catch(() => undefined);
+
+      const loggedLine = consoleLogSpy.mock.calls
+        .map(([arg]) => String(arg))
+        .find((line) => line.includes('"outcomes"'));
+      expect(loggedLine, 'expected a console.log line containing the outcomes JSON').toBeDefined();
+
+      const match = loggedLine!.match(LOGS_INSIGHTS_QUERY_REGEX);
+      expect(match, `README query regex did not match the actual logged line: ${loggedLine}`).not.toBeNull();
+      expect(match![1]).toBe('pass');
+      expect(match![2]).toMatch(/^\d+$/);
+    } finally {
+      consoleLogSpy.mockRestore();
+    }
+  });
+});
+
+/**
  * Tier split (wxyc-canary#48). The `wxyc-canary-check-failure` page reads
  * the `UserFacingCheckFailure` aggregate; `wxyc-canary-infra-degraded`
  * reads `InfraCheckFailure`. Both are dimensionless-only (per-surface
@@ -3577,6 +3650,15 @@ describe('template.yaml ↔ publishMetrics contract', () => {
   // flagged `latencyAlarmed: true` with no matching alarm, or an alarm
   // naming a check that isn't flagged, both fail. Mirrors the `pagesOncall`
   // classification-pin test in `test/checks.test.ts`.
+  //
+  // Only parses the SIMPLE alarm form (`Properties.MetricName` +
+  // `Properties.Dimensions` directly under the resource) — unlike
+  // `extractMetricSources` above (used by the broader `publishMetrics`
+  // contract test), it does not also read the metric-math `Metrics:` array
+  // shape `wxyc-canary-lml-discogs-breaker-shed` introduced (wxyc-canary#84).
+  // A future `CheckLatency` alarm expressed in that shape would silently
+  // fall out of `targetedCheckNames` below rather than failing loudly. No
+  // such alarm exists today, so this is a known gap, not a live bug.
   it('latencyAlarmed — every CheckLatency alarm target is flagged, and only those checks are flagged', () => {
     const templatePath = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'template.yaml');
     const text = readFileSync(templatePath, 'utf-8');
@@ -4110,7 +4192,7 @@ describe('enrichment-quality write canary', () => {
     expect(enrichment.metrics?.EnrichmentLagSeconds).toBeGreaterThanOrEqual(0.07);
   });
 
-  it('publishMetrics emits EnrichmentLagSeconds dimensioned + dimensionless on pass', async () => {
+  it('publishMetrics emits EnrichmentLagSeconds dimensionless-only on pass (wxyc-canary#78: no dashboard reads the dimensioned copy)', async () => {
     cloudWatchSendMock.mockClear();
     process.env.CANARY_BACKEND_URL = 'https://api.example.test';
     process.env.CANARY_AUTH_URL = 'https://auth.example.test';
@@ -4131,14 +4213,15 @@ describe('enrichment-quality write canary', () => {
       const dimensionless = lagMetrics.filter((d) => !d.Dimensions || d.Dimensions.length === 0);
 
       // The dimensionless emit is what `wxyc-canary-enrichment-lag`
-      // targets. A regression that emitted only the dimensioned variant
-      // would leave the alarm at INSUFFICIENT_DATA forever (the
-      // wxyc-canary#13 lesson, generalized).
-      expect(dimensioned).toHaveLength(1);
+      // targets. A regression that stopped emitting it would leave the
+      // alarm at INSUFFICIENT_DATA forever (the wxyc-canary#13 lesson,
+      // generalized). No dashboard reads the dimensioned copy, so it's
+      // dropped entirely (wxyc-canary#78) — a regression that started
+      // emitting it again would be silent cardinality cost, not a
+      // functional bug, but this still pins the shape.
+      expect(dimensioned).toHaveLength(0);
       expect(dimensionless).toHaveLength(1);
-      expect(dimensioned[0]!.Dimensions![0]!).toEqual({ Name: 'Check', Value: 'enrichment-quality' });
-      expect(dimensioned[0]!.Value).toBe(dimensionless[0]!.Value);
-      expect(dimensioned[0]!.Value).toBeGreaterThanOrEqual(0);
+      expect(dimensionless[0]!.Value).toBeGreaterThanOrEqual(0);
     } finally {
       delete process.env.CANARY_BACKEND_URL;
       delete process.env.CANARY_AUTH_URL;
