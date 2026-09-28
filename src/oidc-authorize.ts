@@ -272,9 +272,12 @@ export const oidcAuthorize: Check = {
       // message; the `[label]` prefixes on each failure preserve routing.
       throw new Error(failures.join(' | '));
     }
-    // Success: don't publish `EnrichmentLagSeconds`-style metrics — this
-    // check's cost signal is `CheckLatency` (already emitted per-check by
-    // the runner), and there's no domain-meaningful duration to surface.
+    // Success: don't publish `EnrichmentLagSeconds`-style metrics — there's
+    // no domain-meaningful duration to surface beyond the runner's own
+    // per-tick latency measurement, and that measurement isn't published to
+    // CloudWatch for this check (no alarm reads `CheckLatency` for
+    // `oidc-authorize`; wxyc-canary#78 cardinality trim). It's still visible
+    // in the handler's logged outcome JSON for ad-hoc inspection.
   },
 };
 

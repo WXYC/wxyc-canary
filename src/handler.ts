@@ -20,6 +20,43 @@ const DEFAULT_ENRICHMENT_POLL_INTERVAL_MS = 2_000;
  */
 const pagesOncallByName = new Map<string, boolean>(checks.map((c) => [c.name, c.pagesOncall !== false]));
 
+/**
+ * Check names whose `CheckLatency` `publishMetrics` actually sends to
+ * CloudWatch. Resolved from the same single source of truth as
+ * `pagesOncallByName` (the `Check.latencyAlarmed` flag, see its docstring in
+ * types.ts) rather than hardcoded here, so a check gains or loses the
+ * publish by editing its own definition in `checks.ts`. Every other check's
+ * latency stays in the logged outcome JSON but is not metric-month cost
+ * (wxyc-canary#78 cardinality trim). Cross-referenced against
+ * `template.yaml`'s alarms by the `latencyAlarmed` test in
+ * `test/handler.test.ts`.
+ */
+const latencyAlarmedByName = new Set<string>(checks.filter((c) => c.latencyAlarmed === true).map((c) => c.name));
+
+/**
+ * Custom check metrics (`outcome.metrics`) whose ONLY CloudWatch consumer is
+ * a dedicated alarm reading the dimensionless series — the dimensioned
+ * `Check=<name>` copy has no reader (wxyc-canary#78 cardinality trim).
+ * `DiscogsBreakerShedding` + `DiscogsLiveRequestsTotal` feed
+ * `wxyc-canary-lml-discogs-breaker-shed`'s metric-math expression;
+ * `LookupDegraded` feeds `wxyc-canary-lml-enrichment-degraded`. A metric NOT
+ * in this set still follows the default emit-twice convention (e.g.
+ * `EnrichmentLagSeconds`, whose dimensioned copy has independent dashboard
+ * value).
+ */
+const DIMENSIONLESS_ONLY_METRICS = new Set(['DiscogsBreakerShedding', 'DiscogsLiveRequestsTotal', 'LookupDegraded']);
+
+/**
+ * Custom check metrics that are dashboard-trend-only with no CloudWatch
+ * alarm of any shape — publishing them (dimensioned or dimensionless) is
+ * pure metric-month cost with no reader. `GraphDbAgeSeconds`
+ * (semantic-index-freshness) is the only one today; its alarm-facing signal
+ * is the `InfraCheckFailure` aggregate, not this metric. Still included in
+ * the logged outcome JSON (`o.metrics`) for ad-hoc inspection — only the
+ * CloudWatch publish is skipped.
+ */
+const METRICS_NOT_PUBLISHED = new Set(['GraphDbAgeSeconds']);
+
 function loadConfigFromEnv(): CanaryConfig {
   const required = (key: string): string => {
     const v = process.env[key];
@@ -388,19 +425,36 @@ function unitForMetric(metricName: string): StandardUnit {
 }
 
 /**
- * Publish per-check failure, skip, latency, and any custom metrics in one
- * PutMetricData call. `CheckFailure` is emitted twice (dimensioned +
- * dimensionless) per the wxyc-canary#13 convention; the dimensionless
- * `CheckFailure` is now a dashboard rollup (no alarm reads it after the
- * wxyc-canary#48 tier split). Each outcome ALSO emits exactly one tier
- * aggregate — `UserFacingCheckFailure` (the `wxyc-canary-check-failure`
- * page) or `InfraCheckFailure` (the low-urgency `wxyc-canary-infra-degraded`
- * alarm) — routed by `pagesOncallByName`. Custom check metrics
- * (`outcome.metrics`) follow the same emit-twice pattern: once with the
- * `Check` dimension and once dimensionless, so a plain-form alarm can target
- * the dimensionless series without a SUM(SEARCH(...)) expression. Failures
- * stay non-fatal so the Lambda still exits on the outcome list, not on a
- * CloudWatch hiccup.
+ * Publish per-check failure and any custom metrics in one PutMetricData
+ * call, at the cardinality the wxyc-canary#78 trim settled on:
+ *
+ *   - `CheckFailure` is dimensioned-only (`Check=<name>`) — the runbook
+ *     drill-down. The dimensionless companion this used to carry lost its
+ *     only reader at the wxyc-canary#48 tier split (the page reads
+ *     `UserFacingCheckFailure` instead) and was dropped.
+ *   - `CheckSkipped` is not published at all — dashboard-only data with no
+ *     alarm ever reading it.
+ *   - `CheckLatency` publishes ONLY for checks in `latencyAlarmedByName`
+ *     (today: `wxyc-info-recent-entries`, the one check an alarm actually
+ *     reads). Every other check's latency is still in the logged outcome
+ *     JSON (see the handler's `console.log` below), just not in CloudWatch.
+ *   - Each outcome ALSO emits exactly one tier aggregate —
+ *     `UserFacingCheckFailure` (the `wxyc-canary-check-failure` page) or
+ *     `InfraCheckFailure` (the low-urgency `wxyc-canary-infra-degraded`
+ *     alarm) — routed by `pagesOncallByName`. Dimensionless-only by design;
+ *     per-surface drill-down is already served by the dimensioned
+ *     `CheckFailure` above.
+ *   - Custom check metrics (`outcome.metrics`) follow one of three shapes —
+ *     see `DIMENSIONLESS_ONLY_METRICS` / `METRICS_NOT_PUBLISHED` docstrings
+ *     and the `CheckResult.metrics` docstring in types.ts for the full
+ *     rationale: emit-twice by default (dimensioned + dimensionless, so a
+ *     plain-form alarm can target the dimensionless series without a
+ *     `SUM(SEARCH(...))` expression CloudWatch rejects), dimensionless-only
+ *     when only a dedicated alarm on the dimensionless series reads it, or
+ *     not published to CloudWatch at all when nothing does.
+ *
+ * Failures stay non-fatal so the Lambda still exits on the outcome list,
+ * not on a CloudWatch hiccup.
  */
 async function publishMetrics(outcomes: CheckOutcome[], region: string): Promise<void> {
   const client = new CloudWatchClient({ region });
@@ -415,37 +469,22 @@ async function publishMetrics(outcomes: CheckOutcome[], region: string): Promise
         Timestamp: timestamp,
         Dimensions: [{ Name: 'Check', Value: o.name }],
       },
-      {
-        MetricName: 'CheckFailure',
-        Value: failureValue,
-        Unit: StandardUnit.Count,
-        Timestamp: timestamp,
-        Dimensions: [],
-      },
-      {
-        MetricName: 'CheckSkipped',
-        Value: o.status === 'skipped' ? 1 : 0,
-        Unit: StandardUnit.Count,
-        Timestamp: timestamp,
-        Dimensions: [{ Name: 'Check', Value: o.name }],
-      },
-      {
+    ];
+    if (latencyAlarmedByName.has(o.name)) {
+      base.push({
         MetricName: 'CheckLatency',
         Value: o.latencyMs,
         Unit: StandardUnit.Milliseconds,
         Timestamp: timestamp,
         Dimensions: [{ Name: 'Check', Value: o.name }],
-      },
-    ];
+      });
+    }
     // Tier-split aggregate (wxyc-canary#48): route this outcome's failure
     // value into exactly one of two dimensionless series. `UserFacingCheckFailure`
     // backs the `wxyc-canary-check-failure` page; `InfraCheckFailure` backs the
     // low-urgency `wxyc-canary-infra-degraded` alarm. An unknown name pages
-    // (fail-safe). These are dimensionless-only on purpose — per-surface
-    // drill-down is already served by the dimensioned `CheckFailure` above, so
-    // a `Tier` dimension or a second dimensioned emission would add cost for no
-    // benefit. `failureValue` (skipped/pass → 0) preserves skip-semantics on
-    // both tiers.
+    // (fail-safe). `failureValue` (skipped/pass → 0) preserves skip-semantics
+    // on both tiers.
     const userFacing = pagesOncallByName.get(o.name) ?? true;
     base.push({
       MetricName: userFacing ? 'UserFacingCheckFailure' : 'InfraCheckFailure',
@@ -456,23 +495,24 @@ async function publishMetrics(outcomes: CheckOutcome[], region: string): Promise
     });
     if (o.metrics) {
       for (const [name, value] of Object.entries(o.metrics)) {
+        if (METRICS_NOT_PUBLISHED.has(name)) continue;
         const unit = unitForMetric(name);
-        base.push(
-          {
+        base.push({
+          MetricName: name,
+          Value: value,
+          Unit: unit,
+          Timestamp: timestamp,
+          Dimensions: [],
+        });
+        if (!DIMENSIONLESS_ONLY_METRICS.has(name)) {
+          base.push({
             MetricName: name,
             Value: value,
             Unit: unit,
             Timestamp: timestamp,
             Dimensions: [{ Name: 'Check', Value: o.name }],
-          },
-          {
-            MetricName: name,
-            Value: value,
-            Unit: unit,
-            Timestamp: timestamp,
-            Dimensions: [],
-          }
-        );
+          });
+        }
       }
     }
     return base;
