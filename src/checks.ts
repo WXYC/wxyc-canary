@@ -472,8 +472,11 @@ const djFlowsheetRead: Check = {
  * DJ-authenticated: the rotation dropdown query. Currently this returns a
  * count that omits the 147 active NULL-album_id rows due to the INNER JOIN
  * bug filed as #689. The canary doesn't assert a specific count (that
- * would lock in the bug) but does catch when rotation goes empty entirely
- * or the endpoint 5xx's.
+ * would lock in the bug), but a fully empty rotation IS a fail — dj-site's
+ * rotation dropdown would render nothing for every DJ, and
+ * `dj-rotation-picker` below depends on this check being the thing that
+ * alarms on that shape (it degrades to `skipped` rather than duplicating
+ * the alert).
  */
 const djRotation: Check = {
   name: 'dj-rotation',
@@ -488,34 +491,50 @@ const djRotation: Check = {
     if (!Array.isArray(r.body)) {
       throw new Error(`expected array body, got ${typeof r.body}: ${r.rawText.slice(0, 200)}`);
     }
+    if (r.body.length === 0) {
+      throw new Error('rotation is empty — dj-site rotation dropdown would show nothing');
+    }
   },
 };
 
 /**
  * DJ-authenticated: the dj-site rotation picker. On selecting a rotation
- * row in the flowsheet entry UI, dj-site calls `GET /library/rotation/{id}/tracks`
- * to populate a track dropdown. The endpoint was the user-visible failure
- * surface of BS#994 / BS#1030: when LML was under cascade load, individual
- * release-id lookups timed out, the controller short-circuited to 502, and
- * on-air DJs saw "Loading tracks..." that never resolved. BS#1029 made 21%
- * of active rotation rows JOIN-resolvable (no LML call needed), but the
- * remaining ~79% still depend on the runtime cascade — so this probe both
- * pins the JOIN path stays healthy and acts as a leading indicator for the
+ * row in the flowsheet entry UI, dj-site calls
+ * `GET /library/rotation/{rotation_id}/tracks` to populate a track
+ * dropdown. The endpoint was the user-visible failure surface of BS#994 /
+ * BS#1030: when LML was under cascade load, individual release-id lookups
+ * timed out, the controller short-circuited to 502, and on-air DJs saw
+ * "Loading tracks..." that never resolved. BS#1029 made 21% of active
+ * rotation rows JOIN-resolvable (no LML call needed), but the remaining
+ * ~79% still depend on the runtime cascade — so this probe both pins the
+ * JOIN path stays healthy and acts as a leading indicator for the
  * cascade-class regression that surfaced today via on-air Slack messages
  * rather than any monitor.
+ *
+ * The probe key is `rotation_id` (the rotation row's own PK, BS
+ * `library.service.ts` `getRotationFromDB`'s `rotation.id AS rotation_id`),
+ * NOT `id` (`library.id`, LEFT JOINed and null for any rotation row that
+ * isn't catalog-linked — 127 of 128 active prod rows as of this fix). The
+ * tracks route is also `/library/rotation/{rotation_id}/tracks`
+ * (`library.route.ts`), so picking `id` both skipped almost every tick
+ * (`id` is usually null) and, on the rare numeric-`id` row, probed the
+ * wrong id — the controller returns a benign 200 `[]` for a nonexistent
+ * rotation id, so that shape would have been a false pass even when it ran.
  *
  * Self-healing target: rather than hardcode a rotation id (which would
  * break when that row gets killed), the probe discovers a candidate from
  * the rotation list itself. Any 2xx + array response is a pass — the body
  * is allowed to be empty because a real release may have zero indexed
- * tracks (e.g., never cross-referenced with Discogs). The 8 s per-fetch
- * timeout in `canaryFetch` is the regression signal: BS#994's cascade was
- * a 30 s timeout chain → 502, so anything that gets within shouting
- * distance of the budget produces a `fail`.
+ * tracks (e.g., never cross-referenced with Discogs) — confirmed against
+ * `resolveRotationPickerSource`, which legitimately returns `[]` when a
+ * linked release has no cached tracklist. The 8 s per-fetch timeout in
+ * `canaryFetch` is the regression signal: BS#994's cascade was a 30 s
+ * timeout chain → 502, so anything that gets within shouting distance of
+ * the budget produces a `fail`.
  */
 const djRotationPicker: Check = {
   name: 'dj-rotation-picker',
-  description: 'GET /library/rotation/{id}/tracks as DJ — catches BS#994 / BS#1030 cascade-to-502 class',
+  description: 'GET /library/rotation/{rotation_id}/tracks as DJ — catches BS#994 / BS#1030 cascade-to-502 class',
   requiresAuth: true,
   run: async (ctx): Promise<CheckResult | void> => {
     const auth = assertDjAuthed(ctx);
@@ -528,14 +547,20 @@ const djRotationPicker: Check = {
     if (!Array.isArray(list.body)) {
       throw new Error(`rotation list precondition: expected array body, got ${typeof list.body}`);
     }
-    const first = list.body[0] as { id?: number } | undefined;
-    if (!first || typeof first.id !== 'number') {
-      // The dj-rotation check already alerts on an empty rotation; this probe
-      // intentionally degrades to skipped so the picker signal doesn't
-      // duplicate that one. With rotation empty there's nothing to probe.
-      return { skipped: true, skipReason: 'rotation list is empty — no probe target available' };
+    const rows = list.body as { rotation_id?: number }[];
+    const first = rows.find((row) => typeof row.rotation_id === 'number');
+    if (!first) {
+      // The dj-rotation check above now alarms on a fully empty rotation;
+      // this probe intentionally degrades to skipped so the picker signal
+      // doesn't duplicate that one. A non-empty rotation with no numeric
+      // rotation_id on any row shouldn't happen in practice (it's the
+      // table's own PK), but is handled the same way defensively.
+      return {
+        skipped: true,
+        skipReason: 'rotation list has no row with a numeric rotation_id — no probe target available',
+      };
     }
-    const tracks = await canaryFetch(`${ctx.backendUrl}/library/rotation/${first.id}/tracks`, {
+    const tracks = await canaryFetch(`${ctx.backendUrl}/library/rotation/${first.rotation_id}/tracks`, {
       headers: { Authorization: `Bearer ${auth.jwt}` },
     });
     if (!tracks.ok) {

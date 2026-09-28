@@ -439,7 +439,11 @@ describe('runCanary — failure surfaces (regression coverage for the 2026-04-30
       '/library/?artist_name=': { status: 200, body: stereolabSearchResults },
       '/flowsheet': { status: 200, body: [] },
       '/library/rotation/21522/tracks': { status: 502, body: { message: 'lookupReleaseId: LML cascade timed out' } },
-      '/library/rotation': { status: 200, body: [{ id: 21522 }] },
+      // Realistic shape (BS `library.service.ts` rotation query): `id` is
+      // `library.id` via a LEFT JOIN and is null for the ~99.7% of active
+      // rows that aren't catalog-linked; `rotation_id` (the rotation row's
+      // own PK) is always present. The picker must key off `rotation_id`.
+      '/library/rotation': { status: 200, body: [{ id: null, rotation_id: 21522 }] },
       '/oauth2/authorize': AUTHORIZE_ECHO_STATE_STUB,
     });
 
@@ -450,8 +454,8 @@ describe('runCanary — failure surfaces (regression coverage for the 2026-04-30
     expect(picker.message).toMatch(/502/);
   });
 
-  it('passes the picker probe when the rotation list yields an id and /tracks returns an array', async () => {
-    setUpFetchMock({
+  it('picks the first row with a numeric rotation_id (not the LEFT-JOINed library id) and probes its /tracks URL', async () => {
+    const fetchMock = setUpFetchMock({
       ...RECENT_ENTRIES_STUB,
       '/healthcheck': { status: 200, body: { ok: true } },
       '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
@@ -460,8 +464,11 @@ describe('runCanary — failure surfaces (regression coverage for the 2026-04-30
       '/token': { status: 200, body: { token: 'fake-jwt' } },
       '/library/?artist_name=': { status: 200, body: stereolabSearchResults },
       '/flowsheet': { status: 200, body: [] },
-      '/library/rotation/4242/tracks': { status: 200, body: [{ id: 1, title: 'la paradoja' }] },
-      '/library/rotation': { status: 200, body: [{ id: 4242 }] },
+      '/library/rotation/43244/tracks': { status: 200, body: [{ id: 1, title: 'la paradoja' }] },
+      // `id: null` mirrors the unlinked-row shape that is 127 of 128 active
+      // prod rows — the bug this test pins is picking `rotation_id`, not
+      // the nullable `id`, as the probe target.
+      '/library/rotation': { status: 200, body: [{ id: null, rotation_id: 43244 }] },
       '/oauth2/authorize': AUTHORIZE_ECHO_STATE_STUB,
     });
 
@@ -469,6 +476,10 @@ describe('runCanary — failure surfaces (regression coverage for the 2026-04-30
     const picker = outcomes.find((o) => o.name === 'dj-rotation-picker')!;
 
     expect(picker.status).toBe('pass');
+    const trackFetches = fetchMock.mock.calls
+      .map(([url]) => String(url))
+      .filter((url) => url.includes('/library/rotation/') && url.includes('/tracks'));
+    expect(trackFetches).toEqual([expect.stringContaining('/library/rotation/43244/tracks')]);
   });
 
   it('skips the picker probe when the rotation list is empty (cannot synthesize a probe target)', async () => {
@@ -490,6 +501,52 @@ describe('runCanary — failure surfaces (regression coverage for the 2026-04-30
 
     expect(picker.status).toBe('skipped');
     expect(picker.message).toMatch(/rotation/i);
+  });
+
+  it('skips the picker probe when no rotation row has a numeric rotation_id (defensive — should not happen in practice)', async () => {
+    setUpFetchMock({
+      ...RECENT_ENTRIES_STUB,
+      '/healthcheck': { status: 200, body: { ok: true } },
+      '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+      '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
+      '/sign-in/email': { status: 200, body: { token: 'fake-session-token', user: { id: 'u1' } } },
+      '/token': { status: 200, body: { token: 'fake-jwt' } },
+      '/library/?artist_name=': { status: 200, body: stereolabSearchResults },
+      '/flowsheet': { status: 200, body: [] },
+      '/library/rotation': { status: 200, body: [{ id: null, rotation_id: null }] },
+      '/oauth2/authorize': AUTHORIZE_ECHO_STATE_STUB,
+    });
+
+    const outcomes = await runCanary({ ...baseConfig, djEmail: 'canary@wxyc.org', djPassword: 'pw' });
+    const picker = outcomes.find((o) => o.name === 'dj-rotation-picker')!;
+
+    expect(picker.status).toBe('skipped');
+    expect(picker.message).toMatch(/rotation_id/i);
+  });
+
+  // dj-rotation used to only check 2xx + array, so a fully empty rotation
+  // silently passed — the exact prod shape the picker's skip-on-empty
+  // comment above wrongly assumed dj-rotation already alarmed on. This
+  // pins the fix: an empty rotation now fails dj-rotation.
+  it('fails dj-rotation on a fully empty rotation array', async () => {
+    setUpFetchMock({
+      ...RECENT_ENTRIES_STUB,
+      '/healthcheck': { status: 200, body: { ok: true } },
+      '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+      '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
+      '/sign-in/email': { status: 200, body: { token: 'fake-session-token', user: { id: 'u1' } } },
+      '/token': { status: 200, body: { token: 'fake-jwt' } },
+      '/library/?artist_name=': { status: 200, body: stereolabSearchResults },
+      '/flowsheet': { status: 200, body: [] },
+      '/library/rotation': { status: 200, body: [] },
+      '/oauth2/authorize': AUTHORIZE_ECHO_STATE_STUB,
+    });
+
+    const outcomes = await runCanary({ ...baseConfig, djEmail: 'canary@wxyc.org', djPassword: 'pw' });
+    const rotation = outcomes.find((o) => o.name === 'dj-rotation')!;
+
+    expect(rotation.status).toBe('fail');
+    expect(rotation.message).toMatch(/empty/i);
   });
 
   it('does not short-circuit other checks when one fails', async () => {
@@ -2544,7 +2601,7 @@ describe('runCanary — sign-in 429 retry carve-out', () => {
       '/token': [{ status: 200, body: { token: 'fake-jwt' } }],
       '/library/?artist_name=': [{ status: 200, body: stereolabSearchResults }],
       '/flowsheet': [{ status: 200, body: [] }],
-      '/library/rotation': [{ status: 200, body: [] }],
+      '/library/rotation': [{ status: 200, body: [{ id: null, rotation_id: 90201 }] }],
     });
 
     const promise = runCanary({ ...baseConfig, djEmail: 'canary@wxyc.org', djPassword: 'pw' });
@@ -3068,7 +3125,7 @@ describe('publishMetrics — tier split (UserFacingCheckFailure / InfraCheckFail
         '/library/?artist_name=': { status: 200, body: stereolabSearchResults },
         '/flowsheet': { status: 200, body: [] },
         '/library/rotation/4242/tracks': { status: 502, body: { message: 'LML cascade timed out' } },
-        '/library/rotation': { status: 200, body: [{ id: 4242 }] },
+        '/library/rotation': { status: 200, body: [{ id: null, rotation_id: 4242 }] },
       } as Record<string, StubEntry>,
     },
   ])('pages when only $name fails (untagged but user-facing)', async ({ name, mocks }) => {
@@ -3516,7 +3573,21 @@ function setUpEnrichmentHappyPathMock(): ReturnType<typeof setUpMethodAwareMock>
       responses: [{ status: 200, body: { results: [{ id: 1, canonical_name: 'stereolab' }] } }],
     },
     { method: 'GET', pattern: '/library/?artist_name=', responses: [{ status: 200, body: stereolabSearchResults }] },
-    { method: 'GET', pattern: '/library/rotation', responses: [{ status: 200, body: [] }] },
+    // dj-rotation now fails on an empty rotation, so the happy path needs a
+    // real row for both dj-rotation and dj-rotation-picker to pass. `id:
+    // null` mirrors the unlinked-row shape most active prod rows have; the
+    // specific `/tracks` route must come first since matching is by
+    // substring and `/library/rotation` alone would shadow it.
+    {
+      method: 'GET',
+      pattern: '/library/rotation/90201/tracks',
+      responses: [{ status: 200, body: [] }],
+    },
+    {
+      method: 'GET',
+      pattern: '/library/rotation',
+      responses: [{ status: 200, body: [{ id: null, rotation_id: 90201 }] }],
+    },
     // Sign-in (POST) + token exchange (GET).
     {
       method: 'POST',
