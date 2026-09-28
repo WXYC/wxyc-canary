@@ -4,6 +4,7 @@ import { dirname, resolve } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import YAML from 'yaml';
 import { handler, runCanary } from '../src/handler.js';
+import { checks } from '../src/checks.js';
 import type { CanaryConfig, CheckOutcome } from '../src/types.js';
 
 // Module-mock hoisting: vi.mock is hoisted above imports, so the mock factory
@@ -2869,18 +2870,19 @@ function getPublishedMetrics(): MetricDatum[] {
 }
 
 /**
- * `CheckFailure` is published twice: once with the `Check` dimension (for
- * dashboards / slicing) and once dimensionless. CloudWatch alarms cannot use
- * `SUM(SEARCH(...))` (issue #13), so emit-twice is how a plain-form alarm
- * reads a metric we also publish dimensioned. Post-#48 the dimensionless
- * `CheckFailure` is a dashboard-only rollup — no alarm reads it; the page
- * reads the `UserFacingCheckFailure` aggregate (covered by the
- * `publishMetrics — tier split` block below). These regressions pin both
- * `CheckFailure` emissions, the failure-case value flow, and the
- * dimensioned-only contract for `CheckSkipped` / `CheckLatency` (alarming on
- * those would be noise).
+ * `CheckFailure` is published dimensioned-only (once per check, with the
+ * `Check` dimension) — the runbook drill-down (README "Alarm fires:
+ * wxyc-canary-check-failure"). Post-#48 the page reads the dimensionless
+ * `UserFacingCheckFailure` aggregate instead (covered by the `publishMetrics
+ * — tier split` block below), so a dimensionless `CheckFailure` companion
+ * had no alarm reader left — dropped in the wxyc-canary#78 cardinality trim.
+ * `CheckSkipped` is dropped entirely (dashboard-only, never alarmed, never
+ * consumed). `CheckLatency` publishes ONLY for the one check an alarm
+ * actually reads (`wxyc-info-recent-entries`, via
+ * `wxyc-canary-recent-entries-latency`) — every other check's latency stays
+ * in the logged outcome JSON but never reaches CloudWatch.
  */
-describe('publishMetrics — dimensioned + dimensionless emit-twice', () => {
+describe('publishMetrics — CloudWatch cardinality contract', () => {
   beforeEach(() => {
     cloudWatchSendMock.mockClear();
     process.env.CANARY_BACKEND_URL = 'https://api.example.test';
@@ -2897,7 +2899,7 @@ describe('publishMetrics — dimensioned + dimensionless emit-twice', () => {
     delete process.env.CANARY_PUBLISH_METRICS;
   });
 
-  it('emits each CheckFailure datapoint twice — once with the Check dimension and once dimensionless', async () => {
+  it('emits CheckFailure dimensioned-only — no dimensionless companion (the page reads UserFacingCheckFailure instead)', async () => {
     setUpFetchMock({
       ...RECENT_ENTRIES_STUB,
       '/healthcheck': { status: 200, body: { ok: true } },
@@ -2915,20 +2917,16 @@ describe('publishMetrics — dimensioned + dimensionless emit-twice', () => {
     const dimensioned = checkFailureData.filter((d) => d.Dimensions && d.Dimensions.length > 0);
     const dimensionless = checkFailureData.filter((d) => !d.Dimensions || d.Dimensions.length === 0);
 
-    // Fifteen checks, each contributes one dimensioned and one dimensionless datapoint.
+    // Sixteen checks, each contributes exactly one dimensioned datapoint.
     expect(dimensioned).toHaveLength(16);
-    expect(dimensionless).toHaveLength(16);
+    expect(dimensionless).toHaveLength(0);
     // Without an inducer, every value is 0 (passes + skips).
     expect(dimensioned.every((d) => d.Value === 0)).toBe(true);
-    expect(dimensionless.every((d) => d.Value === 0)).toBe(true);
   });
 
-  // Pins that `failureValue` flows into BOTH the dimensioned and dimensionless
-  // `CheckFailure` emissions. Post-#48 no alarm reads dimensionless
-  // `CheckFailure` (the page reads `UserFacingCheckFailure` — covered by the
-  // `publishMetrics — tier split` block below); this still guards the
-  // dimensioned-vs-dimensionless value parity the dashboards rely on.
-  it('flows the failure value (1) into both the dimensioned and dimensionless emission for the failing check', async () => {
+  // Pins that `failureValue` flows into the dimensioned `CheckFailure`
+  // emission for the failing check (and only that check).
+  it('flows the failure value (1) into the dimensioned CheckFailure emission for the failing check', async () => {
     setUpFetchMock({
       ...RECENT_ENTRIES_STUB,
       // backend-healthcheck fails; everything else passes (DJ-auth checks
@@ -2946,24 +2944,24 @@ describe('publishMetrics — dimensioned + dimensionless emit-twice', () => {
 
     const checkFailureData = getPublishedMetrics().filter((d) => d.MetricName === 'CheckFailure');
     const dimensioned = checkFailureData.filter((d) => d.Dimensions && d.Dimensions.length > 0);
-    const dimensionless = checkFailureData.filter((d) => !d.Dimensions || d.Dimensions.length === 0);
 
     const failingDimensioned = dimensioned.find((d) => d.Dimensions![0].Value === 'backend-healthcheck')!;
     expect(failingDimensioned.Value).toBe(1);
 
-    // Exactly one dimensionless datapoint carries the failure value (the
-    // one paired with backend-healthcheck); the rest are 0. Value-matching
-    // isn't enough — `Statistic: Maximum` on the alarm needs at least one
-    // `1` in the window, so this asserts the count of 1s explicitly.
-    expect(dimensionless.filter((d) => d.Value === 1)).toHaveLength(1);
-    expect(dimensionless.filter((d) => d.Value === 0)).toHaveLength(15);
+    // Exactly one of the sixteen dimensioned datapoints carries the failure
+    // value; the rest are 0. `Statistic: Maximum` on the runbook drill-down
+    // needs at least one `1` in the window, so this asserts the count of 1s
+    // explicitly, not just value-matching.
+    expect(dimensioned.filter((d) => d.Value === 1)).toHaveLength(1);
+    expect(dimensioned.filter((d) => d.Value === 0)).toHaveLength(15);
   });
 
-  // `CheckSkipped` and `CheckLatency` are dashboard data, not alarm inputs.
-  // A future "let's mirror everything" refactor that also published their
-  // dimensionless companions would pollute the namespace and risk a
-  // misconfigured alarm being added against them — pin the contract.
-  it('emits CheckSkipped and CheckLatency dimensioned-only (no dimensionless companion)', async () => {
+  // `CheckSkipped` was dashboard data with no alarm reader — dropped
+  // entirely (wxyc-canary#78). `CheckLatency` publishes only for checks an
+  // alarm actually reads (today: wxyc-info-recent-entries, via
+  // Check.latencyAlarmed) — every other check's latency stays in the
+  // logged outcome JSON but never reaches CloudWatch.
+  it('does not publish CheckSkipped at all, and publishes CheckLatency only for the latency-alarmed check', async () => {
     setUpFetchMock({
       ...RECENT_ENTRIES_STUB,
       '/healthcheck': { status: 200, body: { ok: true } },
@@ -2978,20 +2976,50 @@ describe('publishMetrics — dimensioned + dimensionless emit-twice', () => {
     await handler();
 
     const metricData = getPublishedMetrics();
-    const isDimensionless = (d: MetricDatum) => !d.Dimensions || d.Dimensions.length === 0;
-    expect(metricData.filter((d) => d.MetricName === 'CheckSkipped' && isDimensionless(d))).toHaveLength(0);
-    expect(metricData.filter((d) => d.MetricName === 'CheckLatency' && isDimensionless(d))).toHaveLength(0);
-    // Sanity: the dimensioned series for each is present (one per check).
-    expect(metricData.filter((d) => d.MetricName === 'CheckSkipped')).toHaveLength(16);
-    expect(metricData.filter((d) => d.MetricName === 'CheckLatency')).toHaveLength(16);
+    expect(metricData.filter((d) => d.MetricName === 'CheckSkipped')).toHaveLength(0);
+
+    const latencyData = metricData.filter((d) => d.MetricName === 'CheckLatency');
+    expect(latencyData).toHaveLength(1);
+    expect(latencyData[0]!.Dimensions).toEqual([{ Name: 'Check', Value: 'wxyc-info-recent-entries' }]);
   });
 
-  // wxyc-canary#84: DiscogsLiveRequestsTotal follows the same custom-metric
-  // emit-twice convention as DiscogsBreakerShedding — the alarm-side gate
-  // (DiscogsBreakerShedAlarm) reads the dimensionless copy via DIFF(); the
-  // dimensioned copy is a #78-acknowledged cardinality cost, not something
-  // any alarm targets (see CLAUDE.md / template.yaml comment).
-  it('emits DiscogsLiveRequestsTotal dimensioned + dimensionless when /health returns a numeric field', async () => {
+  // wxyc-canary#78: DiscogsBreakerShedding, DiscogsLiveRequestsTotal, and
+  // LookupDegraded each have exactly one CloudWatch consumer — a dedicated
+  // alarm reading the dimensionless series (DiscogsBreakerShedAlarm's
+  // metric-math DIFF(), wxyc-canary-lml-enrichment-degraded). The
+  // dimensioned Check=<name> copy was unread cardinality; dropped.
+  it('emits DiscogsBreakerShedding, DiscogsLiveRequestsTotal, and LookupDegraded dimensionless-only (no dimensioned companion)', async () => {
+    // Reuses the full happy-path fixture (defined below) rather than a
+    // narrow stub set: lml-auth, lml-protected-search, and
+    // lml-enrichment-lookup all share one LML_API_KEY bearer, so setting it
+    // activates all three, and each needs its own working stub (lml-auth's
+    // dual good/known-bad-bearer probe in particular) to avoid an unrelated
+    // page-tier failure here.
+    process.env.CANARY_DJ_EMAIL = 'canary@wxyc.org';
+    process.env.CANARY_DJ_PASSWORD = 'pw';
+    process.env.CANARY_LML_API_KEY = 'fake-lml-bearer';
+    try {
+      setUpEnrichmentHappyPathMock();
+      await handler();
+
+      const metricData = getPublishedMetrics();
+      for (const name of ['DiscogsBreakerShedding', 'DiscogsLiveRequestsTotal', 'LookupDegraded']) {
+        const data = metricData.filter((d) => d.MetricName === name);
+        expect(data, `${name} datapoints`).toHaveLength(1);
+        expect(data[0]!.Dimensions ?? [], `${name} should have no Dimensions`).toEqual([]);
+      }
+    } finally {
+      delete process.env.CANARY_DJ_EMAIL;
+      delete process.env.CANARY_DJ_PASSWORD;
+      delete process.env.CANARY_LML_API_KEY;
+    }
+  });
+
+  // wxyc-canary#78: GraphDbAgeSeconds is dashboard-trend-only with no
+  // CloudWatch consumer at all — it still surfaces in the logged outcome
+  // JSON (semantic-index-freshness's own `metrics` field, pinned elsewhere)
+  // but must never reach PutMetricData, dimensioned or dimensionless.
+  it('never publishes GraphDbAgeSeconds to CloudWatch, even though semantic-index-freshness returns it', async () => {
     setUpFetchMock({
       ...RECENT_ENTRIES_STUB,
       '/healthcheck': { status: 200, body: { ok: true } },
@@ -3001,23 +3029,11 @@ describe('publishMetrics — dimensioned + dimensionless emit-twice', () => {
         status: 200,
         body: { status: 'healthy', artist_count: 136_702, graph_db_age_seconds: 3_600 },
       },
-      'library-metadata-lookup-production.up.railway.app/health': {
-        status: 200,
-        body: { status: 'ok', discogs_breaker_state: 'closed', discogs_live_requests_total: 812 },
-      },
     });
 
     await handler();
 
-    const totalMetrics = getPublishedMetrics().filter((d) => d.MetricName === 'DiscogsLiveRequestsTotal');
-    const dimensioned = totalMetrics.filter((d) => d.Dimensions && d.Dimensions.length > 0);
-    const dimensionless = totalMetrics.filter((d) => !d.Dimensions || d.Dimensions.length === 0);
-
-    expect(dimensioned).toHaveLength(1);
-    expect(dimensionless).toHaveLength(1);
-    expect(dimensioned[0]!.Dimensions![0]!).toEqual({ Name: 'Check', Value: 'lml-discogs-breaker-shed' });
-    expect(dimensioned[0]!.Value).toBe(812);
-    expect(dimensionless[0]!.Value).toBe(812);
+    expect(getPublishedMetrics().filter((d) => d.MetricName === 'GraphDbAgeSeconds')).toHaveLength(0);
   });
 
   // Mirrors the EnrichmentLagSeconds "does NOT emit" pin below: an older
@@ -3550,6 +3566,41 @@ describe('template.yaml ↔ publishMetrics contract', () => {
 
     expect(doc.Conditions?.HasWriteProbe).toBeDefined();
     expect(doc.Resources?.EnrichmentLagAlarm?.Condition).toBe('HasWriteProbe');
+  });
+
+  // wxyc-canary#78 cardinality trim: `publishMetrics` only sends a check's
+  // `CheckLatency` to CloudWatch when that check's `latencyAlarmed` flag is
+  // set (see the docstring in types.ts). This test derives the "should be
+  // flagged" set directly from template.yaml — every alarm that targets
+  // `CheckLatency` dimensioned on a specific `Check` value — and
+  // cross-references it against `checks` in both directions: a check
+  // flagged `latencyAlarmed: true` with no matching alarm, or an alarm
+  // naming a check that isn't flagged, both fail. Mirrors the `pagesOncall`
+  // classification-pin test in `test/checks.test.ts`.
+  it('latencyAlarmed — every CheckLatency alarm target is flagged, and only those checks are flagged', () => {
+    const templatePath = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'template.yaml');
+    const text = readFileSync(templatePath, 'utf-8');
+    const doc = YAML.parse(text, { logLevel: 'silent' }) as {
+      Resources?: Record<string, { Type?: string; Properties?: { MetricName?: string; Dimensions?: unknown } }>;
+    };
+    const targetedCheckNames = new Set<string>();
+    for (const resource of Object.values(doc.Resources ?? {})) {
+      if (resource?.Type !== 'AWS::CloudWatch::Alarm') continue;
+      const props = resource.Properties ?? {};
+      if (props.MetricName !== 'CheckLatency') continue;
+      const dims = Array.isArray(props.Dimensions) ? props.Dimensions : [];
+      for (const dim of dims) {
+        if (dim && typeof dim === 'object' && (dim as { Name?: unknown }).Name === 'Check') {
+          targetedCheckNames.add(String((dim as { Value?: unknown }).Value));
+        }
+      }
+    }
+    // Sanity: if this drops to zero, the parser or the alarm both broke —
+    // the test would otherwise trivially pass by comparing two empty sets.
+    expect(targetedCheckNames.size).toBeGreaterThan(0);
+
+    const flaggedCheckNames = new Set(checks.filter((c) => c.latencyAlarmed === true).map((c) => c.name));
+    expect(flaggedCheckNames).toEqual(targetedCheckNames);
   });
 });
 

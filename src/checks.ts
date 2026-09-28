@@ -153,10 +153,11 @@ const ARTIST_COUNT_FLOOR = 100_000;
  * survives the #347 migration without rework. `graph_db_age_seconds` is added
  * to `/health` by semantic-index#348; until that deploys, prod `/health` only
  * carries `artist_count`, so the age half no-ops in production (the floor half
- * is live today). Returns the age as a `GraphDbAgeSeconds` metric (emitted
- * dimensioned + dimensionless per the org CloudWatch convention) for dashboard
- * trend visibility; the alarm signal is the infra-tier failure aggregate, not
- * a dedicated age alarm.
+ * is live today). Returns the age as a `GraphDbAgeSeconds` metric for trend
+ * visibility in the logged outcome only — `publishMetrics` deliberately does
+ * NOT send it to CloudWatch (wxyc-canary#78 cardinality trim): no alarm reads
+ * it, the alarm signal is the infra-tier failure aggregate, and a metric with
+ * no consumer is pure metric-month cost.
  */
 const semanticIndexFreshness: Check = {
   name: 'semantic-index-freshness',
@@ -215,7 +216,9 @@ const semanticIndexFreshness: Check = {
           `graph_db_age_seconds ${Math.round(ageRaw)} exceeds the ${GRAPH_DB_MAX_AGE_SECONDS}s (~36h) limit — the nightly sync has missed or failed (silent-stale window)`
         );
       }
-      // Fresh + above floor: surface the age for dashboard trend visibility.
+      // Fresh + above floor: surface the age in the logged outcome for
+      // ad-hoc trend visibility. Not published to CloudWatch — see the
+      // docstring above.
       return { metrics: { GraphDbAgeSeconds: ageRaw } };
     }
     // Floor passed and the age field is absent (pre-#348 prod) or a non-numeric,
@@ -364,6 +367,10 @@ const wxycInfoRecentEntries: Check = {
   requiresAuth: false,
   // Page tier (default). This is the listener-facing now-playing surface for
   // both mobile apps; a sustained break here blanks every phone.
+  // The one check whose CheckLatency an alarm actually reads
+  // (wxyc-canary-recent-entries-latency in template.yaml) — see the
+  // Check.latencyAlarmed docstring in types.ts.
+  latencyAlarmed: true,
   run: async (ctx): Promise<CheckResult | void> => {
     if (!ctx.legacyPlaylistUrl) {
       return { skipped: true, skipReason: 'no legacy playlist URL configured' };

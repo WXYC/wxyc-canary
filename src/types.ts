@@ -48,6 +48,24 @@ export type Check = {
    */
   pagesOncall?: boolean;
   /**
+   * Whether a CloudWatch alarm reads this check's `CheckLatency` series.
+   * Default false — `CheckLatency` is dashboard-trend data with no alarm
+   * consumer for nearly every check, so `publishMetrics` doesn't send it to
+   * CloudWatch at all unless this is `true` (wxyc-canary#78 cardinality
+   * trim: an unread per-check series is pure metric-month cost, not free
+   * visibility). Set `true` ONLY when a `template.yaml` alarm actually
+   * targets `CheckLatency` with `Dimensions: [{Name: Check, Value: <this
+   * check's name>}]` — currently only `wxyc-info-recent-entries`, via
+   * `wxyc-canary-recent-entries-latency`. The `latencyAlarmed —
+   * CheckLatency alarm classification` test in `test/handler.test.ts`
+   * cross-references this flag against `template.yaml` directly, so a
+   * mismatch in either direction fails a test rather than drifting
+   * silently. The runner still measures `latencyMs` for every check and
+   * includes it in the logged outcome JSON regardless of this flag — only
+   * the CloudWatch publish is gated.
+   */
+  latencyAlarmed?: boolean;
+  /**
    * The actual probe. Throws on failure with a message that's safe to alert
    * on. May optionally return a `CheckResult` carrying custom metrics the
    * runner should publish (see CheckResult docs).
@@ -59,10 +77,27 @@ export type Check = {
  * Optional return shape for `Check.run`. A check that just verifies a 2xx
  * response can return undefined (treated as pass with no custom metrics).
  *
- * `metrics` — each entry is published twice (once with the `Check`
- * dimension for dashboards, once dimensionless for alarms) per the
- * convention pinned in CLAUDE.md and wxyc-canary#13. The CloudWatch unit
- * is inferred from the key suffix:
+ * `metrics` — each entry names a value the runner stores on the outcome
+ * (always visible in the handler's logged outcome JSON) and `publishMetrics`
+ * may send to CloudWatch, in one of three ways depending on whether an alarm
+ * reads it (wxyc-canary#78 cardinality trim — see `publishMetrics` in
+ * `src/handler.ts` for the exact per-metric-name lists):
+ *   - **default: emitted twice**, once with the `Check` dimension (for
+ *     dashboards) and once dimensionless (so a plain-form alarm can target
+ *     it without a `SUM(SEARCH(...))` expression CloudWatch rejects) — the
+ *     convention pinned in CLAUDE.md and wxyc-canary#13. Use this when the
+ *     dimensioned copy has dashboard value beyond what an alarm needs.
+ *   - **dimensionless-only** for a metric whose ONLY CloudWatch consumer is
+ *     a dedicated alarm reading the dimensionless series (e.g.
+ *     `DiscogsBreakerShedding`, `DiscogsLiveRequestsTotal`, `LookupDegraded`)
+ *     — the dimensioned copy would be cardinality with no reader.
+ *   - **not published to CloudWatch at all** for a metric that's
+ *     dashboard-trend-only with no alarm of any shape (e.g.
+ *     `GraphDbAgeSeconds`) — it still appears in the logged outcome JSON,
+ *     just never reaches `PutMetricData`.
+ *
+ * The CloudWatch unit (for whichever metrics do publish) is inferred from
+ * the key suffix:
  *   - ends in `Seconds` → `StandardUnit.Seconds`
  *   - ends in `Milliseconds` → `StandardUnit.Milliseconds`
  *   - otherwise → `StandardUnit.Count`

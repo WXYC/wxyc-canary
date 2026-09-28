@@ -398,7 +398,13 @@ Resources:
     Type: AWS::Logs::LogGroup
     Properties:
       LogGroupName: !Sub /aws/lambda/${CanaryFunction}
-      RetentionInDays: 30
+      # 365 days, not 30 (wxyc-canary#78 cardinality trim): the trim stops
+      # publishing per-check CheckLatency to CloudWatch for every check
+      # except wxyc-info-recent-entries, so this log group — whose JSON line
+      # carries every check's latencyMs regardless — becomes the only place
+      # latency trends for the other 15 checks survive. See the README's
+      # Logs Insights query for reading them back.
+      RetentionInDays: 365
 
   # ---------------------------------------------------------------------------
   # Stream listener sampler (audience measurement, NOT liveness monitoring)
