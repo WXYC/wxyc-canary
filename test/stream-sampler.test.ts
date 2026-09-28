@@ -1,6 +1,13 @@
 import { describe, expect, it } from 'vitest';
 
-import { buildCapturePayload, buildFailurePayload, mountPathFrom, sampleWxycMounts } from '../src/stream-sampler.js';
+import {
+  type OnAir,
+  buildCapturePayload,
+  buildFailurePayload,
+  mountPathFrom,
+  parseOnAir,
+  sampleWxycMounts,
+} from '../src/stream-sampler.js';
 
 /**
  * A trimmed shape of the real `status-json.xsl` from ibiblio's shared
@@ -160,6 +167,47 @@ describe('sampleWxycMounts', () => {
   });
 });
 
+describe('parseOnAir', () => {
+  // The three shapes Backend-Service's paginated `GET /flowsheet` gives
+  // `on_air` (flowsheet.controller.ts, the `res.status(200).json` of the
+  // default branch): an object when a human is live, explicit `null` when
+  // automation is, and the field absent when the banner query itself failed.
+  it.each<[string, unknown, OnAir['state'], string | undefined]>([
+    ['an object names the live DJ', { on_air: { dj_name: 'dj pipe dreams' } }, 'dj', 'dj pipe dreams'],
+    ['explicit null is automation', { on_air: null }, 'automation', undefined],
+    ['an absent field is unknown', { entries: [], total: 0 }, 'unknown', undefined],
+  ])('%s', (_label, body, state, djName) => {
+    const onAir = parseOnAir(body);
+    expect(onAir.state).toBe(state);
+    expect(onAir.state === 'dj' ? onAir.djName : undefined).toBe(djName);
+  });
+
+  it('keeps the "WXYC" station brand as a live DJ, not automation', () => {
+    // Backend-Service reports the brand when an open show's DJ handle does
+    // not resolve. That is a human on the air; folding it into automation
+    // would erase their show from the per-DJ breakdown and inflate the
+    // automation bucket with live airtime.
+    expect(parseOnAir({ on_air: { dj_name: 'WXYC' } })).toEqual({ state: 'dj', djName: 'WXYC' });
+  });
+
+  it.each<[string, unknown]>([
+    ['a non-JSON body', '<html>Bad Gateway</html>'],
+    ['a null body', null],
+    ['an array body', []],
+    ['an on_air object without a name', { on_air: {} }],
+    ['an on_air object with an empty name', { on_air: { dj_name: '' } }],
+    ['an on_air object with a non-string name', { on_air: { dj_name: 42 } }],
+    ['an on_air string', { on_air: 'dj pipe dreams' }],
+    ['an on_air array', { on_air: [{ dj_name: 'dj pipe dreams' }] }],
+  ])('reads %s as unknown rather than guessing', (_label, body) => {
+    // Contract drift must not mint a DJ called "undefined" or book live
+    // airtime as automation; unknown is the one honest bucket.
+    const onAir = parseOnAir(body);
+    expect(onAir.state).toBe('unknown');
+    expect(onAir.state === 'unknown' && onAir.reason.length > 0).toBe(true);
+  });
+});
+
 describe('buildCapturePayload', () => {
   const sample = sampleWxycMounts(
     statusWith([
@@ -167,11 +215,12 @@ describe('buildCapturePayload', () => {
       { listenurl: 'http://audio-mp3.ibiblio.org:8000/wxyc-alt.mp3', listeners: 3, listener_peak: 8 },
     ])
   );
-  const payload = buildCapturePayload(sample, {
+  const context = {
     apiKey: 'phc_test',
     timestamp: '2026-08-20T03:34:00.000Z',
     environment: 'production',
-  });
+  };
+  const payload = buildCapturePayload(sample, context, { state: 'dj', djName: 'dj pipe dreams' });
 
   it('captures a single summary event, not one per mount', () => {
     // One event per sample keeps the cost fixed at 288/day regardless of how
@@ -201,6 +250,22 @@ describe('buildCapturePayload', () => {
       { mount: 'wxyc-alt.mp3', listeners: 3, peak: 8 },
       { mount: 'wxyc.mp3', listeners: 25, peak: 69 },
     ]);
+  });
+
+  it.each<[string, OnAir, Record<string, unknown>]>([
+    ['a live DJ', { state: 'dj', djName: 'dj pipe dreams' }, { on_air_state: 'dj', dj_name: 'dj pipe dreams' }],
+    ['automation', { state: 'automation' }, { on_air_state: 'automation' }],
+    ['unknown', { state: 'unknown', reason: 'status 503' }, { on_air_state: 'unknown' }],
+  ])('records who was on the air for %s', (_label, onAir, expected) => {
+    // Flat properties so station-wide per-DJ audience is a plain breakdown of
+    // `total_listeners` by `dj_name`. Only a live DJ carries a name.
+    const properties = buildCapturePayload(sample, context, onAir).properties;
+    expect({ on_air_state: properties.on_air_state, dj_name: properties.dj_name }).toEqual({
+      dj_name: undefined,
+      ...expected,
+    });
+    // The unknown reason is for the log line, not the event schema.
+    expect(properties).not.toHaveProperty('on_air_reason');
   });
 });
 

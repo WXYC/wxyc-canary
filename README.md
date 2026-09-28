@@ -432,12 +432,12 @@ A second Lambda in this stack, `wxyc-canary-stream-listener-sampler`, records ho
 
 ### What it does
 
-Every 5 minutes it GETs `https://audio-mp3.ibiblio.org/status-json.xsl`, sums the listener counts across the WXYC mounts, and POSTs one event to the PostHog capture API.
+Every 5 minutes it GETs `https://audio-mp3.ibiblio.org/status-json.xsl`, sums the listener counts across the WXYC mounts, and POSTs one event to the PostHog capture API. Alongside the Icecast read it GETs `https://api.wxyc.org/flowsheet?limit=1` and records who was on the air from the response's `on_air` field, so the sample says whose show the audience was listening to.
 
-| Event                           | When                                  | Key properties                                                                     |
-| ------------------------------- | ------------------------------------- | ---------------------------------------------------------------------------------- |
-| `stream_listener_sample`        | The status endpoint answered          | `total_listeners`, `primary_listeners`, `mount_count`, `stream_online`, `mounts[]` |
-| `stream_listener_sample_failed` | The status endpoint could not be read | `reason` (and deliberately **no** listener count)                                  |
+| Event                           | When                                  | Key properties                                                                                                |
+| ------------------------------- | ------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `stream_listener_sample`        | The status endpoint answered          | `total_listeners`, `primary_listeners`, `mount_count`, `stream_online`, `mounts[]`, `on_air_state`, `dj_name` |
+| `stream_listener_sample_failed` | The status endpoint could not be read | `reason` (and deliberately **no** listener count or on-air state)                                             |
 
 Three states, kept distinct on purpose: a normal sample, a sample where `stream_online: false` (fetch succeeded, no encoder connected — nobody _could_ be listening), and a failure (we could not measure). Booking a failure as `total_listeners: 0` would drag the average down invisibly, since zero is a legitimate value here.
 
@@ -451,6 +451,16 @@ Two analysis rules worth stating up front:
 - **Do not derive cume from this.** Icecast counts connections; Nielsen counts people. Only AQH and total listening hours survive a broadcast-vs-stream comparison honestly. See the org-level notes on comparing terrestrial and online audience.
 
 Note that the apps (iOS, Android, Alexa) and the web player all pull these same mounts, so `total_listeners` is the _whole_ online audience, not just the website's.
+
+**Per-DJ audience** is a breakdown of the same number: `avg(total_listeners)` by `dj_name` is each DJ's average concurrent online audience, and `sum(total_listeners) * 5 / 60` is their listener-hours. `on_air_state` says how to read a sample:
+
+| `on_air_state` | Meaning                                                                                                                                                                      |
+| -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `dj`           | A human was live; `dj_name` names them. `dj_name = 'WXYC'` is the station brand Backend-Service reports when an open show's DJ handle does not resolve — still a live human. |
+| `automation`   | Backend-Service reported `on_air: null`: no show was open.                                                                                                                   |
+| `unknown`      | The flowsheet read failed or timed out, or Backend-Service's own on-air lookup failed. The listener count is still good; only the attribution is missing.                    |
+
+Attribution has five-minute resolution, so a show's first and last samples can straddle a handover. It also inherits Backend-Service's notion of an open show: a DJ whose show is never closed stays `dj` until the next show opens, so a missed sign-off credits the automation hours that follow to the departed DJ. Backend-Service detects such shows daily but does not close them (WXYC/Backend-Service#2065). Treat a single show running far past its slot as that, not as a marathon.
 
 ### Operating
 
@@ -467,13 +477,15 @@ Dry-run locally without writing to PostHog:
 SAMPLER_CAPTURE_ENABLED=false npm run local:sampler
 ```
 
-**Cost.** One GET and at most one event per invocation pins ingestion at a constant 288 events/day regardless of traffic — under 1% of the org's 1M/month PostHog allowance. That constancy is the design's whole point: the 2026-08-04 org-wide analytics cutoff came from telemetry whose volume scaled with load. Any change that makes the event rate depend on something we don't control needs to be justified against that.
+**Cost.** Two GETs and at most one event per invocation pins ingestion at a constant 288 events/day regardless of traffic — under 1% of the org's 1M/month PostHog allowance. That constancy is the design's whole point: the 2026-08-04 org-wide analytics cutoff came from telemetry whose volume scaled with load. Any change that makes the event rate depend on something we don't control needs to be justified against that.
 
 **Deploy secret.** `STREAM_SAMPLER_POSTHOG_API_KEY` (a `phc_` project ingestion token) is a GitHub Actions secret; the deploy workflow omits the parameter entirely when it is unset. It has no default in this public repo — a write-only token is still an invitation to inject junk events into a quota shared across every WXYC project.
 
 **Deleting the secret does not stop capture.** Omitting the parameter only produces the dry run on the stack's first _create_, where the template default applies. On an _update_, CloudFormation reuses the previous value of any parameter not passed to `--parameter-overrides`, so removing the secret and redeploying leaves the function running with the token it already had. To actually stop sampling, set `StreamSamplerState=DISABLED` (accepting that paused ticks are lost data), or rotate the token in PostHog.
 
 **If samples go missing.** The most likely cause is not the stream. `audio-mp3.ibiblio.org` is dual-stack and can take up to ~2.4s to answer, while Node's default Happy Eyeballs `autoSelectFamilyAttemptTimeout` is 250ms — which abandons healthy connections and surfaces as a bare `ETIMEDOUT` that looks like a dead host. `configureNetworking` raises it to 3s (`SAMPLER_FAMILY_ATTEMPT_TIMEOUT_MS`), and the read is retried once (`SAMPLER_READ_RETRIES`). Check the sampler's own log group before suspecting ibiblio.
+
+**If `on_air_state` reads `unknown`.** The log line's `onAirReason` says why. The flowsheet read has its own 3s budget (`SAMPLER_ON_AIR_TIMEOUT_MS`), runs concurrently with the Icecast read, and is never retried — by design, since it must never cost a sample. `on_air absent` means Backend-Service's own on-air lookup failed and it omitted the field.
 
 ## Why these specific checks
 
