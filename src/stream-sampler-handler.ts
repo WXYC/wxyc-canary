@@ -7,15 +7,22 @@
  * repo buys the SAM/deploy/test plumbing and the WXYC AWS account; sharing a
  * Lambda would entangle two different jobs.
  *
- * Cost is fixed by construction: one HTTP GET and at most one PostHog event
- * per invocation, so the 5-minute schedule pins ingestion at 288 events/day
- * no matter what the stream is doing. See `stream-sampler.ts` for why that
- * invariant is load-bearing.
+ * Cost is fixed by construction: two HTTP GETs (Icecast, and the flowsheet
+ * for who is on the air) and at most one PostHog event per invocation, so the
+ * 5-minute schedule pins ingestion at 288 events/day no matter what the stream
+ * is doing. See `stream-sampler.ts` for why that invariant is load-bearing.
  */
 import { setDefaultAutoSelectFamilyAttemptTimeout } from 'node:net';
 
 import { CanaryFetchError, canaryFetch } from './client.js';
-import { type CaptureEvent, buildCapturePayload, buildFailurePayload, sampleWxycMounts } from './stream-sampler.js';
+import {
+  type CaptureEvent,
+  type OnAir,
+  buildCapturePayload,
+  buildFailurePayload,
+  parseOnAir,
+  sampleWxycMounts,
+} from './stream-sampler.js';
 
 export type SamplerConfig = {
   statusUrl: string;
@@ -28,6 +35,8 @@ export type SamplerConfig = {
   captureEnabled: boolean;
   familyAttemptTimeoutMs: number;
   readRetries: number;
+  onAirUrl: string;
+  onAirTimeoutMs: number;
 };
 
 /**
@@ -85,6 +94,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): SamplerConfig 
     captureEnabled: env.SAMPLER_CAPTURE_ENABLED !== 'false',
     familyAttemptTimeoutMs: numberFromEnv(env.SAMPLER_FAMILY_ATTEMPT_TIMEOUT_MS, 3000),
     readRetries: numberFromEnv(env.SAMPLER_READ_RETRIES, 1),
+    // `limit`, not `n`: the flowsheet silently ignores `n` and returns 30
+    // entries. Only this paginated branch carries `on_air`.
+    onAirUrl: env.SAMPLER_ON_AIR_URL ?? 'https://api.wxyc.org/flowsheet?limit=1',
+    onAirTimeoutMs: numberFromEnv(env.SAMPLER_ON_AIR_TIMEOUT_MS, 3000),
   };
 }
 
@@ -116,6 +129,25 @@ async function fetchStatus(config: SamplerConfig) {
 }
 
 /**
+ * Reads who is on the air. Never throws.
+ *
+ * The listener count is the job's whole purpose and a skipped sample is
+ * unrecoverable, so this is the one read that may not fail the run: every
+ * failure degrades to `unknown` and the sample is captured regardless. It is
+ * not retried, and its timeout is shorter than one Icecast attempt, so running
+ * it alongside the status read can never delay the sample.
+ */
+async function readOnAir(config: SamplerConfig): Promise<OnAir> {
+  try {
+    const response = await canaryFetch(config.onAirUrl, { timeoutMs: config.onAirTimeoutMs });
+    if (!response.ok) return { state: 'unknown', reason: `flowsheet status ${response.status}` };
+    return parseOnAir(response.body);
+  } catch (err) {
+    return { state: 'unknown', reason: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/**
  * POSTs one event to PostHog's capture API.
  *
  * A raw fetch instead of `posthog-node` on purpose. The SDK batches and
@@ -143,6 +175,9 @@ export type SamplerResult = {
   totalListeners: number | null;
   streamOnline: boolean | null;
   mounts: string[];
+  onAirState?: OnAir['state'];
+  djName?: string;
+  onAirReason?: string;
   reason?: string;
 };
 
@@ -162,6 +197,9 @@ export async function runSampler(
   let payload: CaptureEvent;
   let result: SamplerResult;
 
+  // Started before the status read so the two run concurrently.
+  const onAirRead = readOnAir(config);
+
   try {
     const response = await fetchStatus(config);
     if (typeof response.body !== 'object' || response.body === null) {
@@ -172,16 +210,25 @@ export async function runSampler(
       mountPrefix: config.mountPrefix,
       primaryMount: config.primaryMount,
     });
-    payload = buildCapturePayload(sample, context);
+    const onAir = await onAirRead;
+    payload = buildCapturePayload(sample, context, onAir);
     result = {
       captured: false,
       event: payload.event,
       totalListeners: sample.totalListeners,
       streamOnline: sample.streamOnline,
       mounts: sample.mounts.map((m) => m.mount),
+      onAirState: onAir.state,
+      djName: onAir.state === 'dj' ? onAir.djName : undefined,
+      onAirReason: onAir.state === 'unknown' ? onAir.reason : undefined,
     };
   } catch (err) {
     const reason = err instanceof CanaryFetchError || err instanceof Error ? err.message : String(err);
+    // Settled but not recorded: the failure event is unchanged, and an on-air
+    // state there would read as attributed airtime nobody measured. Awaiting
+    // it (it cannot reject, and is bounded by onAirTimeoutMs) keeps a request
+    // from straddling the Lambda freeze into the next invocation.
+    await onAirRead;
     payload = buildFailurePayload({ ...context, reason });
     result = {
       captured: false,

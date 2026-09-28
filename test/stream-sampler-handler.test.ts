@@ -16,12 +16,26 @@ function configWith(overrides: Partial<SamplerConfig> = {}): SamplerConfig {
     captureEnabled: true,
     familyAttemptTimeoutMs: 3000,
     readRetries: 1,
+    onAirUrl: 'https://api.test/flowsheet?limit=1',
+    onAirTimeoutMs: 1000,
     ...overrides,
   };
 }
 
 function jsonResponse(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+}
+
+type FetchSpy = { mock: { calls: Parameters<typeof fetch>[] } };
+
+function captureCalls(spy: FetchSpy) {
+  return spy.mock.calls.filter(([input]) => String(input).startsWith('https://posthog.test/'));
+}
+
+function captureCall(spy: FetchSpy) {
+  const calls = captureCalls(spy);
+  expect(calls).toHaveLength(1);
+  return calls[0];
 }
 
 const HEALTHY_STATUS = {
@@ -47,6 +61,21 @@ describe('loadConfig', () => {
     expect(config.statusUrl).toBe('https://audio-mp3.ibiblio.org/status-json.xsl');
     expect(config.posthogHost).toBe('https://us.i.posthog.com');
     expect(config.captureEnabled).toBe(true);
+  });
+
+  it('reads the on-air DJ from the paginated flowsheet branch, one entry deep', () => {
+    // Only the paginated branch carries `on_air`. The parameter is `limit`:
+    // `?n=1` is silently ignored and returns the default 30 entries.
+    expect(loadConfig({}).onAirUrl).toBe('https://api.wxyc.org/flowsheet?limit=1');
+  });
+
+  it('gives the on-air read a budget well inside the status read', () => {
+    // The two reads run concurrently, so as long as the flowsheet budget is
+    // shorter than one Icecast attempt it can never delay the sample.
+    const config = loadConfig({});
+    expect(config.onAirTimeoutMs).toBe(3000);
+    expect(config.onAirTimeoutMs).toBeLessThan(config.timeoutMs);
+    expect(loadConfig({ SAMPLER_ON_AIR_TIMEOUT_MS: 'soon' }).onAirTimeoutMs).toBe(3000);
   });
 
   it('treats a blank api key as capture-disabled rather than substituting a default', () => {
@@ -83,9 +112,14 @@ describe('runSampler', () => {
     expect(result.streamOnline).toBe(true);
     expect(result.mounts).toEqual(['wxyc-alt.mp3', 'wxyc.mp3']);
 
-    // Exactly two calls: one read, one capture. No batching, no retries.
-    expect(fetchSpy).toHaveBeenCalledTimes(2);
-    const [captureUrl, captureInit] = fetchSpy.mock.calls[1];
+    // Exactly three calls: the status read, the on-air read, and one capture.
+    // No batching, no retries.
+    expect(fetchSpy.mock.calls.map(([input]) => new URL(String(input)).host).sort()).toEqual([
+      'api.test',
+      'icecast.test',
+      'posthog.test',
+    ]);
+    const [captureUrl, captureInit] = captureCall(fetchSpy);
     expect(String(captureUrl)).toBe('https://posthog.test/i/v0/e/');
     expect(captureInit?.method).toBe('POST');
 
@@ -140,25 +174,27 @@ describe('runSampler', () => {
   });
 
   it('does not contact PostHog when capture is disabled', async () => {
-    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(jsonResponse(HEALTHY_STATUS));
+    // A fresh Response per call: a body can be read once, and both the status
+    // read and the on-air read consume one.
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => jsonResponse(HEALTHY_STATUS));
 
     const result = await runSampler(configWith({ captureEnabled: false }), FIXED_NOW);
 
     expect(result.captured).toBe(false);
     expect(result.totalListeners).toBe(28);
-    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(captureCalls(fetchSpy)).toHaveLength(0);
     // Must name the lever that actually fired — the operator note tells
     // readers that "no api key" means a CloudFormation problem.
     expect(result.reason).toContain('SAMPLER_CAPTURE_ENABLED=false');
   });
 
   it('does not contact PostHog when no api key is configured', async () => {
-    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(jsonResponse(HEALTHY_STATUS));
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => jsonResponse(HEALTHY_STATUS));
 
     const result = await runSampler(configWith({ posthogApiKey: undefined }), FIXED_NOW);
 
     expect(result.captured).toBe(false);
-    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(captureCalls(fetchSpy)).toHaveLength(0);
     expect(result.reason).toContain('capture disabled');
   });
 
@@ -204,6 +240,7 @@ describe('runSampler', () => {
     let captureCalls = 0;
     vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
       if (String(input).includes('icecast.test')) return jsonResponse(HEALTHY_STATUS);
+      if (String(input).includes('api.test')) return jsonResponse({ on_air: null });
       captureCalls += 1;
       throw new Error('ETIMEDOUT');
     });
@@ -221,6 +258,121 @@ describe('runSampler', () => {
     });
 
     await expect(runSampler(configWith(), FIXED_NOW)).rejects.toThrow(/posthog capture returned 401/);
+  });
+});
+
+describe('runSampler — on-air attribution', () => {
+  /**
+   * Routes the three hosts: Icecast answers healthily, the capture API
+   * accepts, and the flowsheet answers with whatever the test supplies.
+   */
+  function stubFetch(flowsheet: (init: RequestInit | undefined) => Promise<Response>) {
+    return vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url.includes('icecast.test')) return jsonResponse(HEALTHY_STATUS);
+      if (url.includes('api.test')) return flowsheet(init);
+      return jsonResponse({ status: 1 });
+    });
+  }
+
+  function capturedProperties(spy: FetchSpy) {
+    const [, init] = captureCall(spy);
+    return JSON.parse(String(init?.body)).properties;
+  }
+
+  it('records the live DJ on the sample', async () => {
+    const spy = stubFetch(async () => jsonResponse({ entries: [], on_air: { dj_name: 'dj pipe dreams' } }));
+
+    const result = await runSampler(configWith(), FIXED_NOW);
+
+    expect(result.onAirState).toBe('dj');
+    expect(result.djName).toBe('dj pipe dreams');
+    expect(capturedProperties(spy)).toMatchObject({
+      total_listeners: 28,
+      on_air_state: 'dj',
+      dj_name: 'dj pipe dreams',
+    });
+  });
+
+  it('records automation with no DJ name', async () => {
+    const spy = stubFetch(async () => jsonResponse({ entries: [], on_air: null }));
+
+    await runSampler(configWith(), FIXED_NOW);
+
+    const properties = capturedProperties(spy);
+    expect(properties.on_air_state).toBe('automation');
+    expect(properties).not.toHaveProperty('dj_name');
+  });
+
+  // A skipped sample is unrecoverable (docs/scope.md) and the audience number
+  // is the job's whole purpose, so no flowsheet failure may cost the sample:
+  // each one degrades to `unknown` with the listener count untouched.
+  it.each<[string, (init: RequestInit | undefined) => Promise<Response>, RegExp]>([
+    [
+      'throws',
+      async () => {
+        throw new Error('ECONNREFUSED');
+      },
+      /ECONNREFUSED/,
+    ],
+    [
+      'times out',
+      // Hangs until canaryFetch's own abort fires, so this exercises the real
+      // per-request timeout rather than a simulated one.
+      (init) =>
+        new Promise((_, reject) => {
+          init?.signal?.addEventListener('abort', () =>
+            reject(Object.assign(new Error('aborted'), { name: 'AbortError' }))
+          );
+        }),
+      /timed out after 20ms/,
+    ],
+    ['returns malformed JSON', async () => new Response('<html>Bad Gateway</html>', { status: 200 }), /.+/],
+    ['returns a non-2xx', async () => jsonResponse({ error: 'down' }, 503), /503/],
+  ])('still captures the sample when the flowsheet read %s', async (_label, flowsheet, reason) => {
+    const spy = stubFetch(flowsheet);
+
+    const result = await runSampler(configWith({ onAirTimeoutMs: 20 }), FIXED_NOW);
+
+    expect(result.captured).toBe(true);
+    expect(result.event).toBe('stream_listener_sample');
+    expect(result.onAirState).toBe('unknown');
+    expect(result.onAirReason).toMatch(reason);
+    const properties = capturedProperties(spy);
+    expect(properties.total_listeners).toBe(28);
+    expect(properties.on_air_state).toBe('unknown');
+    expect(properties).not.toHaveProperty('dj_name');
+  });
+
+  it('never retries the flowsheet read', async () => {
+    // The Icecast read is the one retried read; a second flowsheet attempt
+    // would only push the sample later for a property that can degrade.
+    let flowsheetCalls = 0;
+    stubFetch(async () => {
+      flowsheetCalls += 1;
+      throw new Error('ECONNREFUSED');
+    });
+
+    await runSampler(configWith(), FIXED_NOW);
+
+    expect(flowsheetCalls).toBe(1);
+  });
+
+  it('leaves the failure event unchanged', async () => {
+    // `stream_listener_sample_failed` records that we could not measure. An
+    // on-air state there would invite reading it as attributed airtime.
+    const spy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.includes('icecast.test')) return jsonResponse({ error: 'nope' }, 503);
+      if (url.includes('api.test')) return jsonResponse({ entries: [], on_air: { dj_name: 'dj pipe dreams' } });
+      return jsonResponse({ status: 1 });
+    });
+
+    const result = await runSampler(configWith(), FIXED_NOW);
+
+    expect(result.event).toBe('stream_listener_sample_failed');
+    const properties = capturedProperties(spy);
+    expect(Object.keys(properties).sort()).toEqual(['$process_person_profile', 'environment', 'reason', 'source']);
   });
 });
 

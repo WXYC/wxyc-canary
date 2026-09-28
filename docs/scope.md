@@ -10,7 +10,7 @@
 
 - **It measures an audience, it does not assert liveness.** It records how many people are connected to the WXYC Icecast mounts so that number can be compared against broadcast ratings. A low number is a fact about the audience, not a fault.
 - **It owns no alarms and publishes no CloudWatch metrics.** Its only outputs are a PostHog event and a log line. It can never page, and an alarm suppression can never silence it.
-- **It retries; the canary does not.** The no-retry rule exists so a flaky retry can't mask a brownout. For a sampler the calculus inverts: a dropped read is a hole in a continuous time series, so the read is retried once. The PostHog write is never retried — a write that timed out may have landed, and a duplicate sample double-counts a quarter-hour.
+- **It retries; the canary does not.** The no-retry rule exists so a flaky retry can't mask a brownout. For a sampler the calculus inverts: a dropped read is a hole in a continuous time series, so the read is retried once. The PostHog write is never retried — a write that timed out may have landed, and a duplicate sample double-counts a quarter-hour. The flowsheet read that records who was on the air is not retried either, and it cannot fail the run: a failed read records `on_air_state: 'unknown'` and the sample is captured anyway, because attribution is secondary to the count it annotates.
 - **A paused schedule loses data.** `StreamSamplerState=DISABLED` is a real lever, but unlike skipping a probe, a skipped sample is unrecoverable.
 
 Why it lives here anyway: it reuses the SAM/deploy/test plumbing and runs in the same WXYC AWS account. It is a separate Lambda, separate schedule, separate log group.

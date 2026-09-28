@@ -442,9 +442,11 @@ Resources:
       # silently punch holes in the time series. Lambda bills GB-ms, so at 288
       # invocations/day of ~3.6s the extra headroom costs cents per year.
       MemorySize: 256
-      # Worst case is THREE HTTP calls, not two: the status read is retried
-      # once (8s + 8s) before the failure capture (8s), so 24s of client
-      # budget plus cold start and DNS. 30s left almost no margin, and
+      # Worst case is THREE sequential HTTP calls, not two: the status read is
+      # retried once (8s + 8s) before the failure capture (8s), so 24s of
+      # client budget plus cold start and DNS. The on-air flowsheet read
+      # (3s, never retried) runs concurrently with the status read, so it
+      # does not add to that. 30s left almost no margin, and
       # overrunning it produces a Lambda timeout. 45s keeps headroom while
       # still bounding the run — the sampler must not linger, since a late
       # sample is attributed to the wrong quarter-hour.

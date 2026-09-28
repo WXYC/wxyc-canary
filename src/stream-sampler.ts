@@ -62,6 +62,20 @@ export type StreamSample = {
   unparseableListenerCounts: number;
 };
 
+/**
+ * Who was on the air when the sample was taken, as Backend-Service's
+ * paginated `GET /flowsheet` reports it in `on_air`.
+ *
+ * - `dj`: a human is live. `djName` may be the `"WXYC"` station brand when the
+ *   open show's DJ handle does not resolve — still a live human, never
+ *   automation.
+ * - `automation`: `on_air` was explicitly `null`.
+ * - `unknown`: the field was absent (Backend-Service's banner query failed),
+ *   the read failed, or the shape drifted. `reason` says which, for the log
+ *   line only — it is not an event property.
+ */
+export type OnAir = { state: 'dj'; djName: string } | { state: 'automation' } | { state: 'unknown'; reason: string };
+
 export type CaptureEvent = {
   api_key: string;
   event: string;
@@ -182,6 +196,28 @@ export function sampleWxycMounts(
 }
 
 /**
+ * Maps a `GET /flowsheet?limit=1` body to the on-air state.
+ *
+ * The three documented shapes pass straight through. Anything else is
+ * contract drift and reads as `unknown`: an object without a usable name must
+ * not mint a DJ called "undefined", and a malformed field must not book live
+ * airtime as automation.
+ */
+export function parseOnAir(body: unknown): OnAir {
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+    return { state: 'unknown', reason: 'flowsheet body is not a JSON object' };
+  }
+  if (!('on_air' in body)) return { state: 'unknown', reason: 'on_air absent' };
+  const onAir = (body as { on_air: unknown }).on_air;
+  if (onAir === null) return { state: 'automation' };
+  if (typeof onAir === 'object' && !Array.isArray(onAir)) {
+    const djName = (onAir as { dj_name?: unknown }).dj_name;
+    if (typeof djName === 'string' && djName !== '') return { state: 'dj', djName };
+  }
+  return { state: 'unknown', reason: 'on_air malformed' };
+}
+
+/**
  * Shapes one PostHog capture event per sample.
  *
  * One summary event per tick — never one per mount — keeps the ingestion cost
@@ -190,7 +226,7 @@ export function sampleWxycMounts(
  * number depend on upstream config we do not control, which is the shape that
  * caused the 2026-08-04 org-wide quota cutoff.
  */
-export function buildCapturePayload(sample: StreamSample, context: PayloadContext): CaptureEvent {
+export function buildCapturePayload(sample: StreamSample, context: PayloadContext, onAir: OnAir): CaptureEvent {
   return {
     api_key: context.apiKey,
     event: SAMPLE_EVENT,
@@ -207,6 +243,10 @@ export function buildCapturePayload(sample: StreamSample, context: PayloadContex
       // names (`listeners_wxyc_mp3`), which would fragment the schema every
       // time a mount is renamed.
       mounts: sample.mounts,
+      // Flat, so station-wide per-DJ audience is a breakdown of
+      // `total_listeners` by `dj_name` rather than a separate pipeline.
+      on_air_state: onAir.state,
+      dj_name: onAir.state === 'dj' ? onAir.djName : undefined,
       environment: context.environment,
       source: 'icecast',
       // No person behind a server-side sampler; skip profile processing.
