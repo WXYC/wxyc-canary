@@ -109,7 +109,18 @@ Resources:
                     logs:TagResource,
                     logs:ListTagsForResource,
                   ]
-                Resource: !Sub arn:aws:logs:us-east-1:${AWS::AccountId}:log-group:/aws/lambda/wxyc-canary*:*
+                # Both ARN forms are needed. The legacy log-group APIs
+                # (CreateLogGroup, PutRetentionPolicy, ...) authorize against
+                # the `...:log-group:<name>:*` form; the tagging APIs
+                # (ListTagsForResource, TagResource) authorize against the
+                # bare `...:log-group:<name>` form, which the `:*` pattern does
+                # not match. CloudFormation calls ListTagsForResource on every
+                # AWS::Logs::LogGroup update, so without the bare form any
+                # change to the log group (e.g. RetentionInDays) fails and
+                # leaves the stack in UPDATE_ROLLBACK_FAILED.
+                Resource:
+                  - !Sub arn:aws:logs:us-east-1:${AWS::AccountId}:log-group:/aws/lambda/wxyc-canary*:*
+                  - !Sub arn:aws:logs:us-east-1:${AWS::AccountId}:log-group:/aws/lambda/wxyc-canary*
               - Sid: ExecRoleLifecycle # SAM-generated Lambda exec role: wxyc-canary-CanaryFunctionRole-*
                 Effect: Allow
                 Action:
