@@ -3531,6 +3531,26 @@ describe('template.yaml ↔ publishMetrics contract', () => {
       ).toContain(shape);
     }
   });
+
+  // EnableWriteProbe defaults to 'false' and is deliberately never turned on
+  // in prod (it would create ~288 public canary shows/day per CLAUDE.md), so
+  // EnrichmentLagSeconds never publishes. `TreatMissingData: notBreaching`
+  // (the wxyc-canary#13 convention) then means the alarm sits at OK forever
+  // rather than ever reaching ALARM — a permanently-vacuous "healthy" alarm
+  // is worse than no alarm, since it looks like coverage. Gate the resource
+  // on the same condition that gates the metric's only emitter so the alarm
+  // simply doesn't exist while the probe is off, instead of lying about it.
+  it('EnrichmentLagAlarm only exists when the write probe is enabled (Condition: HasWriteProbe)', () => {
+    const templatePath = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'template.yaml');
+    const text = readFileSync(templatePath, 'utf-8');
+    const doc = YAML.parse(text, { logLevel: 'silent' }) as {
+      Conditions?: Record<string, unknown>;
+      Resources?: Record<string, { Type?: string; Condition?: string }>;
+    };
+
+    expect(doc.Conditions?.HasWriteProbe).toBeDefined();
+    expect(doc.Resources?.EnrichmentLagAlarm?.Condition).toBe('HasWriteProbe');
+  });
 });
 
 /**
