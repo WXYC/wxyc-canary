@@ -498,6 +498,21 @@ const djRotation: Check = {
 };
 
 /**
+ * `GET /library/rotation/{rotation_id}/tracks` timeout budget for the
+ * picker probe. Deliberately NOT `canaryFetch`'s 8 s default: Backend's
+ * tier-3 LML tracklist resolution (`resolveRotationDiscogsReleaseViaLml`,
+ * `library.service.ts`) is bounded at 10 s per call (the
+ * `library-rotation-picker` class-2 policy override, BS#1826) — an 8 s
+ * client timeout races that bound and client-aborts a LEGITIMATE slow
+ * resolution before Backend ever answers, which throws (`CanaryFetchError`)
+ * and pages on a request that would have completed with a normal 200. Set
+ * to Backend's own bound plus headroom, and still comfortably under BS#994's
+ * 30 s cascade signature (this check's actual regression target — see the
+ * docstring below) so a real cascade regression still fails loudly.
+ */
+export const ROTATION_PICKER_TRACKS_TIMEOUT_MS = 12_000;
+
+/**
  * DJ-authenticated: the dj-site rotation picker. On selecting a rotation
  * row in the flowsheet entry UI, dj-site calls
  * `GET /library/rotation/{rotation_id}/tracks` to populate a track
@@ -509,7 +524,13 @@ const djRotation: Check = {
  * ~79% still depend on the runtime cascade — so this probe both pins the
  * JOIN path stays healthy and acts as a leading indicator for the
  * cascade-class regression that surfaced today via on-air Slack messages
- * rather than any monitor.
+ * rather than any monitor. As of Backend's current `resolveRotationPickerSource`
+ * (`library.service.ts`), a slow tier-3 call that errors or times out is
+ * CAUGHT and degrades the picker response to a plain `200 []` (free-text
+ * fallback for the DJ) rather than the controller "short-circuiting to
+ * 502" the original incident produced — so this probe's regression signal
+ * today is latency (a real cascade still burns the request's whole
+ * `canaryFetch` budget getting there), not necessarily a non-2xx status.
  *
  * The probe key is `rotation_id` (the rotation row's own PK, BS
  * `library.service.ts` `getRotationFromDB`'s `rotation.id AS rotation_id`),
@@ -521,16 +542,33 @@ const djRotation: Check = {
  * wrong id — the controller returns a benign 200 `[]` for a nonexistent
  * rotation id, so that shape would have been a false pass even when it ran.
  *
+ * Target-selection preference order (production-verified 2026-09-28 against
+ * the live `active` rotation query, read-only): prefer the first row that
+ * is catalog-linked (`id != null` — i.e. `library.id` is set), else fall
+ * back to the first row with a numeric `rotation_id` in list order.
+ * `discogs_release_id` — which would let the probe prefer a guaranteed
+ * tier-1 (fast, no-LML-call) row outright — is NOT a field `/library/rotation`
+ * exposes (verified against `getRotationFromDB`'s selected `columns`, BS
+ * `library.service.ts`), so that top preference from the original request
+ * isn't implementable without a Backend/API change; out of scope here.
+ * `id != null` is the best available proxy: `library_identity` (tier 2)
+ * can only match when `rotation.album_id` is set, which is exactly when
+ * `id` is non-null, so a linked row has two chances to resolve (direct +
+ * identity) where an unlinked row has one. Caveat, from that same prod
+ * query: only 1 of 128 active rows is currently linked, and that one row
+ * presently has NEITHER a direct nor an identity release id (so it would
+ * itself hit the tier-3 cascade) — the preference is a structural
+ * improvement in expectation, not a guarantee on any given day, which is
+ * why `ROTATION_PICKER_TRACKS_TIMEOUT_MS` above is the actual mitigation
+ * for the timeout-racing hazard, independent of which row gets picked.
+ *
  * Self-healing target: rather than hardcode a rotation id (which would
  * break when that row gets killed), the probe discovers a candidate from
  * the rotation list itself. Any 2xx + array response is a pass — the body
  * is allowed to be empty because a real release may have zero indexed
  * tracks (e.g., never cross-referenced with Discogs) — confirmed against
  * `resolveRotationPickerSource`, which legitimately returns `[]` when a
- * linked release has no cached tracklist. The 8 s per-fetch timeout in
- * `canaryFetch` is the regression signal: BS#994's cascade was a 30 s
- * timeout chain → 502, so anything that gets within shouting distance of
- * the budget produces a `fail`.
+ * linked release has no cached tracklist.
  */
 const djRotationPicker: Check = {
   name: 'dj-rotation-picker',
@@ -547,9 +585,9 @@ const djRotationPicker: Check = {
     if (!Array.isArray(list.body)) {
       throw new Error(`rotation list precondition: expected array body, got ${typeof list.body}`);
     }
-    const rows = list.body as { rotation_id?: number }[];
-    const first = rows.find((row) => typeof row.rotation_id === 'number');
-    if (!first) {
+    const rows = list.body as { id?: number | null; rotation_id?: number }[];
+    const candidates = rows.filter((row) => typeof row.rotation_id === 'number');
+    if (candidates.length === 0) {
       // The dj-rotation check above now alarms on a fully empty rotation;
       // this probe intentionally degrades to skipped so the picker signal
       // doesn't duplicate that one. A non-empty rotation with no numeric
@@ -560,8 +598,12 @@ const djRotationPicker: Check = {
         skipReason: 'rotation list has no row with a numeric rotation_id — no probe target available',
       };
     }
-    const tracks = await canaryFetch(`${ctx.backendUrl}/library/rotation/${first.rotation_id}/tracks`, {
+    // Preference order: see the docstring above. `id != null` (catalog-linked)
+    // first, else the first candidate in list order.
+    const target = candidates.find((row) => typeof row.id === 'number') ?? candidates[0]!;
+    const tracks = await canaryFetch(`${ctx.backendUrl}/library/rotation/${target.rotation_id}/tracks`, {
       headers: { Authorization: `Bearer ${auth.jwt}` },
+      timeoutMs: ROTATION_PICKER_TRACKS_TIMEOUT_MS,
     });
     if (!tracks.ok) {
       throw new Error(`expected 2xx, got ${tracks.status}: ${tracks.rawText.slice(0, 200)}`);

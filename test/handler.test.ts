@@ -482,6 +482,135 @@ describe('runCanary — failure surfaces (regression coverage for the 2026-04-30
     expect(trackFetches).toEqual([expect.stringContaining('/library/rotation/43244/tracks')]);
   });
 
+  it('probes rotation_id even when id is a different, non-null number (never falls back to id)', async () => {
+    const fetchMock = setUpFetchMock({
+      ...RECENT_ENTRIES_STUB,
+      '/healthcheck': { status: 200, body: { ok: true } },
+      '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+      '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
+      '/sign-in/email': { status: 200, body: { token: 'fake-session-token', user: { id: 'u1' } } },
+      '/token': { status: 200, body: { token: 'fake-jwt' } },
+      '/library/?artist_name=': { status: 200, body: stereolabSearchResults },
+      '/flowsheet': { status: 200, body: [] },
+      '/library/rotation/43244/tracks': { status: 200, body: [] },
+      // `id: 999` is deliberately numeric AND different from `rotation_id`
+      // — a `library.id` collision with some other row would be a coding
+      // error, but this pins that the probe never reads `id` for the URL
+      // even when it's present and numeric (this row happens to be linked,
+      // so the preference-order logic below also selects it first).
+      '/library/rotation': { status: 200, body: [{ id: 999, rotation_id: 43244 }] },
+      '/oauth2/authorize': AUTHORIZE_ECHO_STATE_STUB,
+    });
+
+    const outcomes = await runCanary({ ...baseConfig, djEmail: 'canary@wxyc.org', djPassword: 'pw' });
+    const picker = outcomes.find((o) => o.name === 'dj-rotation-picker')!;
+
+    expect(picker.status).toBe('pass');
+    const trackFetches = fetchMock.mock.calls
+      .map(([url]) => String(url))
+      .filter((url) => url.includes('/library/rotation/') && url.includes('/tracks'));
+    expect(trackFetches).toEqual([expect.stringContaining('/library/rotation/43244/tracks')]);
+    expect(trackFetches[0]).not.toContain('/library/rotation/999/tracks');
+  });
+
+  it('skips rows with no numeric rotation_id and probes the first later row that has one', async () => {
+    const fetchMock = setUpFetchMock({
+      ...RECENT_ENTRIES_STUB,
+      '/healthcheck': { status: 200, body: { ok: true } },
+      '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+      '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
+      '/sign-in/email': { status: 200, body: { token: 'fake-session-token', user: { id: 'u1' } } },
+      '/token': { status: 200, body: { token: 'fake-jwt' } },
+      '/library/?artist_name=': { status: 200, body: stereolabSearchResults },
+      '/flowsheet': { status: 200, body: [] },
+      '/library/rotation/55001/tracks': { status: 200, body: [] },
+      '/library/rotation': {
+        status: 200,
+        // First row is malformed (no rotation_id at all — shouldn't happen
+        // in practice since it's the table's PK, but the probe must not
+        // crash or pick it); the second row is a normal candidate.
+        body: [{ id: null }, { id: null, rotation_id: 55001 }],
+      },
+      '/oauth2/authorize': AUTHORIZE_ECHO_STATE_STUB,
+    });
+
+    const outcomes = await runCanary({ ...baseConfig, djEmail: 'canary@wxyc.org', djPassword: 'pw' });
+    const picker = outcomes.find((o) => o.name === 'dj-rotation-picker')!;
+
+    expect(picker.status).toBe('pass');
+    const trackFetches = fetchMock.mock.calls
+      .map(([url]) => String(url))
+      .filter((url) => url.includes('/library/rotation/') && url.includes('/tracks'));
+    expect(trackFetches).toEqual([expect.stringContaining('/library/rotation/55001/tracks')]);
+  });
+
+  it('prefers a catalog-linked row (id != null) over an earlier unlinked candidate', async () => {
+    const fetchMock = setUpFetchMock({
+      ...RECENT_ENTRIES_STUB,
+      '/healthcheck': { status: 200, body: { ok: true } },
+      '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+      '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
+      '/sign-in/email': { status: 200, body: { token: 'fake-session-token', user: { id: 'u1' } } },
+      '/token': { status: 200, body: { token: 'fake-jwt' } },
+      '/library/?artist_name=': { status: 200, body: stereolabSearchResults },
+      '/flowsheet': { status: 200, body: [] },
+      '/library/rotation/70475/tracks': { status: 200, body: [] },
+      '/library/rotation/43244/tracks': { status: 200, body: [] },
+      '/library/rotation': {
+        status: 200,
+        // The unlinked row comes first in list order (as most active rows
+        // do — 127 of 128 in prod), but the linked row later in the list
+        // should still win the preference.
+        body: [
+          { id: null, rotation_id: 43244 },
+          { id: 70475, rotation_id: 21538 },
+        ],
+      },
+      '/oauth2/authorize': AUTHORIZE_ECHO_STATE_STUB,
+    });
+
+    const outcomes = await runCanary({ ...baseConfig, djEmail: 'canary@wxyc.org', djPassword: 'pw' });
+    const picker = outcomes.find((o) => o.name === 'dj-rotation-picker')!;
+
+    expect(picker.status).toBe('pass');
+    const trackFetches = fetchMock.mock.calls
+      .map(([url]) => String(url))
+      .filter((url) => url.includes('/library/rotation/') && url.includes('/tracks'));
+    expect(trackFetches).toEqual([expect.stringContaining('/library/rotation/21538/tracks')]);
+  });
+
+  it('falls back to the first candidate in list order when no row is catalog-linked', async () => {
+    const fetchMock = setUpFetchMock({
+      ...RECENT_ENTRIES_STUB,
+      '/healthcheck': { status: 200, body: { ok: true } },
+      '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+      '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
+      '/sign-in/email': { status: 200, body: { token: 'fake-session-token', user: { id: 'u1' } } },
+      '/token': { status: 200, body: { token: 'fake-jwt' } },
+      '/library/?artist_name=': { status: 200, body: stereolabSearchResults },
+      '/flowsheet': { status: 200, body: [] },
+      '/library/rotation/43244/tracks': { status: 200, body: [] },
+      '/library/rotation/43277/tracks': { status: 200, body: [] },
+      '/library/rotation': {
+        status: 200,
+        body: [
+          { id: null, rotation_id: 43244 },
+          { id: null, rotation_id: 43277 },
+        ],
+      },
+      '/oauth2/authorize': AUTHORIZE_ECHO_STATE_STUB,
+    });
+
+    const outcomes = await runCanary({ ...baseConfig, djEmail: 'canary@wxyc.org', djPassword: 'pw' });
+    const picker = outcomes.find((o) => o.name === 'dj-rotation-picker')!;
+
+    expect(picker.status).toBe('pass');
+    const trackFetches = fetchMock.mock.calls
+      .map(([url]) => String(url))
+      .filter((url) => url.includes('/library/rotation/') && url.includes('/tracks'));
+    expect(trackFetches).toEqual([expect.stringContaining('/library/rotation/43244/tracks')]);
+  });
+
   it('skips the picker probe when the rotation list is empty (cannot synthesize a probe target)', async () => {
     setUpFetchMock({
       ...RECENT_ENTRIES_STUB,

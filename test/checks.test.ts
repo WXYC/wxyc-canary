@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { checks, checksForSuite, RECENT_ENTRIES_TIMEOUT_MS, VALID_SUITES } from '../src/checks.js';
+import {
+  checks,
+  checksForSuite,
+  RECENT_ENTRIES_TIMEOUT_MS,
+  ROTATION_PICKER_TRACKS_TIMEOUT_MS,
+  VALID_SUITES,
+} from '../src/checks.js';
 
 describe('checksForSuite', () => {
   it('returns the BS+LML smoke set in the expected order', () => {
@@ -74,6 +80,25 @@ describe('RECENT_ENTRIES_TIMEOUT_MS', () => {
     // `readTimeout` restarts per successful read); see the docstring for why
     // the canary is deliberately stricter than any real client.
     expect(RECENT_ENTRIES_TIMEOUT_MS).toBe(10_000);
+  });
+});
+
+describe('ROTATION_PICKER_TRACKS_TIMEOUT_MS', () => {
+  it('stays above Backend LML tier-3 bound (10s) and below the BS#994 cascade signature (30s)', () => {
+    // Value pin, same rationale as RECENT_ENTRIES_TIMEOUT_MS above: the
+    // docstring on the constant, this test, and the prod-verified rationale
+    // in the checks.ts docstring above djRotationPicker all cite this
+    // number's provenance — a silent edit here should fail loudly.
+    //
+    // Source: Backend's `resolveRotationDiscogsReleaseViaLml`
+    // (`library.service.ts`) bounds its LML tier-3 tracklist lookup at 10s
+    // (the `library-rotation-picker` class-2 policy override, BS#1826).
+    // `canaryFetch`'s 8s default races that bound and client-aborts a
+    // legitimate slow resolution before Backend answers. 12s clears the 10s
+    // bound with headroom while staying well under BS#994's 30s
+    // timeout-chain-to-502 cascade signature, so a genuine cascade
+    // regression still fails this check.
+    expect(ROTATION_PICKER_TRACKS_TIMEOUT_MS).toBe(12_000);
   });
 });
 
