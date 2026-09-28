@@ -542,25 +542,26 @@ export const ROTATION_PICKER_TRACKS_TIMEOUT_MS = 12_000;
  * wrong id — the controller returns a benign 200 `[]` for a nonexistent
  * rotation id, so that shape would have been a false pass even when it ran.
  *
- * Target-selection preference order (production-verified 2026-09-28 against
- * the live `active` rotation query, read-only): prefer the first row that
- * is catalog-linked (`id != null` — i.e. `library.id` is set), else fall
- * back to the first row with a numeric `rotation_id` in list order.
- * `discogs_release_id` — which would let the probe prefer a guaranteed
- * tier-1 (fast, no-LML-call) row outright — is NOT a field `/library/rotation`
- * exposes (verified against `getRotationFromDB`'s selected `columns`, BS
- * `library.service.ts`), so that top preference from the original request
- * isn't implementable without a Backend/API change; out of scope here.
- * `id != null` is the best available proxy: `library_identity` (tier 2)
- * can only match when `rotation.album_id` is set, which is exactly when
- * `id` is non-null, so a linked row has two chances to resolve (direct +
- * identity) where an unlinked row has one. Caveat, from that same prod
- * query: only 1 of 128 active rows is currently linked, and that one row
- * presently has NEITHER a direct nor an identity release id (so it would
- * itself hit the tier-3 cascade) — the preference is a structural
- * improvement in expectation, not a guarantee on any given day, which is
- * why `ROTATION_PICKER_TRACKS_TIMEOUT_MS` above is the actual mitigation
- * for the timeout-racing hazard, independent of which row gets picked.
+ * Target selection is deliberately the plain first candidate in list order
+ * — NOT a catalog-linked (`id != null`) preference. That was tried and
+ * reverted: `discogs_release_id`, which would let the probe prefer a
+ * guaranteed tier-1 (fast, no-LML-call) row outright, is NOT a field
+ * `/library/rotation` exposes (verified against `getRotationFromDB`'s
+ * selected `columns`, BS `library.service.ts`), so there's no way to
+ * detect fast-path eligibility from the list response at all.
+ * Catalog-linked (`id != null`) looks like the next-best proxy — tier 2
+ * (`library_identity`) can only match when linked — but production-verified
+ * 2026-09-28 against the live `active` rotation query, it ISN'T one on this
+ * data: only 1 of 128 active rows is currently linked, and that one row has
+ * NEITHER a direct nor an identity release id, with its negative-cache
+ * stamp 39+ days past the 7-day window — so preferring it would pin the
+ * probe onto the one row most likely to force a ~10 s tier-3 LML lookup
+ * every single tick, silently absorbed by the 12 s timeout below with no
+ * failure signal (Backend doesn't record anything on that path either —
+ * WXYC/Backend-Service#2731). A preference with no coverage benefit but a
+ * real cost (steady LML traffic with no monitoring value) is worse than no
+ * preference. What's actually implemented below is the plain first
+ * candidate, unconditionally.
  *
  * Self-healing target: rather than hardcode a rotation id (which would
  * break when that row gets killed), the probe discovers a candidate from
@@ -585,7 +586,7 @@ const djRotationPicker: Check = {
     if (!Array.isArray(list.body)) {
       throw new Error(`rotation list precondition: expected array body, got ${typeof list.body}`);
     }
-    const rows = list.body as { id?: number | null; rotation_id?: number }[];
+    const rows = list.body as { rotation_id?: number }[];
     const candidates = rows.filter((row) => typeof row.rotation_id === 'number');
     if (candidates.length === 0) {
       // The dj-rotation check above now alarms on a fully empty rotation;
@@ -598,9 +599,9 @@ const djRotationPicker: Check = {
         skipReason: 'rotation list has no row with a numeric rotation_id — no probe target available',
       };
     }
-    // Preference order: see the docstring above. `id != null` (catalog-linked)
-    // first, else the first candidate in list order.
-    const target = candidates.find((row) => typeof row.id === 'number') ?? candidates[0]!;
+    // First candidate in list order — see the docstring above for why a
+    // catalog-linked preference was tried and reverted.
+    const target = candidates[0]!;
     const tracks = await canaryFetch(`${ctx.backendUrl}/library/rotation/${target.rotation_id}/tracks`, {
       headers: { Authorization: `Bearer ${auth.jwt}` },
       timeoutMs: ROTATION_PICKER_TRACKS_TIMEOUT_MS,
