@@ -39,12 +39,20 @@ const latencyAlarmedByName = new Set<string>(checks.filter((c) => c.latencyAlarm
  * `Check=<name>` copy has no reader (wxyc-canary#78 cardinality trim).
  * `DiscogsBreakerShedding` + `DiscogsLiveRequestsTotal` feed
  * `wxyc-canary-lml-discogs-breaker-shed`'s metric-math expression;
- * `LookupDegraded` feeds `wxyc-canary-lml-enrichment-degraded`. A metric NOT
- * in this set still follows the default emit-twice convention (e.g.
- * `EnrichmentLagSeconds`, whose dimensioned copy has independent dashboard
- * value).
+ * `LookupDegraded` feeds `wxyc-canary-lml-enrichment-degraded`;
+ * `EnrichmentLagSeconds` feeds `wxyc-canary-enrichment-lag`. This repo has no
+ * CloudWatch dashboards, so "the dimensioned copy has independent dashboard
+ * value" is never true for any metric here — every custom metric with an
+ * alarm belongs in this set unless a future dashboard actually reads the
+ * dimensioned copy, at which point that specific metric (and only that one)
+ * should be pulled back out with a comment saying which dashboard.
  */
-const DIMENSIONLESS_ONLY_METRICS = new Set(['DiscogsBreakerShedding', 'DiscogsLiveRequestsTotal', 'LookupDegraded']);
+const DIMENSIONLESS_ONLY_METRICS = new Set([
+  'DiscogsBreakerShedding',
+  'DiscogsLiveRequestsTotal',
+  'LookupDegraded',
+  'EnrichmentLagSeconds',
+]);
 
 /**
  * Custom check metrics that are dashboard-trend-only with no CloudWatch
