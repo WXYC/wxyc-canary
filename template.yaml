@@ -296,6 +296,7 @@ Conditions:
     - !Not [!Equals [!Ref GitHubTokenSsmParamName, '']]
     - !Not [!Equals [!Ref GitHubIssuesRepo, '']]
   HasLegacyPlaylistProbe: !Equals [!Ref EnableLegacyPlaylistProbe, 'true']
+  HasWriteProbe: !Equals [!Ref EnableWriteProbe, 'true']
   HasGhaRunnerProbe: !And
     - !Not [!Equals [!Ref GhaRunnerTokenSsmParamName, '']]
     # !Ref on a Number parameter returns the value as a string ("0"), so the
@@ -583,11 +584,22 @@ Resources:
   #   - 3 evaluation periods at 5 min cadence = the alarm needs sustained
   #     breach (15 min) before firing, which clears small Discogs-side
   #     latency spikes without delaying the on-air paging window.
-  #   - `notBreaching` on missing data: when `EnableWriteProbe=false` the
-  #     metric is simply absent, and the alarm must sit at OK — wxyc-canary#13
-  #     pinned the "no data → no firing" failure mode the other way.
+  #   - `notBreaching` on missing data covers a transient gap while the
+  #     probe IS enabled — e.g. `enrichment-quality` skipping a tick because
+  #     another DJ is on-air — not the steady-state absence below.
+  #   - `Condition: HasWriteProbe` (not just `notBreaching`): `EnableWriteProbe`
+  #     defaults to 'false' and CLAUDE.md records it as deliberately never
+  #     enabled in prod (it would create ~288 public canary shows/day), so
+  #     without this condition the metric would NEVER publish and
+  #     `notBreaching` would park the alarm at OK permanently — indistinguishable
+  #     from a healthy, actively-monitored SLO. Gating the resource itself
+  #     means the alarm simply doesn't exist while the probe is off, rather
+  #     than existing and silently lying about coverage (the wxyc-canary#103
+  #     shape, generalized: `notBreaching` makes "never published" and
+  #     "healthy" the same color).
   EnrichmentLagAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HasWriteProbe
     Properties:
       AlarmName: wxyc-canary-enrichment-lag
       AlarmDescription: WXYC canary sentinel row exceeded the enrichment lag SLO.
