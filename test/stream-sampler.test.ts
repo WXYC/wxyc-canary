@@ -182,6 +182,12 @@ describe('parseOnAir', () => {
     expect(onAir.state === 'dj' ? onAir.djName : undefined).toBe(djName);
   });
 
+  it('trims a handle so formatting drift cannot split one DJ into two rows', () => {
+    // Backend-Service trims on one resolution path but not the show-member
+    // path, so a trailing space would otherwise open a second breakdown row.
+    expect(parseOnAir({ on_air: { dj_name: ' dj pipe dreams ' } })).toEqual({ state: 'dj', djName: 'dj pipe dreams' });
+  });
+
   it('keeps the "WXYC" station brand as a live DJ, not automation', () => {
     // Backend-Service reports the brand when an open show's DJ handle does
     // not resolve. That is a human on the air; folding it into automation
@@ -196,6 +202,7 @@ describe('parseOnAir', () => {
     ['an array body', []],
     ['an on_air object without a name', { on_air: {} }],
     ['an on_air object with an empty name', { on_air: { dj_name: '' } }],
+    ['an on_air object with a whitespace-only name', { on_air: { dj_name: '   ' } }],
     ['an on_air object with a non-string name', { on_air: { dj_name: 42 } }],
     ['an on_air string', { on_air: 'dj pipe dreams' }],
     ['an on_air array', { on_air: [{ dj_name: 'dj pipe dreams' }] }],

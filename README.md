@@ -452,7 +452,7 @@ Two analysis rules worth stating up front:
 
 Note that the apps (iOS, Android, Alexa) and the web player all pull these same mounts, so `total_listeners` is the _whole_ online audience, not just the website's.
 
-**Per-DJ audience** is a breakdown of the same number: `avg(total_listeners)` by `dj_name` is each DJ's average concurrent online audience, and `sum(total_listeners) * 5 / 60` is their listener-hours. `on_air_state` says how to read a sample:
+**Per-DJ audience** is a breakdown of the same number: `avg(total_listeners)` by `dj_name` is the average concurrent online audience per DJ handle, and `sum(total_listeners) * 5 / 60` is the listener-hours. `on_air_state` says how to read a sample:
 
 | `on_air_state` | Meaning                                                                                                                                                                      |
 | -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -462,14 +462,18 @@ Note that the apps (iOS, Android, Alexa) and the web player all pull these same 
 
 Attribution has five-minute resolution, so a show's first and last samples can straddle a handover. It also inherits Backend-Service's notion of an open show: a DJ whose show is never closed stays `dj` until the next show opens, so a missed sign-off credits the automation hours that follow to the departed DJ. Backend-Service detects such shows daily but does not close them (WXYC/Backend-Service#2065). Treat a single show running far past its slot as that, not as a marathon.
 
+`dj_name` is the handle as Backend-Service reports it, not a stable identity. A DJ who changes handle splits across two rows, and `WXYC` pools every live show whose handle did not resolve, so read it as "unattributed live airtime", not as one DJ. Separately, if the canary's write probe is ever enabled (`EnableWriteProbe=true`; off in production), it opens a short synthetic show only when no DJ is on the air, and a sample landing inside it records the canary's DJ account as `dj`.
+
 ### Operating
 
-| Lever                              | Effect                                                                                                |
-| ---------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| `StreamSamplerState=DISABLED`      | Pauses the schedule. **This loses data** — unlike a skipped probe, a skipped sample is unrecoverable. |
-| `StreamSamplerSchedule`            | Cadence. 5 minutes = 288 events/day. Raising the frequency is a billing decision (see below).         |
-| `StreamSamplerPostHogApiKey` empty | Sampler runs and logs but does not capture. The intended posture for a first deploy.                  |
-| `SAMPLER_CAPTURE_ENABLED=false`    | Same dry-run effect, for local runs.                                                                  |
+| Lever                              | Effect                                                                                                                                                                        |
+| ---------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `StreamSamplerState=DISABLED`      | Pauses the schedule. **This loses data** — unlike a skipped probe, a skipped sample is unrecoverable.                                                                         |
+| `StreamSamplerSchedule`            | Cadence. 5 minutes = 288 events/day. Raising the frequency is a billing decision (see below).                                                                                 |
+| `StreamSamplerPostHogApiKey` empty | Sampler runs and logs but does not capture. The intended posture for a first deploy.                                                                                          |
+| `SAMPLER_CAPTURE_ENABLED=false`    | Same dry-run effect, for local runs.                                                                                                                                          |
+| `SAMPLER_ON_AIR_TIMEOUT_MS`        | Budget for the on-air flowsheet read (default 3000). Capped at one Icecast attempt (`SAMPLER_TIMEOUT_MS`) so it cannot push the run past the Lambda timeout.                  |
+| `SAMPLER_ON_AIR_URL`               | Where the on-air state is read (default `https://api.wxyc.org/flowsheet?limit=1`). Keep `limit`, not `n`, and the paginated branch: it is the only one that carries `on_air`. |
 
 Dry-run locally without writing to PostHog:
 
