@@ -291,17 +291,34 @@ describe('runSampler — on-air attribution', () => {
   }
 
   it('records the live DJ on the sample', async () => {
-    const spy = stubFetch(async () => jsonResponse({ entries: [], on_air: { dj_name: 'dj pipe dreams' } }));
+    const spy = stubFetch(async () =>
+      jsonResponse({
+        entries: [{ add_time: '2026-08-20T03:31:12.500Z' }],
+        on_air: { dj_name: 'dj pipe dreams' },
+      })
+    );
 
     const result = await runSampler(configWith(), FIXED_NOW);
 
     expect(result.onAirState).toBe('dj');
     expect(result.djName).toBe('dj pipe dreams');
+    expect(result.latestEntryAt).toBe('2026-08-20 03:31:12');
     expect(capturedProperties(spy)).toMatchObject({
       total_listeners: 28,
       on_air_state: 'dj',
       dj_name: 'dj pipe dreams',
+      latest_entry_at: '2026-08-20 03:31:12',
     });
+  });
+
+  it('keeps the entry time when the on_air field itself is missing', async () => {
+    // The two are independent: Backend-Service omits on_air when its own
+    // lookup fails, but the entry it returned is still a real observation.
+    const spy = stubFetch(async () => jsonResponse({ entries: [{ add_time: '2026-08-20T03:31:12.500Z' }] }));
+
+    await runSampler(configWith(), FIXED_NOW);
+
+    expect(capturedProperties(spy)).toMatchObject({ on_air_state: 'unknown', latest_entry_at: '2026-08-20 03:31:12' });
   });
 
   it('records automation with no DJ name', async () => {
