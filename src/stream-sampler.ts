@@ -221,6 +221,27 @@ export function parseOnAir(body: unknown): OnAir {
 }
 
 /**
+ * Reads when the newest flowsheet entry was logged, from the one entry a
+ * `GET /flowsheet?limit=1` returns.
+ *
+ * Recorded so a query can catch a show that was never closed: Backend-Service
+ * keeps naming a DJ in `on_air` until the next show opens, so a `dj` sample
+ * whose newest entry is hours old is a missed sign-off rather than a live DJ.
+ * Formatted `YYYY-MM-DD HH:MM:SS` UTC because HogQL's `toDateTime` inside an
+ * aggregate rejects fractional seconds and a `Z`. Anything unexpected yields
+ * `undefined` — an invented time would be worse than none.
+ */
+export function parseLatestEntryAt(body: unknown): string | undefined {
+  const entries = (body as { entries?: unknown } | null)?.entries;
+  if (!Array.isArray(entries)) return undefined;
+  const addTime = (entries[0] as { add_time?: unknown } | undefined)?.add_time;
+  if (typeof addTime !== 'string') return undefined;
+  const parsed = new Date(addTime);
+  if (Number.isNaN(parsed.getTime())) return undefined;
+  return parsed.toISOString().slice(0, 19).replace('T', ' ');
+}
+
+/**
  * Shapes one PostHog capture event per sample.
  *
  * One summary event per tick — never one per mount — keeps the ingestion cost
@@ -229,7 +250,12 @@ export function parseOnAir(body: unknown): OnAir {
  * number depend on upstream config we do not control, which is the shape that
  * caused the 2026-08-04 org-wide quota cutoff.
  */
-export function buildCapturePayload(sample: StreamSample, context: PayloadContext, onAir: OnAir): CaptureEvent {
+export function buildCapturePayload(
+  sample: StreamSample,
+  context: PayloadContext,
+  onAir: OnAir,
+  latestEntryAt: string | undefined
+): CaptureEvent {
   return {
     api_key: context.apiKey,
     event: SAMPLE_EVENT,
@@ -250,6 +276,7 @@ export function buildCapturePayload(sample: StreamSample, context: PayloadContex
       // `total_listeners` by `dj_name` rather than a separate pipeline.
       on_air_state: onAir.state,
       dj_name: onAir.state === 'dj' ? onAir.djName : undefined,
+      latest_entry_at: latestEntryAt,
       environment: context.environment,
       source: 'icecast',
       // No person behind a server-side sampler; skip profile processing.
