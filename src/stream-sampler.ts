@@ -211,8 +211,11 @@ export function parseOnAir(body: unknown): OnAir {
   const onAir = (body as { on_air: unknown }).on_air;
   if (onAir === null) return { state: 'automation' };
   if (typeof onAir === 'object' && !Array.isArray(onAir)) {
+    // Trimmed because Backend-Service trims only one of its two resolution
+    // paths; a stray space would otherwise split one DJ into two rows.
     const djName = (onAir as { dj_name?: unknown }).dj_name;
-    if (typeof djName === 'string' && djName !== '') return { state: 'dj', djName };
+    const trimmed = typeof djName === 'string' ? djName.trim() : '';
+    if (trimmed !== '') return { state: 'dj', djName: trimmed };
   }
   return { state: 'unknown', reason: 'on_air malformed' };
 }

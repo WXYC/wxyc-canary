@@ -79,6 +79,7 @@ function numberFromEnv(raw: string | undefined, fallback: number): number {
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): SamplerConfig {
+  const timeoutMs = numberFromEnv(env.SAMPLER_TIMEOUT_MS, 8000);
   return {
     statusUrl: env.SAMPLER_ICECAST_STATUS_URL ?? 'https://audio-mp3.ibiblio.org/status-json.xsl',
     posthogHost: env.SAMPLER_POSTHOG_HOST ?? 'https://us.i.posthog.com',
@@ -89,7 +90,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): SamplerConfig 
     environment: env.SAMPLER_ENVIRONMENT ?? 'production',
     mountPrefix: env.SAMPLER_MOUNT_PREFIX ?? 'wxyc',
     primaryMount: env.SAMPLER_PRIMARY_MOUNT ?? 'wxyc.mp3',
-    timeoutMs: numberFromEnv(env.SAMPLER_TIMEOUT_MS, 8000),
+    timeoutMs,
     // Dry-run lever for local runs: parse and log without writing to PostHog.
     captureEnabled: env.SAMPLER_CAPTURE_ENABLED !== 'false',
     familyAttemptTimeoutMs: numberFromEnv(env.SAMPLER_FAMILY_ATTEMPT_TIMEOUT_MS, 3000),
@@ -97,7 +98,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): SamplerConfig 
     // `limit`, not `n`: the flowsheet silently ignores `n` and returns 30
     // entries. Only this paginated branch carries `on_air`.
     onAirUrl: env.SAMPLER_ON_AIR_URL ?? 'https://api.wxyc.org/flowsheet?limit=1',
-    onAirTimeoutMs: numberFromEnv(env.SAMPLER_ON_AIR_TIMEOUT_MS, 3000),
+    // Capped at one status attempt. When Icecast fails fast the failure path
+    // waits out this read before capturing, so an uncapped value could push
+    // the run past the Lambda timeout, which kills it before it logs.
+    onAirTimeoutMs: Math.min(numberFromEnv(env.SAMPLER_ON_AIR_TIMEOUT_MS, 3000), timeoutMs),
   };
 }
 
@@ -134,8 +138,10 @@ async function fetchStatus(config: SamplerConfig) {
  * The listener count is the job's whole purpose and a skipped sample is
  * unrecoverable, so this is the one read that may not fail the run: every
  * failure degrades to `unknown` and the sample is captured regardless. It is
- * not retried, and its timeout is shorter than one Icecast attempt, so running
- * it alongside the status read can never delay the sample.
+ * not retried and runs alongside the status read, so it can hold the capture
+ * back by at most its own budget — which `loadConfig` caps at one status
+ * attempt, keeping the run inside the Lambda timeout. The sample's timestamp
+ * is taken before either read, so a late capture still lands in its slot.
  */
 async function readOnAir(config: SamplerConfig): Promise<OnAir> {
   try {

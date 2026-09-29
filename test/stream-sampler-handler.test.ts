@@ -70,12 +70,22 @@ describe('loadConfig', () => {
   });
 
   it('gives the on-air read a budget well inside the status read', () => {
-    // The two reads run concurrently, so as long as the flowsheet budget is
-    // shorter than one Icecast attempt it can never delay the sample.
     const config = loadConfig({});
     expect(config.onAirTimeoutMs).toBe(3000);
     expect(config.onAirTimeoutMs).toBeLessThan(config.timeoutMs);
     expect(loadConfig({ SAMPLER_ON_AIR_TIMEOUT_MS: 'soon' }).onAirTimeoutMs).toBe(3000);
+  });
+
+  it.each<[string, Record<string, string>, number]>([
+    ['the default status budget', { SAMPLER_ON_AIR_TIMEOUT_MS: '40000' }, 8000],
+    ['a tuned status budget', { SAMPLER_ON_AIR_TIMEOUT_MS: '40000', SAMPLER_TIMEOUT_MS: '5000' }, 5000],
+  ])('caps the on-air budget at one status attempt, against %s', (_label, env, expected) => {
+    // When Icecast fails fast, the failure path waits out the on-air read
+    // before its own capture. An uncapped 40s budget there overruns the 45s
+    // Lambda timeout, and the killed invocation leaves neither an event nor a
+    // log line. Capped at one status attempt, the worst case stays at the
+    // retried read plus the capture that the Lambda timeout is sized for.
+    expect(loadConfig(env).onAirTimeoutMs).toBe(expected);
   });
 
   it('treats a blank api key as capture-disabled rather than substituting a default', () => {
@@ -327,7 +337,11 @@ describe('runSampler — on-air attribution', () => {
         }),
       /timed out after 20ms/,
     ],
-    ['returns malformed JSON', async () => new Response('<html>Bad Gateway</html>', { status: 200 }), /.+/],
+    [
+      'returns malformed JSON',
+      async () => new Response('<html>Bad Gateway</html>', { status: 200 }),
+      /not a JSON object/,
+    ],
     ['returns a non-2xx', async () => jsonResponse({ error: 'down' }, 503), /503/],
   ])('still captures the sample when the flowsheet read %s', async (_label, flowsheet, reason) => {
     const spy = stubFetch(flowsheet);
