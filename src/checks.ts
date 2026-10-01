@@ -893,6 +893,31 @@ const ENRICHMENT_LOOKUP_BODY = JSON.stringify({
  *     unexplained miss on a fixture that should always resolve — a hard
  *     fail, matching `dj-library-search`'s "expected at least 1 hit"
  *     precedent for the same reasoning.
+ *   - A 2xx response with non-empty `results` but `search_type: "fallback"`
+ *     and neither flag set is ALSO a hard fail (wxyc-canary#122). LML
+ *     library-metadata-lookup#1404 added a shelf fallback: when a response
+ *     would otherwise be empty, an album was typed, and the fixture artist
+ *     is shelved, LML returns the artist's shelf as display-only rows
+ *     (`search_type: "fallback"`, no `artwork`) instead of an empty array.
+ *     Juana Molina is shelved, so a real matching regression on this
+ *     fixture no longer shows up as `results.length === 0` — it shows up
+ *     as her shelf, and row count alone can't tell the two apart. The
+ *     canary sends no `X-Caller-Class` header on this request, so LML
+ *     treats it as normal priority and the fallback applies (LML skips it
+ *     only for the low-priority class-5 lane) — do not add that header to
+ *     route around this; the whole point is to observe what a normal
+ *     DJ-facing caller gets back. This does NOT also assert that
+ *     `results[0].artwork` is present or `release_id > 0`: LML does not
+ *     flag an ordinary Discogs-side miss (not on Discogs, or the Discogs
+ *     API call itself failed) as `degraded`, so an artwork assertion would
+ *     page this canary on routine Discogs flakiness rather than on a
+ *     matching regression. A missing or non-string `search_type` (an
+ *     older or malformed response shape) is treated as "not fallback" —
+ *     this assertion only ever gets stricter in the fallback direction. A
+ *     response that is already shedding (`degraded`/`timeout`) keeps its
+ *     existing soft-signal behavior even when it also carries
+ *     `search_type: "fallback"` — the fallback-specific hard fail only
+ *     applies when LML isn't already shedding.
  *
  * Skips when no LML_API_KEY is configured (operator gap, mirrors lml-auth).
  */
@@ -923,7 +948,12 @@ const lmlEnrichmentLookup: Check = {
     if (!r.ok) {
       throw new Error(`expected 2xx, got ${r.status}: ${r.rawText.slice(0, 200)}`);
     }
-    const body = r.body as { results?: unknown; degraded?: unknown; timeout?: unknown };
+    const body = r.body as {
+      results?: unknown;
+      degraded?: unknown;
+      timeout?: unknown;
+      search_type?: unknown;
+    };
     if (!body || typeof body !== 'object' || !Array.isArray(body.results)) {
       throw new Error(`expected {results: [...]}, got: ${r.rawText.slice(0, 200)}`);
     }
@@ -931,6 +961,11 @@ const lmlEnrichmentLookup: Check = {
     if (body.results.length === 0 && !shedding) {
       throw new Error(
         `expected at least 1 match for the canonical fixture, got 0 (degraded=false, timeout=false) — enrichment/matching regression: ${r.rawText.slice(0, 200)}`
+      );
+    }
+    if (!shedding && body.search_type === 'fallback') {
+      throw new Error(
+        `canonical fixture resolved only to shelf-fallback rows (search_type="fallback"), not a real match — enrichment/matching regression: ${r.rawText.slice(0, 200)}`
       );
     }
     return { metrics: { LookupDegraded: shedding ? 1 : 0 } };

@@ -1449,6 +1449,103 @@ describe('runCanary — lml-protected-search + lml-enrichment-lookup (BS#1819 is
       expect(lookup.message).toMatch(/expected at least 1 match/);
     });
 
+    // wxyc-canary#122: library-metadata-lookup#1404 added a shelf fallback —
+    // when a response would otherwise be empty, an album was typed, and the
+    // fixture artist (Juana Molina) is shelved, LML now returns her shelf as
+    // display-only rows (`search_type: "fallback"`, no `artwork`) instead of
+    // an empty array. `results.length > 0` alone can no longer distinguish a
+    // real match from a shelf hand-back, so a matching regression on this
+    // fixture must still fail even though `results` is non-empty.
+    it('fails (hard) when LML returns shelf-fallback rows instead of a real match (wxyc-canary#122)', async () => {
+      setUpFetchMock({
+        ...RECENT_ENTRIES_STUB,
+        '/healthcheck': { status: 200, body: { ok: true } },
+        '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+        '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
+        'lml.example.test/api/v1/lookup': {
+          status: 200,
+          body: {
+            results: [{ library_item: { title: 'Segundo' } }, { library_item: { title: 'Tres Cosas' } }],
+            search_type: 'fallback',
+            degraded: false,
+            timeout: false,
+          },
+        },
+      });
+
+      const outcomes = await runCanary(lmlIsolationConfig);
+      const lookup = outcomes.find((o) => o.name === 'lml-enrichment-lookup')!;
+
+      expect(lookup.status).toBe('fail');
+      expect(lookup.message).toMatch(/matching regression/);
+      expect(lookup.message).toMatch(/fallback/);
+    });
+
+    it('passes on the healthy production shape: search_type "direct" with an artwork-bearing DOGA row', async () => {
+      setUpFetchMock({
+        ...RECENT_ENTRIES_STUB,
+        '/healthcheck': { status: 200, body: { ok: true } },
+        '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+        '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
+        'lml.example.test/api/v1/lookup': {
+          status: 200,
+          body: {
+            results: [{ library_item: { title: 'DOGA' }, artwork: { release_id: 35580385 } }],
+            search_type: 'direct',
+            degraded: false,
+            timeout: false,
+          },
+        },
+      });
+
+      const outcomes = await runCanary(lmlIsolationConfig);
+      const lookup = outcomes.find((o) => o.name === 'lml-enrichment-lookup')!;
+
+      expect(lookup.status).toBe('pass');
+      expect(lookup.metrics?.LookupDegraded).toBe(0);
+    });
+
+    it.each([
+      ['degraded', { results: [], search_type: 'fallback', degraded: true, timeout: false }],
+      ['timeout', { results: [], search_type: 'fallback', degraded: false, timeout: true }],
+    ])(
+      'passes (soft) when search_type is "fallback" but the response is already shedding (%s) — unchanged soft-signal behavior',
+      async (_label, body) => {
+        setUpFetchMock({
+          ...RECENT_ENTRIES_STUB,
+          '/healthcheck': { status: 200, body: { ok: true } },
+          '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+          '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
+          'lml.example.test/api/v1/lookup': { status: 200, body },
+        });
+
+        const outcomes = await runCanary(lmlIsolationConfig);
+        const lookup = outcomes.find((o) => o.name === 'lml-enrichment-lookup')!;
+
+        expect(lookup.status).toBe('pass');
+        expect(lookup.metrics?.LookupDegraded).toBe(1);
+      }
+    );
+
+    it('passes when search_type is missing (older/malformed response shape) and results are non-empty', async () => {
+      setUpFetchMock({
+        ...RECENT_ENTRIES_STUB,
+        '/healthcheck': { status: 200, body: { ok: true } },
+        '/proxy/library/search': { status: 200, body: proxyLibrarySearchResponse },
+        '/graph/artists/search': { status: 200, body: { results: [{ id: 1 }] } },
+        'lml.example.test/api/v1/lookup': {
+          status: 200,
+          body: { results: [{ library_item: { title: 'DOGA' } }], degraded: false, timeout: false },
+        },
+      });
+
+      const outcomes = await runCanary(lmlIsolationConfig);
+      const lookup = outcomes.find((o) => o.name === 'lml-enrichment-lookup')!;
+
+      expect(lookup.status).toBe('pass');
+      expect(lookup.metrics?.LookupDegraded).toBe(0);
+    });
+
     it('skips when no LML_API_KEY is configured (operator gap, mirrors lml-auth)', async () => {
       setUpFetchMock({
         ...RECENT_ENTRIES_STUB,
