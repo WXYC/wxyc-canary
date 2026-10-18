@@ -131,7 +131,7 @@ const ARTIST_COUNT_FLOOR = 100_000;
  * explore.wxyc.org and fails when the served graph is stale or empty. The
  * nightly sync can fail completely silently — an OOM/SIGKILL kills the rebuild
  * before the atomic DB swap, bypassing Python's exception machinery, so nothing
- * reaches Sentry. The only trustworthy success signal is the serving-host graph
+ * reaches error reporting. The only trustworthy success signal is the serving-host graph
  * freshness, which this check externally backstops:
  *
  *   - `graph_db_age_seconds` > 36 h → at least one scheduled 09:00 UTC sync
@@ -639,7 +639,7 @@ const LML_KNOWN_BAD_BEARER = 'wxyc-canary-probe-not-a-real-key';
  * the header" rather than "the LML bearer is stale". This check removes
  * BS from the loop entirely. Layer-1 mitigation for BS#1094 — the
  * silent backfill stall the org saw the last time the bearer was
- * rotated without a coordinated rollout (Sentry per row, no aggregated
+ * rotated without a coordinated rollout (an error per row, no aggregated
  * alarm, predicate didn't know about auth).
  *
  * Two probes per tick:
@@ -1037,13 +1037,9 @@ const DISCOGS_BREAKER_SHEDDING_STATES = new Set(['open', 'half-open']);
  * in its `/health` body, which reads identically to "indeterminate" here.
  *
  * On-call response to this alarm: do NOT rely on `/health` alone to judge
- * recovery — verify via `api.discogs.com` spans resuming in Sentry
- * instead. Sentry stores `span.domain` wildcard-normalized: query
- * `span.domain:*.discogs.com`, NOT the literal `span.domain:api.discogs.com`
- * — the literal-subdomain filter returns zero rows even while live traffic
- * is flowing (it produced a false "still latched" reading during the
- * 2026-07-14 post-fix verification). `span.op:http.client` grouped by
- * `span.domain` is the reliable shape.
+ * recovery — verify via `DiscogsBreakerShedding`
+ * returning to 0 while `DiscogsLiveRequestsTotal` keeps advancing, plus LML's
+ * `/health` `discogs_breaker_state` returning to `closed`.
  */
 const lmlDiscogsBreakerShed: Check = {
   name: 'lml-discogs-breaker-shed',
