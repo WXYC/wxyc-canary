@@ -1036,10 +1036,10 @@ const DISCOGS_BREAKER_SHEDDING_STATES = new Set(['open', 'half-open']);
  * Backward-compatible: an LML that predates #940 simply never has the key
  * in its `/health` body, which reads identically to "indeterminate" here.
  *
- * On-call response to this alarm: do NOT rely on `/health` alone to judge
- * recovery — verify via `DiscogsBreakerShedding`
- * returning to 0 while `DiscogsLiveRequestsTotal` keeps advancing, plus LML's
- * `/health` `discogs_breaker_state` returning to `closed`.
+ * On-call response to this alarm: judge recovery from both signals together
+ * — `DiscogsBreakerShedding` returning to 0 while `DiscogsLiveRequestsTotal`
+ * keeps advancing, plus LML's `/health` `discogs_breaker_state` reading
+ * `closed`.
  */
 const lmlDiscogsBreakerShed: Check = {
   name: 'lml-discogs-breaker-shed',
