@@ -5940,3 +5940,30 @@ describe('handler — GitHub issue reporting dispatch', () => {
     await expect(handler()).rejects.not.toThrow(/github API rate limited/);
   });
 });
+
+describe('template.yaml — rotation-artist-backfill alarms (WXYC/RotationArtistBackfill)', () => {
+  const doc = YAML.parse(
+    readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), '..', 'template.yaml'), 'utf-8'),
+    { logLevel: 'silent' }
+  ) as { Resources: Record<string, { Type?: string; Properties?: Record<string, unknown> }> };
+  const alarms = Object.values(doc.Resources)
+    .filter((r) => r.Type === 'AWS::CloudWatch::Alarm' && r.Properties?.Namespace === 'WXYC/RotationArtistBackfill')
+    .map((r) => r.Properties ?? {});
+
+  it.each([
+    ['NotFound', 'wxyc-canary-rotation-backfill-not-found', 1],
+    ['LmlError', 'wxyc-canary-rotation-backfill-lml-error', 6],
+  ])('%s alarm is a plain-form daily Sum that ignores missing data', (metric, name, threshold) => {
+    const alarm = alarms.find((a) => a.MetricName === metric);
+    expect(alarm).toMatchObject({
+      AlarmName: name,
+      Statistic: 'Sum',
+      Period: 86400,
+      EvaluationPeriods: 1,
+      Threshold: threshold,
+      ComparisonOperator: 'GreaterThanThreshold',
+      TreatMissingData: 'notBreaching',
+    });
+    expect(alarm?.Dimensions).toBeUndefined();
+  });
+});
