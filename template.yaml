@@ -941,6 +941,51 @@ Resources:
       OKActions:
         - !Ref AlertTopic
 
+  # Rotation-artist-backfill counters (BS#3393 C2). The job emits both
+  # dimensionless counters once per non-dry run, including 0, and nothing on
+  # a dry run, so notBreaching keeps a dry run or skipped day from paging.
+  # These are not WXYC/Canary metrics, so the template-vs-publishMetrics
+  # contract test ignores them.
+  RotationBackfillNotFoundAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: wxyc-canary-rotation-backfill-not-found
+      AlarmDescription: >
+        Rotation-artist backfill found no match for more than 1 artist in 24h. Threshold carried over from the Sentry metric monitor it
+        replaces (BS#1402); BS#1502 revisits it.
+      Namespace: WXYC/RotationArtistBackfill
+      MetricName: NotFound
+      Statistic: Sum
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+      OKActions:
+        - !Ref AlertTopic
+
+  RotationBackfillLmlErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: wxyc-canary-rotation-backfill-lml-error
+      AlarmDescription: >
+        Rotation-artist backfill hit more than 6 LML errors in 24h. Threshold carried over from the Sentry metric monitor it
+        replaces (BS#1402); BS#1502 revisits it.
+      Namespace: WXYC/RotationArtistBackfill
+      MetricName: LmlError
+      Statistic: Sum
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: 6
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+      OKActions:
+        - !Ref AlertTopic
+
 Outputs:
   FunctionArn:
     Value: !GetAtt CanaryFunction.Arn
