@@ -5967,3 +5967,33 @@ describe('template.yaml — rotation-artist-backfill alarms (WXYC/RotationArtist
     expect(alarm?.Dimensions).toBeUndefined();
   });
 });
+
+describe('template.yaml — cron heartbeat alarms (WXYC/Cron)', () => {
+  const doc = YAML.parse(
+    readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), '..', 'template.yaml'), 'utf-8'),
+    { logLevel: 'silent' }
+  ) as { Resources: Record<string, { Type?: string; Properties?: Record<string, unknown> }> };
+  const alarms = Object.values(doc.Resources)
+    .filter((r) => r.Type === 'AWS::CloudWatch::Alarm' && r.Properties?.Namespace === 'WXYC/Cron')
+    .map((r) => r.Properties ?? {});
+
+  it.each([
+    ['legacy-linkage-resolve', 'wxyc-canary-cron-heartbeat-legacy-linkage-resolve', 2],
+    ['flowsheet-no-match-recheck', 'wxyc-canary-cron-heartbeat-flowsheet-no-match-recheck', 9],
+  ])('%s alarm pages when the dimensioned heartbeat goes missing', (job, name, periods) => {
+    const alarm = alarms.find((a) => JSON.stringify(a.Dimensions) === JSON.stringify([{ Name: 'job', Value: job }]));
+    expect(alarm).toMatchObject({
+      AlarmName: name,
+      MetricName: 'HeartbeatSuccess',
+      Statistic: 'Sum',
+      Period: 3600,
+      EvaluationPeriods: periods,
+      DatapointsToAlarm: periods,
+      Threshold: 1,
+      ComparisonOperator: 'LessThanThreshold',
+      TreatMissingData: 'breaching',
+      AlarmActions: ['AlertTopic'],
+      OKActions: ['AlertTopic'],
+    });
+  });
+});
