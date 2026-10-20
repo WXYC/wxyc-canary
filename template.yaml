@@ -986,6 +986,63 @@ Resources:
       OKActions:
         - !Ref AlertTopic
 
+  # Cron heartbeats (BS#3404 emits, BS#3393 C1). The datum is published at the
+  # END of a successful run, so each window is cadence + worst-case run time
+  # (BS docs/ops-cron-scheduling.md). Dimensioned series only, no companion.
+  CronHeartbeatLegacyLinkageResolveAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: wxyc-canary-cron-heartbeat-legacy-linkage-resolve
+      AlarmDescription: >
+        No HeartbeatSuccess from legacy-linkage-resolve (every 30 min) in 2h.
+        Runbook: check the job's `cronjob_runs` row and log on the Backend-Service
+        host first. If the job logged successful runs, look for
+        CRON_HEARTBEAT_METRICS_DISABLED=true in the host .env, then a
+        `failed to publish HeartbeatSuccess` warning in the job log.
+      Namespace: WXYC/Cron
+      MetricName: HeartbeatSuccess
+      Dimensions:
+        - Name: job
+          Value: legacy-linkage-resolve
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions:
+        - !Ref AlertTopic
+      OKActions:
+        - !Ref AlertTopic
+
+  CronHeartbeatFlowsheetNoMatchRecheckAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: wxyc-canary-cron-heartbeat-flowsheet-no-match-recheck
+      AlarmDescription: >
+        No HeartbeatSuccess from flowsheet-no-match-recheck (every 6h, up to ~3h run) in 9h.
+        Runbook: check the job's `cronjob_runs` row and log on the Backend-Service
+        host first. If the job logged successful runs, look for
+        CRON_HEARTBEAT_METRICS_DISABLED=true in the host .env, then a
+        `failed to publish HeartbeatSuccess` warning in the job log.
+      Namespace: WXYC/Cron
+      MetricName: HeartbeatSuccess
+      Dimensions:
+        - Name: job
+          Value: flowsheet-no-match-recheck
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 9
+      DatapointsToAlarm: 9
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions:
+        - !Ref AlertTopic
+      OKActions:
+        - !Ref AlertTopic
+
 Outputs:
   FunctionArn:
     Value: !GetAtt CanaryFunction.Arn
