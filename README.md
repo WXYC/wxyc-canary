@@ -434,10 +434,10 @@ A second Lambda in this stack, `wxyc-canary-stream-listener-sampler`, records ho
 
 Every 5 minutes it GETs `https://audio-mp3.ibiblio.org/status-json.xsl`, sums the listener counts across the WXYC mounts, and POSTs one event to the PostHog capture API. Alongside the Icecast read it GETs `https://api.wxyc.org/flowsheet?limit=1` and records who was on the air from the response's `on_air` field, so the sample says whose show the audience was listening to.
 
-| Event                           | When                                  | Key properties                                                                                                |
-| ------------------------------- | ------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
-| `stream_listener_sample`        | The status endpoint answered          | `total_listeners`, `primary_listeners`, `mount_count`, `stream_online`, `mounts[]`, `on_air_state`, `dj_name` |
-| `stream_listener_sample_failed` | The status endpoint could not be read | `reason` (and deliberately **no** listener count or on-air state)                                             |
+| Event                           | When                                  | Key properties                                                                                                                   |
+| ------------------------------- | ------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `stream_listener_sample`        | The status endpoint answered          | `total_listeners`, `primary_listeners`, `mount_count`, `stream_online`, `mounts[]`, `on_air_state`, `dj_name`, `latest_entry_at` |
+| `stream_listener_sample_failed` | The status endpoint could not be read | `reason` (and deliberately **no** listener count or on-air state)                                                                |
 
 Three states, kept distinct on purpose: a normal sample, a sample where `stream_online: false` (fetch succeeded, no encoder connected — nobody _could_ be listening), and a failure (we could not measure). Booking a failure as `total_listeners: 0` would drag the average down invisibly, since zero is a legitimate value here.
 
@@ -460,7 +460,7 @@ Note that the apps (iOS, Android, Alexa) and the web player all pull these same 
 | `automation`   | Backend-Service reported `on_air: null`: no show was open.                                                                                                                   |
 | `unknown`      | The flowsheet read failed or timed out, or Backend-Service's own on-air lookup failed. The listener count is still good; only the attribution is missing.                    |
 
-Attribution has five-minute resolution, so a show's first and last samples can straddle a handover. It also inherits Backend-Service's notion of an open show: a DJ whose show is never closed stays `dj` until the next show opens, so a missed sign-off credits the automation hours that follow to the departed DJ. Backend-Service detects such shows daily but does not close them (WXYC/Backend-Service#2065). Treat a single show running far past its slot as that, not as a marathon.
+Attribution has five-minute resolution, so a show's first and last samples can straddle a handover. It also inherits Backend-Service's notion of an open show: a DJ whose show is never closed stays `dj` until the next show opens, so a missed sign-off credits the automation hours that follow to the departed DJ. Backend-Service detects such shows daily but does not close them (WXYC/Backend-Service#2065). Treat a single show running far past its slot as that, not as a marathon. `latest_entry_at` (UTC, `YYYY-MM-DD HH:MM:SS`) is when the newest flowsheet entry was logged, so such samples can be filtered out: a `dj` sample whose newest entry is more than three hours older than the sample is a missed sign-off, the same cutoff the airtime emitter uses for orphaned shows. For example, `on_air_state = 'dj' AND dateDiff('minute', toDateTime(properties.latest_entry_at), timestamp) > 180`.
 
 `dj_name` is the handle as Backend-Service reports it, not a stable identity. A DJ who changes handle splits across two rows, and `WXYC` pools every live show whose handle did not resolve, so read it as "unattributed live airtime", not as one DJ. Separately, if the canary's write probe is ever enabled (`EnableWriteProbe=true`; off in production), it opens a short synthetic show only when no DJ is on the air, and a sample landing inside it records the canary's DJ account as `dj`.
 

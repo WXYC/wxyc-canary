@@ -5,6 +5,7 @@ import {
   buildCapturePayload,
   buildFailurePayload,
   mountPathFrom,
+  parseLatestEntryAt,
   parseOnAir,
   sampleWxycMounts,
 } from '../src/stream-sampler.js';
@@ -215,6 +216,25 @@ describe('parseOnAir', () => {
   });
 });
 
+describe('parseLatestEntryAt', () => {
+  it('formats the newest entry time as a HogQL-safe UTC datetime', () => {
+    // `toDateTime` inside an aggregate rejects fractional seconds and `Z`, so
+    // the property is written in the same form the airtime emitter uses.
+    expect(parseLatestEntryAt({ entries: [{ add_time: '2026-09-28T20:31:57.134Z' }] })).toBe('2026-09-28 20:31:57');
+  });
+
+  it.each<[string, unknown]>([
+    ['no entries', { entries: [] }],
+    ['no entries field', { on_air: null }],
+    ['a missing add_time', { entries: [{ id: 1 }] }],
+    ['an unparseable add_time', { entries: [{ add_time: 'yesterday' }] }],
+    ['a non-string add_time', { entries: [{ add_time: 1759091517134 }] }],
+    ['a non-object body', '<html>Bad Gateway</html>'],
+  ])('omits it for %s rather than inventing one', (_label, body) => {
+    expect(parseLatestEntryAt(body)).toBeUndefined();
+  });
+});
+
 describe('buildCapturePayload', () => {
   const sample = sampleWxycMounts(
     statusWith([
@@ -227,7 +247,21 @@ describe('buildCapturePayload', () => {
     timestamp: '2026-08-20T03:34:00.000Z',
     environment: 'production',
   };
-  const payload = buildCapturePayload(sample, context, { state: 'dj', djName: 'dj pipe dreams' });
+  const payload = buildCapturePayload(
+    sample,
+    context,
+    { state: 'dj', djName: 'dj pipe dreams' },
+    '2026-09-28 20:31:57'
+  );
+
+  it('records when the newest flowsheet entry was logged', () => {
+    // Lets a query spot a show that was never closed: a `dj` sample whose
+    // newest entry is hours old is a missed sign-off, not a live DJ.
+    expect(payload.properties.latest_entry_at).toBe('2026-09-28 20:31:57');
+    expect(
+      buildCapturePayload(sample, context, { state: 'automation' }, undefined).properties.latest_entry_at
+    ).toBeUndefined();
+  });
 
   it('captures a single summary event, not one per mount', () => {
     // One event per sample keeps the cost fixed at 288/day regardless of how
@@ -266,7 +300,7 @@ describe('buildCapturePayload', () => {
   ])('records who was on the air for %s', (_label, onAir, expected) => {
     // Flat properties so station-wide per-DJ audience is a plain breakdown of
     // `total_listeners` by `dj_name`. Only a live DJ carries a name.
-    const properties = buildCapturePayload(sample, context, onAir).properties;
+    const properties = buildCapturePayload(sample, context, onAir, undefined).properties;
     expect({ on_air_state: properties.on_air_state, dj_name: properties.dj_name }).toEqual({
       dj_name: undefined,
       ...expected,

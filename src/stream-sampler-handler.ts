@@ -20,6 +20,7 @@ import {
   type OnAir,
   buildCapturePayload,
   buildFailurePayload,
+  parseLatestEntryAt,
   parseOnAir,
   sampleWxycMounts,
 } from './stream-sampler.js';
@@ -143,13 +144,18 @@ async function fetchStatus(config: SamplerConfig) {
  * attempt, keeping the run inside the Lambda timeout. The sample's timestamp
  * is taken before either read, so a late capture still lands in its slot.
  */
-async function readOnAir(config: SamplerConfig): Promise<OnAir> {
+async function readOnAir(config: SamplerConfig): Promise<{ onAir: OnAir; latestEntryAt: string | undefined }> {
   try {
     const response = await canaryFetch(config.onAirUrl, { timeoutMs: config.onAirTimeoutMs });
-    if (!response.ok) return { state: 'unknown', reason: `flowsheet status ${response.status}` };
-    return parseOnAir(response.body);
+    if (!response.ok) {
+      return { onAir: { state: 'unknown', reason: `flowsheet status ${response.status}` }, latestEntryAt: undefined };
+    }
+    return { onAir: parseOnAir(response.body), latestEntryAt: parseLatestEntryAt(response.body) };
   } catch (err) {
-    return { state: 'unknown', reason: err instanceof Error ? err.message : String(err) };
+    return {
+      onAir: { state: 'unknown', reason: err instanceof Error ? err.message : String(err) },
+      latestEntryAt: undefined,
+    };
   }
 }
 
@@ -184,6 +190,7 @@ export type SamplerResult = {
   onAirState?: OnAir['state'];
   djName?: string;
   onAirReason?: string;
+  latestEntryAt?: string;
   reason?: string;
 };
 
@@ -216,8 +223,8 @@ export async function runSampler(
       mountPrefix: config.mountPrefix,
       primaryMount: config.primaryMount,
     });
-    const onAir = await onAirRead;
-    payload = buildCapturePayload(sample, context, onAir);
+    const { onAir, latestEntryAt } = await onAirRead;
+    payload = buildCapturePayload(sample, context, onAir, latestEntryAt);
     result = {
       captured: false,
       event: payload.event,
@@ -227,6 +234,7 @@ export async function runSampler(
       onAirState: onAir.state,
       djName: onAir.state === 'dj' ? onAir.djName : undefined,
       onAirReason: onAir.state === 'unknown' ? onAir.reason : undefined,
+      latestEntryAt,
     };
   } catch (err) {
     const reason = err instanceof CanaryFetchError || err instanceof Error ? err.message : String(err);
